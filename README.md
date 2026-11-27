@@ -24,8 +24,8 @@ You need two files from the [latest release](../../releases/latest), or build th
 
 | File | Flash at | When |
 |---|---|---|
-| `rabbitmesh-…-full.bin` | `0x0` | **First install**, coming from any other firmware. It replaces everything, settings included, so back up first. |
-| `rabbitmesh-…-update.bin` | `0x10000` | **Updating** RabbitMesh. Keeps your settings, contacts and identity. |
+| `rabbitmesh-<version>-tdeck-full.bin` | `0x0` | **First install**, coming from any other firmware. It replaces everything, settings included, so back up first. |
+| `rabbitmesh-<version>-tdeck-update.bin` | `0x10000` | **Updating** RabbitMesh. Keeps your settings, contacts and identity. |
 
 1. Put the T-Deck in download mode: **hold the trackball down** while you switch it on, then plug it in by USB.
 2. Open the [Espressif web flasher](https://espressif.github.io/esptool-js/) in Chrome or Edge, set the baud rate to 921600, and press **Connect**.
@@ -36,8 +36,8 @@ You need two files from the [latest release](../../releases/latest), or build th
 From a terminal instead (`pip install esptool`):
 
 ```bash
-esptool.py --chip esp32s3 write_flash 0x0 rabbitmesh-...-full.bin          # first install
-esptool.py --chip esp32s3 write_flash 0x10000 rabbitmesh-...-update.bin    # update
+esptool.py --chip esp32s3 write_flash 0x0 rabbitmesh-0.1.0-tdeck-full.bin       # first install
+esptool.py --chip esp32s3 write_flash 0x10000 rabbitmesh-0.1.0-tdeck-update.bin # update
 ```
 
 ## First steps
@@ -79,12 +79,22 @@ More about the character and how he's drawn: [docs/CHARACTER.md](docs/CHARACTER.
 ## Privacy: what it sends, and where
 
 - **It never updates itself, and never reports anything** to the projects it's built on. You update it only by flashing it.
+- **New versions:** once a week, while on WiFi, it asks this project's GitHub page for the newest version number, and tells you if there's a newer one. Nothing about you or your device is sent, and nothing is installed. Turn it off under Settings > System.
 - **WiGLE:** RabbitMesh only writes the file. It never contacts WiGLE; uploading is up to you.
 - **The only internet addresses in the firmware:**
   - `data.dontgetflocked.com`: the camera map, when you update it (at most once a day);
   - `tile.openstreetmap.org`: map tiles while you look at the map;
-  - `pool.ntp.org` and `time.google.com`: the clock.
+  - `pool.ntp.org` and `time.google.com`: the clock;
+  - `api.github.com`: the weekly new-version check above.
 - **Flock hunt** only listens. Nothing is ever transmitted at a camera.
+
+## Staying up to date
+
+RabbitMesh tracks [MeshCore](https://github.com/meshcore-dev/MeshCore): each MeshCore release gets a RabbitMesh build on it. A T-Deck only changes firmware when you flash it, so:
+
+- **Your T-Deck tells you** when a new version is out (once a week, on WiFi), and Settings > System > check for updates asks now.
+- **Or watch this repository:** Watch > Custom > Releases on GitHub emails you when there's a new one.
+- **To update:** flash the new **update** file at `0x10000` (see Install). Your settings and contacts stay.
 
 ## Troubleshooting
 

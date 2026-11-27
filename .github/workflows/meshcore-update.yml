@@ -1,0 +1,84 @@
+# Once a week: is there a newer MeshCore release? If so, move RabbitMesh's pin to it
+# (tools/bump_meshcore.py), build and test, and open a pull request to merge, or, if the build
+# or tests fail (MeshCore changed something RabbitMesh relies on), an issue saying so, with the
+# branch to fix it on. Nothing is released by itself: merge, then tag a version (release.yml).
+name: MeshCore update check
+
+on:
+  schedule:
+    - cron: "17 14 * * 1"          # Mondays
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Newest MeshCore release
+        id: bump
+        run: python3 tools/bump_meshcore.py --apply --github-output "$GITHUB_OUTPUT"
+
+      - name: Already handled?
+        id: seen
+        if: steps.bump.outputs.changed == 'true'
+        run: |
+          br="meshcore-${{ steps.bump.outputs.version }}"
+          echo "branch=$br" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --heads origin "$br" > /dev/null; then echo "done=true" >> "$GITHUB_OUTPUT"; fi
+
+      - uses: actions/cache@v4
+        if: steps.bump.outputs.changed == 'true' && steps.seen.outputs.done != 'true'
+        with:
+          path: ~/.platformio
+          key: pio-${{ hashFiles('patches/rabbitmesh-tdeck.patch') }}
+          restore-keys: pio-
+
+      - name: Build and test with it
+        id: build
+        if: steps.bump.outputs.changed == 'true' && steps.seen.outputs.done != 'true'
+        continue-on-error: true
+        run: |
+          pip install platformio
+          ./setup.sh build
+          (cd build && pio run -e t-deck-rabbit)
+          test/run.sh
+
+      - name: Pull request, or an issue if it needs work
+        if: steps.bump.outputs.changed == 'true' && steps.seen.outputs.done != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.bump.outputs.version }}
+          CUR: ${{ steps.bump.outputs.current }}
+          BR: ${{ steps.seen.outputs.branch }}
+          OK: ${{ steps.build.outcome == 'success' }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BR"
+          git add patches/rabbitmesh-tdeck.patch docs/DEVELOPMENT.md
+          git commit -m "MeshCore $V (from $CUR)"
+          git push origin "$BR"
+          if [ "$OK" = "true" ]; then
+            body="MeshCore $V is out (RabbitMesh is on $CUR). It builds and the host tests pass ($RUN).
+
+          Before merging, flash it on a T-Deck: messages both ways, the phone app pairing, and a restart keeping contacts and settings. Then merge and tag a version to release it."
+            gh pr create --base main --head "$BR" --title "MeshCore $V" --body "$body" ||
+              gh issue create --title "MeshCore $V is ready on branch $BR" --body "$body
+
+          (A pull request couldn't be opened: allow it under Settings > Actions > General > Workflow permissions, or open one from the branch.)"
+          else
+            gh issue create --title "MeshCore $V: RabbitMesh needs changes" --body "MeshCore $V is out (RabbitMesh is on $CUR), and RabbitMesh doesn't build or pass its tests with it yet: see $RUN.
+
+          The pin is moved on branch $BR. Usually the fix is in tools/patch_meshcore.py (a pattern MeshCore moved) or src/node.cpp (a changed API); see docs/DEVELOPMENT.md."
+          fi

@@ -23,6 +23,7 @@
 #include "meshclock.h"
 #include "drive.h"
 #include "sdview.h"
+#include "updcheck.h"
 #include "ui.h"
 #include "deck_draw.h"
 
@@ -293,6 +294,7 @@ void tick() {
   holiday::tick();
   tzauto::tick();
   meshclock::tick();
+  updcheck::tick();
   spectrum::watch();
   mecp::tick();
 }
