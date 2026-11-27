@@ -94,7 +94,7 @@ The generated sprite files are committed, so building doesn't need Python. To ch
 
 1. Set the version: `RABBITMESH_VERSION` in `platformio.ini` (in `patches/rabbitmesh-tdeck.patch`).
 2. Write the notes in `docs/releases/vX.Y.Z.md` (optional; without them GitHub writes a list of changes).
-3. Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+3. Tag and push (`git tag vX.Y.Z && git push origin vX.Y.Z`), or on GitHub: Actions > Release > Run workflow, with the version; that tags the newest `main` itself.
 
 The **Release** job (`.github/workflows/release.yml`) checks the tag matches the version, runs the host tests, builds, makes the two flash files and `SHA256SUMS.txt`, and publishes the release. T-Decks on WiFi notice it within a week (`src/updcheck.cpp`).
 

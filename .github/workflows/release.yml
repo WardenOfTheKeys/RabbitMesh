@@ -1,11 +1,17 @@
-# Builds RabbitMesh and publishes a GitHub Release with the two flash files, when a version tag
-# (v0.1.0, v0.1.1, ...) is pushed. The tag has to match RABBITMESH_VERSION in the patch.
+# Builds RabbitMesh and publishes a GitHub Release with the two flash files: when a version tag
+# (v0.1.0, v0.1.1, ...) is pushed, or from the Actions tab (Run workflow, with the version), which
+# tags the commit it builds. The version has to match RABBITMESH_VERSION in the patch.
 # Release notes come from docs/releases/<tag>.md when there is one.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Version to release, e.g. v0.1.1 (must match RABBITMESH_VERSION)"
+        required: true
 
 permissions:
   contents: write
@@ -13,6 +19,8 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-24.04
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
 
@@ -22,9 +30,9 @@ jobs:
 
       - name: The tag matches the firmware's version
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           grep -q "RABBITMESH_VERSION=\\\\\"$v\\\\\"" patches/rabbitmesh-tdeck.patch || {
-            echo "tag $GITHUB_REF_NAME doesn't match RABBITMESH_VERSION in patches/rabbitmesh-tdeck.patch"; exit 1; }
+            echo "tag $TAG doesn't match RABBITMESH_VERSION in patches/rabbitmesh-tdeck.patch"; exit 1; }
 
       - uses: actions/cache@v4
         with:
@@ -43,7 +51,7 @@ jobs:
 
       - name: The two flash files
         run: |
-          v="${GITHUB_REF_NAME#v}"
+          v="${TAG#v}"
           B=build/.pio/build/t-deck-rabbit
           python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
             -o "rabbitmesh-$v-tdeck-full.bin" --flash_mode dio --flash_size 16MB \
@@ -58,8 +66,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          notes="docs/releases/$GITHUB_REF_NAME.md"
+          v="${TAG#v}"
+          notes="docs/releases/$TAG.md"
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
-          gh release create "$GITHUB_REF_NAME" --title "RabbitMesh $v" "$@" \
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "RabbitMesh $v" "$@" \
             "rabbitmesh-$v-tdeck-full.bin" "rabbitmesh-$v-tdeck-update.bin" SHA256SUMS.txt
