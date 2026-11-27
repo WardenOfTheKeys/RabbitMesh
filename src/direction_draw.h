@@ -53,7 +53,7 @@ inline int draw(G& g, const T& t, int x, int y, int screenW, const foxcore::Grad
     if (!gpsFix) {
       snprintf(l1, sizeof l1, "direction: waiting for a gps fix");
       if (satsHeard) snprintf(l2, sizeof l2, "hearing %u sats, best %u: %s", (unsigned)satsHeard, (unsigned)bestSignal,
-                              bestSignal >= 30 ? "nearly there" : "open sky helps");
+                              bestSignal >= 35 ? "should fix soon" : "too weak: open sky helps");
       else snprintf(l2, sizeof l2, "hearing no satellites: go outside");
     }
     else if (!haveReadings || why == Gradient::FEW) { snprintf(l1, sizeof l1, "direction: gathering readings"); snprintf(l2, sizeof l2, "keep moving while it hears the target"); }

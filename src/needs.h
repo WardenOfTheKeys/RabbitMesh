@@ -24,7 +24,7 @@ inline bool gpsOk() { return gps.hasFix() && !(gps.fix().lat == 0 && gps.fix().l
 inline String gpsWait() {
   const uint8_t n = gps.heard(), sig = gps.bestSignal();
   if (!n) return String("hearing no satellites: go outside");
-  return String("hearing ") + n + " sats, best " + sig + (sig >= 30 ? " - nearly there" : " - weak: open sky helps");
+  return String("hearing ") + n + " sats, best " + sig + (sig >= 35 ? " - strong, should fix soon" : " - too weak for a fix: open sky helps");
 }
 
 inline String line(uint8_t what) {

@@ -306,7 +306,7 @@ index 8ada4da..76c7691 100644
      if (p >= 1 || testStop(t0)) break;
    }
 diff --git a/src/gps.h b/src/gps.h
-index 2ed7c0d..c8730ea 100644
+index 2ed7c0d..c086eae 100644
 --- a/src/gps.h
 +++ b/src/gps.h
 @@ -11,6 +11,7 @@ struct GpsFix {
@@ -317,8 +317,48 @@ index 2ed7c0d..c8730ea 100644
      uint16_t year = 0;
      uint8_t  month = 0, day = 0, hour = 0, minute = 0, second = 0;
      uint32_t updatedAt = 0;      // millis() of the last good sentence
-@@ -256,6 +257,8 @@ private:
+@@ -124,6 +125,12 @@ public:
+     // It has the time, which it only gets by decoding a satellite (or from its own
+     // backup battery, if the board has one that is charged).
+     bool timeKnown() const { return _timeKnown; }
++    // RabbitMesh: what the module says about its fix, sentence by sentence, for the GPS page.
++    // rmcStatus: 'A' (fix), 'V' (none) or 0 (no RMC heard in 5 s); ggaQuality: 0 none, 1 GPS,
++    // 2 DGPS...; ggaUsed: satellites in the fix (not just heard).
++    char rmcStatus() const { return millis() - _rmcAt < 5000 ? _rmcStatus : 0; }
++    uint8_t ggaQuality() const { return millis() - _ggaAt < 5000 ? _ggaQuality : 0; }
++    uint8_t ggaUsed() const { return _fix.satellites; }
+     // The module's own antenna check, on boards that send one: "ok", "open", "short",
+     // or "" when it has said nothing.
+     const char* antenna() const { return _antenna == 1 ? "ok" : _antenna == 2 ? "open" : _antenna == 3 ? "short" : ""; }
+@@ -235,6 +242,8 @@ private:
+         }
+         char* status = field(_line, 2);
+         _fix.valid = status && *status == 'A';
++        _rmcStatus = status ? *status : 'V';             // RabbitMesh: for the GPS page
++        _rmcAt = millis();
+ 
+         char* lat = field(_line, 3); char* ns = field(_line, 4);
+         char* lon = field(_line, 5); char* ew = field(_line, 6);
+@@ -254,8 +263,26 @@ private:
+     }
+ 
      bool parseGga() {
++        // RabbitMesh: GGA's fix quality too. Some modules send no RMC (or not every second): then
++        // the fix and position come from here, so the tools aren't kept waiting on a sentence
++        // that never comes.
++        char* q = field(_line, 6);
++        _ggaQuality = (q && isdigit((unsigned char)q[0])) ? (uint8_t)(q[0] - '0') : 0;
++        _ggaAt = millis();
++        if (millis() - _rmcAt > 3000 || !_rmcAt) {
++            char* lat = field(_line, 2); char* ns = field(_line, 3);
++            char* lon = field(_line, 4); char* ew = field(_line, 5);
++            _fix.valid = _ggaQuality > 0 && lat && ns && lon && ew && lat[0] != ',' && lon[0] != ',';
++            if (_fix.valid) {
++                _fix.lat = degMin(lat, *ns);
++                _fix.lon = degMin(lon, *ew);
++                _fix.updatedAt = millis();
++            }
++        }
          char* sats = field(_line, 7);
          if (sats) _fix.satellites = (uint8_t)atoi(sats);
 +        char* hdop = field(_line, 8);
@@ -326,6 +366,16 @@ index 2ed7c0d..c8730ea 100644
          char* alt = field(_line, 9);
          if (alt) _fix.altitudeM = (float)atof(alt);
          return true;
+@@ -298,6 +325,9 @@ private:
+     struct Sys { char a = 0, b = 0; uint8_t heard = 0, best = 0, pendHeard = 0, pendBest = 0; uint32_t at = 0; };
+     Sys      _sys[4];
+     bool     _timeKnown = false;
++    char     _rmcStatus = 0;              // RabbitMesh: see rmcStatus()
++    uint32_t _rmcAt = 0, _ggaAt = 0;
++    uint8_t  _ggaQuality = 0;
+     uint8_t  _antenna = 0;
+     uint8_t  _choice = 0, _try = 0;
+     uint32_t _probeFrom = 0, _goodFrom = 0;
 diff --git a/src/home.cpp b/src/home.cpp
 index a28eb86..10abacb 100644
 --- a/src/home.cpp
@@ -1368,7 +1418,7 @@ index 54012ae..eccd03c 100644
 +inline bool themeListed(uint8_t) { return true; }
 +#endif
 diff --git a/src/tools.cpp b/src/tools.cpp
-index 40c0875..2841f7b 100644
+index 40c0875..ae3c9fb 100644
 --- a/src/tools.cpp
 +++ b/src/tools.cpp
 @@ -5,6 +5,8 @@
@@ -1380,7 +1430,23 @@ index 40c0875..2841f7b 100644
  #include "fx.h"
  #include "extport.h"
  #if BOARD_HAS_TOUCH
-@@ -259,7 +261,11 @@ static void gpsPage() {
+@@ -244,6 +246,15 @@ static void gpsPage() {
+       }
+     }
+     snprintf(b, sizeof(b), "fix        %s", gps.hasFix() ? "yes" : "searching"); out.push_back(b);
++#if RABBITMESH
++    // What the module itself says about the fix: tells "no fix yet" from "a fix it isn't reading".
++    {
++      const char st = gps.rmcStatus();
++      snprintf(b, sizeof(b), "# module   rmc %s, gga quality %u, %u sats in the fix",
++               st == 'A' ? "fix" : st == 'V' ? "no fix" : "not sent", gps.ggaQuality(), gps.ggaUsed());
++      out.push_back(b);
++    }
++#endif
+     snprintf(b, sizeof(b), "satellites %u", f.satellites); out.push_back(b);
+     if (gps.hasFix()) {
+       snprintf(b, sizeof(b), "position   %.6f, %.6f", f.lat, f.lon); out.push_back(b);
+@@ -259,7 +270,11 @@ static void gpsPage() {
  void deviceInfoPage() {
    nav.push(new TextPageView("Device", [](std::vector<String>& out) {
      char b[72];
@@ -1392,7 +1458,7 @@ index 40c0875..2841f7b 100644
      if (g_node) {
        char h[20];
        mesh::Utils::toHex(h, g_node->self_id.pub_key, 8);
-@@ -292,14 +298,23 @@ void logsPage() {
+@@ -292,14 +307,23 @@ void logsPage() {
    }, 2000));
  }
  
