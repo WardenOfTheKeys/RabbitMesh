@@ -342,7 +342,8 @@ static void livePage() {
     if (!needs::met(needs::GPS | needs::SD_CARD)) out.push_back(String("#") + needs::line(needs::GPS | needs::SD_CARD));
     double la, lo;
     out.push_back(fixNow(la, lo) ? String("gps   ") + String(la, 5) + ", " + String(lo, 5) + "  " + gps.fix().satellites + " sats"
-                                 : String("gps   no fix - not probing until there is one"));
+                                 : String("gps   no fix yet - probing starts with one"));
+    if (!fixNow(la, lo)) out.push_back(String("#      ") + needs::gpsWait());
     if (s_probeAt) out.push_back(String("probe out, listening ") + (HARVEST_MS - min<uint32_t>(HARVEST_MS, millis() - s_probeAt)) / 1000 + " s");
     else if (s_probes) out.push_back(String("last stop: ") + s_lastHits + (s_lastHits == 1 ? " answer" : " answers"));
     out.push_back(String("probes ") + s_probes + "  answered " + s_answered + "  dead " + (s_liveN - s_answered) +

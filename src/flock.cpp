@@ -690,7 +690,7 @@ public:
       g.fillRect(mx + 2, y + 2, (int)((mw - 4) * s), mh - 4, s > 0.66f ? t.red : s > 0.33f ? t.amber : t.green);
       y += mh + 4;
       // which way is stronger: "GO AHEAD-RIGHT" with an arrow up your way (direction_draw.h)
-      y = dirdraw::draw(g, t, 6, y, L::W, s_grad, s_gradSm, gps.hasFix(), s_meter.have, now);
+      y = dirdraw::draw(g, t, 6, y, L::W, s_grad, s_gradSm, gps.hasFix(), s_meter.have, now, gps.heard(), gps.bestSignal());
       g.setTextColor(h.confirmed ? t.green : t.amber);
       if (h.confirmed) snprintf(line, sizeof line, "CONFIRMED: mapped camera %d m away", h.mappedM);
       else if (!s_camN) snprintf(line, sizeof line, "no camera map loaded to check against");

@@ -12,7 +12,7 @@ namespace dirdraw {
 // Two lines (36 px) at y, across the screen; returns the y under them.
 template <class G, class T>
 inline int draw(G& g, const T& t, int x, int y, int screenW, const foxcore::Gradient& gr, foxcore::SmoothBearing& sm,
-                bool gpsFix, bool haveReadings, uint32_t now) {
+                bool gpsFix, bool haveReadings, uint32_t now, uint8_t satsHeard = 0, uint8_t bestSignal = 0) {
   using namespace foxcore;
   char l1[48], l2[64];
   float b = 0, s10 = 0, crs = 0, cov = 0;
@@ -50,7 +50,12 @@ inline int draw(G& g, const T& t, int x, int y, int screenW, const foxcore::Grad
     snprintf(l2, sizeof l2, "walk a few steps: then it points your way");
     g.setTextColor(t.green);
   } else {
-    if (!gpsFix) { snprintf(l1, sizeof l1, "direction: needs a gps fix"); snprintf(l2, sizeof l2, "go outside, or wait for the satellites"); }
+    if (!gpsFix) {
+      snprintf(l1, sizeof l1, "direction: waiting for a gps fix");
+      if (satsHeard) snprintf(l2, sizeof l2, "hearing %u sats, best %u: %s", (unsigned)satsHeard, (unsigned)bestSignal,
+                              bestSignal >= 30 ? "nearly there" : "open sky helps");
+      else snprintf(l2, sizeof l2, "hearing no satellites: go outside");
+    }
     else if (!haveReadings || why == Gradient::FEW) { snprintf(l1, sizeof l1, "direction: gathering readings"); snprintf(l2, sizeof l2, "keep moving while it hears the target"); }
     else if (why == Gradient::SHORT) { snprintf(l1, sizeof l1, "direction: walk on, %d of %d m", (int)cov, (int)Gradient::SPREAD_M); snprintf(l2, sizeof l2, "then turn a corner or loop"); }
     else if (why == Gradient::LINE) { snprintf(l1, sizeof l1, "direction: turn a corner"); snprintf(l2, sizeof l2, "a straight walk can't tell left from right"); }

@@ -379,7 +379,8 @@ static void livePage() {
     if (!needs::met(needs::GPS | needs::SD_CARD)) out.push_back(String("#") + needs::line(needs::GPS | needs::SD_CARD) + " (to log)");
     double la, lo;
     out.push_back(fix(la, lo) ? String("gps   ") + String(la, 5) + ", " + String(lo, 5) + "  " + gps.fix().satellites + " sats"
-                              : String("gps   no fix - scanning, logging starts with a fix"));
+                              : String("gps   no fix yet - scanning, logging starts with one"));
+    if (!fix(la, lo)) out.push_back(String("#      ") + needs::gpsWait());
     out.push_back(String("wifi  ") + s_wifiNow + " in range, " + s_wifiN + " logged, " + s_openN + " open" +
                   (s_wifiOn ? (s_wifiNote[0] ? String("  (") + s_wifiNote + ")" : String("")) : String("  (scanning off)")));
     out.push_back(String("bt    ") + s_bleNow + " in range, " + s_bleN + " logged" +

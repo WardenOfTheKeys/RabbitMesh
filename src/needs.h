@@ -19,6 +19,13 @@ inline bool sdOk() {
   return ok;
 }
 inline bool gpsOk() { return gps.hasFix() && !(gps.fix().lat == 0 && gps.fix().lon == 0); }
+// While there's no fix: what the GPS hears, so "no fix" doesn't look like "no GPS". Satellites
+// counted on the GPS page are the ones it hears; a fix needs a few of them strong enough.
+inline String gpsWait() {
+  const uint8_t n = gps.heard(), sig = gps.bestSignal();
+  if (!n) return String("hearing no satellites: go outside");
+  return String("hearing ") + n + " sats, best " + sig + (sig >= 30 ? " - nearly there" : " - weak: open sky helps");
+}
 
 inline String line(uint8_t what) {
   String s = "needs:";
@@ -29,7 +36,7 @@ inline String line(uint8_t what) {
     s += name;
     s += ok ? " ok" : " NO";
   };
-  if (what & GPS) add("gps fix", gpsOk());
+  if (what & GPS) { add("gps fix", gpsOk()); if (!gpsOk()) s += String(" (") + gpsWait() + ")"; }
   if (what & SD_CARD) add("sd card", sdOk());
   if (what & WIFI_OFF) add("wifi off", !wifi::enabled());
   if (what & WIFI_ON) add("wifi", wifi::connected());

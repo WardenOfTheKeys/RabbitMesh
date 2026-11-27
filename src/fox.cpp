@@ -196,7 +196,7 @@ private:
   // "stronger: NE  ahead-right" and a small north-up arrow, or what it needs to say that.
   // "GO AHEAD-RIGHT" with an arrow up your way, or why it can't tell yet (direction_draw.h).
   int drawDirection(Canvas& g, const Theme& t, int y, uint32_t now) {
-    return dirdraw::draw(g, t, 8, y, L::W, _g, _sm, gps.hasFix(), _m.have, now);
+    return dirdraw::draw(g, t, 8, y, L::W, _g, _sm, gps.hasFix(), _m.have, now, gps.heard(), gps.bestSignal());
   }
   void clearReadings() { _m.clear(); _g.clear(); _sm.clear(); _fedN = 0; }
   uint32_t staleMs() const { return _mode == REP ? STALE_REP_MS : _mode == WIFI ? STALE_WIFI_MS : _mode == BT ? STALE_BT_MS : STALE_ANY_MS; }
