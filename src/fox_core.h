@@ -85,12 +85,24 @@ struct Gradient {
     head = (head + 1) % N;
     if (count < N) count++;
   }
-  // The bearing (degrees from north) toward stronger signal, and how steep (dB per 10 m).
-  bool estimate(uint32_t nowMs, float& bearingDeg, float& dbPer10m) const {
+  // Why there's no direction yet, for the screen to say what to do about it.
+  enum Why : uint8_t { OK = 0, FEW, SHORT, LINE, FLAT };
+  static constexpr float WIDTH_M = 2.0f;               // you have to turn: this wide across your path
+  // The bearing (degrees from north) toward stronger signal, and how steep (dB per 10 m). why:
+  // FEW readings, SHORT of ground (coveredM says how much), all in a LINE (a straight walk can't
+  // tell left from right), or the signal too FLAT to say.
+  bool estimate(uint32_t nowMs, float& bearingDeg, float& dbPer10m, Why* why = nullptr, float* coveredM = nullptr) const {
+    Why w = OK;
+    bool ok = fit(nowMs, bearingDeg, dbPer10m, w, coveredM);
+    if (why) *why = w;
+    return ok;
+  }
+  bool fit(uint32_t nowMs, float& bearingDeg, float& dbPer10m, Why& why, float* coveredM) const {
     double me = 0, mn = 0, mr = 0;
     int k = 0;
+    if (coveredM) *coveredM = 0;
     for (int i = 0; i < count; i++) if (nowMs - s[i].at <= WINDOW_MS) { me += s[i].e; mn += s[i].n; mr += s[i].rssi; k++; }
-    if (k < MIN_SAMPLES) return false;
+    if (k < MIN_SAMPLES) { why = FEW; return false; }
     me /= k; mn /= k; mr /= k;
     double see = 0, snn = 0, sen = 0, ser = 0, snr = 0, spread = 0;
     for (int i = 0; i < count; i++) {
@@ -100,15 +112,21 @@ struct Gradient {
       const double d = sqrt(de * de + dn * dn);
       if (d > spread) spread = d;
     }
-    if (spread * 2 < SPREAD_M) return false;           // spread: furthest from the middle
+    if (coveredM) *coveredM = (float)(spread * 2);
+    if (spread * 2 < SPREAD_M) { why = SHORT; return false; }   // spread: furthest from the middle
+    // How wide the readings are across their main line (the smaller axis, as a standard deviation).
+    const double tr = see + snn, dif = see - snn;
+    const double minor = (tr - sqrt(dif * dif + 4 * sen * sen)) / 2 / k;
+    if (minor < (WIDTH_M / 2) * (WIDTH_M / 2)) { why = LINE; return false; }
     const double det = see * snn - sen * sen;
-    if (det < 1e-6 * (see + snn) * (see + snn) || det <= 0) return false;   // all in a line: one axis unknown
+    if (det <= 0) { why = LINE; return false; }
     const double b = (ser * snn - snr * sen) / det;    // dB per metre east
     const double c = (snr * see - ser * sen) / det;    // dB per metre north
     const double slope = sqrt(b * b + c * c);
-    if (slope < MIN_SLOPE) return false;
+    if (slope < MIN_SLOPE) { why = FLAT; return false; }
     bearingDeg = (float)fmod(atan2(b, c) * 180.0 / M_PI + 360.0, 360.0);
     dbPer10m = (float)(slope * 10.0);
+    why = OK;
     return true;
   }
   // Which way you're going: from the oldest recent reading to the newest, if far enough apart.
@@ -134,6 +152,20 @@ inline const char* relative(float targetDeg, float courseDeg) {
   float d = fmodf(targetDeg - courseDeg + 360.0f + 22.5f, 360.0f);
   return R[(int)(d / 45.0f) % 8];
 }
+// A bearing that doesn't jump about: each new estimate pulls it a part of the way (as a unit
+// vector, so 350 and 10 average to 0, not 180).
+struct SmoothBearing {
+  float x = 0, y = 0;
+  bool have = false;
+  void add(float deg, float k = 0.3f) {
+    const float a = deg * (float)M_PI / 180.0f;
+    if (!have) { x = sinf(a); y = cosf(a); have = true; return; }
+    x += (sinf(a) - x) * k; y += (cosf(a) - y) * k;
+  }
+  float deg() const { return fmodf(atan2f(x, y) * 180.0f / (float)M_PI + 360.0f, 360.0f); }
+  void clear() { have = false; x = y = 0; }
+};
+
 inline const char* compass8(float deg) {
   static const char* P[] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
   return P[(int)(fmodf(deg + 22.5f + 360.0f, 360.0f) / 45.0f) % 8];

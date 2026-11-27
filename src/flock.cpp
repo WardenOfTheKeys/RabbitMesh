@@ -26,6 +26,7 @@
 #include "alpr_core.h"
 #include "flock_core.h"
 #include "fox_core.h"
+#include "direction_draw.h"
 
 extern LogStore logs;
 
@@ -406,6 +407,7 @@ static const Jingle NEAR_J = {"fl-near", NEAR_STEPS, 3, WAVE_TRIANGLE, false};
 // ---- detections ---------------------------------------------------------------------------------------
 static foxcore::Meter s_meter;
 static foxcore::Gradient s_grad;             // which way the followed camera is stronger
+static foxcore::SmoothBearing s_gradSm;       // its bearing, steadied
 static int s_lock = -1;                           // the heard camera the meter follows
 static uint32_t s_clickAt = 0;
 
@@ -442,7 +444,7 @@ static void heard(const Event& e) {
   const Heard& cur = s_heard[s_lock < 0 ? 0 : s_lock];
   if (s_lock < 0 || s_lock == idx || now - cur.last > 15000 ||
       rank(h->tier, h->mac, h->ble, h->confirmed) > rank(cur.tier, cur.mac, cur.ble, cur.confirmed)) {
-    if (s_lock != idx) { s_meter.clear(); s_grad.clear(); }
+    if (s_lock != idx) { s_meter.clear(); s_grad.clear(); s_gradSm.clear(); }
     s_lock = idx;
     s_meter.feed(e.rssi, now);
     if (have) s_grad.add(la, lo, e.rssi, now);   // where it was heard from: which way is stronger
@@ -687,19 +689,8 @@ public:
       const float s = foxcore::strength(s_meter.avg);
       g.fillRect(mx + 2, y + 2, (int)((mw - 4) * s), mh - 4, s > 0.66f ? t.red : s > 0.33f ? t.amber : t.green);
       y += mh + 4;
-      {                                            // which way is stronger (fox_core.h Gradient)
-        float b = 0, s10 = 0, crs = 0;
-        if (s_grad.estimate(now, b, s10)) {
-          if (s_grad.course(now, crs))
-            snprintf(line, sizeof line, "stronger: %s %d deg - %s", foxcore::compass8(b), (int)lroundf(b), foxcore::relative(b, crs));
-          else snprintf(line, sizeof line, "stronger: %s %d deg", foxcore::compass8(b), (int)lroundf(b));
-          g.setTextColor(t.green);
-        } else {
-          snprintf(line, sizeof line, "%s", gps.hasFix() ? "direction: keep moving, turning (15 m+)" : "direction: needs a gps fix");
-          g.setTextColor(t.dim);
-        }
-        g.drawString(line, 6, y); y += 16;
-      }
+      // which way is stronger: "GO AHEAD-RIGHT" with an arrow up your way (direction_draw.h)
+      y = dirdraw::draw(g, t, 6, y, L::W, s_grad, s_gradSm, gps.hasFix(), s_meter.have, now);
       g.setTextColor(h.confirmed ? t.green : t.amber);
       if (h.confirmed) snprintf(line, sizeof line, "CONFIRMED: mapped camera %d m away", h.mappedM);
       else if (!s_camN) snprintf(line, sizeof line, "no camera map loaded to check against");

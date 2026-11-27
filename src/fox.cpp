@@ -8,6 +8,7 @@
 #include "audio_jingle.h"
 #include "ui.h"
 #include "fox_core.h"
+#include "direction_draw.h"
 #include "gps.h"
 #include <WiFi.h>
 #include <algorithm>
@@ -180,6 +181,7 @@ public:
 private:
   Meter _m;
   Gradient _g;                                   // which way is stronger (fox_core.h)
+  SmoothBearing _sm;                             // its bearing, steadied
   uint32_t _fedN = 0;
   Mode _mode = ANY;
   bool _sound = true, _scanning = false;
@@ -192,29 +194,11 @@ private:
   wifi_event_id_t _wEvt = 0;
 
   // "stronger: NE  ahead-right" and a small north-up arrow, or what it needs to say that.
+  // "GO AHEAD-RIGHT" with an arrow up your way, or why it can't tell yet (direction_draw.h).
   int drawDirection(Canvas& g, const Theme& t, int y, uint32_t now) {
-    char line[64];
-    float b = 0, s10 = 0, crs = 0;
-    const bool fixed = gps.hasFix();
-    if (_m.have && _g.estimate(now, b, s10)) {
-      if (_g.course(now, crs)) snprintf(line, sizeof line, "stronger: %s %d deg - %s", compass8(b), (int)lroundf(b), relative(b, crs));
-      else snprintf(line, sizeof line, "stronger: %s %d deg  (+%.1f dB / 10 m)", compass8(b), (int)lroundf(b), s10);
-      g.setTextColor(t.green);
-      g.drawString(line, 8, y);
-      const int cx = L::W - 18, cy = y + 6, r = 8;   // north-up arrow
-      g.drawCircle(cx, cy, r + 2, t.line);
-      const float a = b * (float)M_PI / 180.0f;
-      g.drawLine(cx - (int)(sinf(a) * r), cy + (int)(cosf(a) * r), cx + (int)(sinf(a) * r), cy - (int)(cosf(a) * r), t.green);
-      g.fillCircle(cx + (int)(sinf(a) * r), cy - (int)(cosf(a) * r), 2, t.green);
-      g.drawPixel(cx, cy - r - 4, t.dim);           // north mark
-    } else {
-      g.setTextColor(t.dim);
-      g.drawString(!fixed ? "direction: needs a gps fix" : !_m.have ? "direction: waiting for readings"
-                                                                    : "direction: walk 15 m+, turning (an L or a loop)", 8, y);
-    }
-    return y + 18;
+    return dirdraw::draw(g, t, 8, y, L::W, _g, _sm, gps.hasFix(), _m.have, now);
   }
-  void clearReadings() { _m.clear(); _g.clear(); _fedN = 0; }
+  void clearReadings() { _m.clear(); _g.clear(); _sm.clear(); _fedN = 0; }
   uint32_t staleMs() const { return _mode == REP ? STALE_REP_MS : _mode == WIFI ? STALE_WIFI_MS : _mode == BT ? STALE_BT_MS : STALE_ANY_MS; }
   float level(float rssi) const { return (_mode == WIFI || _mode == BT) ? strength(rssi, WIFI_LO, WIFI_HI) : strength(rssi); }
   uint32_t _gen = 0, _clickAt = 0, _drawn = 0, _probeAt = 0, _lastProbe = 0;
