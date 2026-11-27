@@ -1,0 +1,8 @@
+# build output (setup.sh makes it)
+build/
+# tools/alpr_extract.py keeps its download beside it
+tools/cameras-*.geojson.gz
+tools/cameras-*.geojson.gz.part
+# preview output
+preview/out/
+__pycache__/
