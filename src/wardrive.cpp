@@ -216,7 +216,7 @@ static void start() {
   if (field::rangeOn()) { nav.toast("stop the range test first - they share the discover", 3000); return; }
   if (!s_live) s_live = psAlloc(LIVE_MAX);
   if (!s_live) { nav.toast("out of memory"); return; }
-  if (!openRunLog()) { s_path[0] = 0; nav.toast("no sd card: surveying without a log (map only)", 3000); }
+  if (!openRunLog()) { s_path[0] = 0; nav.toast((String(needs::sdShort()) + ": surveying without a log (map only)").c_str(), 3000); }
   s_on = true;
   s_reviewing = false;                         // the map follows the live run again
   s_liveN = 0;
@@ -351,7 +351,7 @@ static void livePage() {
     out.push_back(String("colour  ") + dirName(s_dir));
     if (s_newFound) out.push_back(String("new repeaters this run: ") + s_newFound + "  (last: " + s_newName + ")");
     const char* file = strrchr(s_path, '/');      // the name only: it's in /rabbit/wardrive
-    out.push_back(s_path[0] ? String("log   ") + (file ? file + 1 : s_path) : String("log   none (no sd card)"));
+    out.push_back(s_path[0] ? String("log   ") + (file ? file + 1 : s_path) : String("log   none (") + needs::sdShort() + ")");
     out.push_back("");
     if (s_nodes.empty()) out.push_back("nothing has answered a probe yet");
     else {
@@ -448,7 +448,7 @@ static void loadRun(const String& path) {
 // The reviewed run, for Google Earth (KML) or any GIS tool (GeoJSON), in /rabbit/wardrive/export.
 static void exportRun(bool kml) {
   if (!s_reviewing || !s_reviewN) { nav.toast("load a run first"); return; }
-  if (!sdMount()) { nav.toast("no sd card"); return; }
+  if (!sdMount()) { nav.toast(needs::sdShort()); return; }
   if (!SD.exists("/rabbit/wardrive/export")) SD.mkdir("/rabbit/wardrive/export");
   String base = s_reviewName;
   if (base.endsWith(".csv")) base = base.substring(0, base.length() - 4);

@@ -97,7 +97,7 @@ static void summaryLines(std::vector<String>& out, const Summary& m) {
   if (m.trip[0]) out.push_back(String("#  track  ") + fileOf(m.trip));
   if (m.wd[0]) out.push_back(String("#  mesh   ") + fileOf(m.wd));
   if (m.wigle[0]) out.push_back(String("#  wigle  ") + fileOf(m.wigle) + " (upload at wigle.net)");
-  if (!m.trip[0] && !m.wd[0] && !m.wigle[0]) out.push_back("#  nothing (no sd card)");
+  if (!m.trip[0] && !m.wd[0] && !m.wigle[0]) out.push_back(String("#  nothing (") + needs::sdShort() + ")");
 }
 
 static void showSummary() {

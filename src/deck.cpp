@@ -1,5 +1,6 @@
 // RabbitMesh deck (see deck.h). Data and keys here; the look is deck_draw.h.
 #include "deck.h"
+#include "needs.h"
 #include <vector>
 #include <algorithm>
 #include <SD.h>
@@ -172,7 +173,7 @@ static void tripRestore() {
 
 static void tripStart() {
   s_trip.start(nowS());
-  if (s_gpx && !gpxOpen()) nav.toast("no sd card: trip without a gpx track", 3000);
+  if (s_gpx && !gpxOpen()) nav.toast((String(needs::sdShort()) + ": trip without a gpx track").c_str(), 3000);
   logs.add(LOG_INFO, "trip started%s%s", s_gpxPath[0] ? ": " : "", s_gpxPath);
   tripSave();
 }

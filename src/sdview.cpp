@@ -137,8 +137,31 @@ static void folderMenu(const Folder& fo) {
   nav.push(m);
 }
 
+// A card that's in but can't be read: say why, and offer to make it one the T-Deck reads.
+static void unreadable() {
+  auto* m = new MenuView("SD card");
+  m->info("card", []() -> String { return String("in, but can't be read"); });
+  m->info("why", []() -> String { return String("not FAT32 (exFAT or a Mac format)"); });
+  m->info("fix", []() -> String { return String("format it here, or as FAT32 on a computer"); });
+  m->action("format it as FAT32 (erases it)", [] {
+    confirm("Format the SD card?", "everything on the card is erased. it becomes FAT32, which the T-Deck reads. large cards take a minute",
+            [] {
+              nav.busy("formatting the card...");
+              const char* r = sdFormat();
+              logs.add(LOG_INFO, "sd: format from the viewer: %s", r);
+              nav.toast(!strcmp(r, "formatted") ? "formatted: back, then open SD card again" : r, 4000);
+            });
+  });
+  nav.push(m);
+}
+
 void open() {
-  if (!sdMount()) { nav.toast("no sd card in the T-Deck", 3000); return; }
+  sdLookNow();   // a card put in a moment ago is looked at now, not in 10 s
+  if (!sdMount()) {
+    if (sdState() == SD_UNREADABLE) unreadable();
+    else nav.toast("no sd card found: push it in until it clicks, then try again", 3500);
+    return;
+  }
   auto* m = new MenuView("SD card");
   m->rebuild = [](MenuView& v) {
     if (!sdMounted()) { v.info("card", []() -> String { return String("not found"); }); return; }

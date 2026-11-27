@@ -468,7 +468,7 @@ static void startListening() {
   if (s_listen) return;
   if (wifi::enabled()) { nav.toast("turn off wifi (settings) first: listening hops channels", 3500); return; }
   if (wifidrive::running()) { nav.toast("stop the wifi + bt wardrive first", 3000); return; }
-  if (!openLog()) nav.toast("no sd card: listening without a log", 2500);
+  if (!openLog()) nav.toast((String(needs::sdShort()) + ": listening without a log").c_str(), 2500);
   WiFi.mode(WIFI_STA);
   WiFi.disconnect(false);
   s_weRaisedWifi = true;

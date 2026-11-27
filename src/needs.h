@@ -18,6 +18,9 @@ inline bool sdOk() {
   if (!at || millis() - at > 5000) { at = millis() | 1; ok = sdMount(); }
   return ok;
 }
+// Why there's no card, in a few words. A card that's in but can't be read is nearly always
+// exFAT (what cards over 32 GB come as) or a Mac's partition scheme: the T-Deck reads FAT32.
+inline const char* sdShort() { return sdState() == SD_UNREADABLE ? "sd card not FAT32" : "no sd card"; }
 inline bool gpsOk() { return gps.hasFix() && !(gps.fix().lat == 0 && gps.fix().lon == 0); }
 // While there's no fix: what the GPS hears, so "no fix" doesn't look like "no GPS". Satellites
 // counted on the GPS page are the ones it hears; a fix needs a few of them strong enough.
@@ -37,7 +40,10 @@ inline String line(uint8_t what) {
     s += ok ? " ok" : " NO";
   };
   if (what & GPS) { add("gps fix", gpsOk()); if (!gpsOk()) s += String(" (") + gpsWait() + ")"; }
-  if (what & SD_CARD) add("sd card", sdOk());
+  if (what & SD_CARD) {
+    add("sd card", sdOk());
+    if (!sdOk() && sdState() == SD_UNREADABLE) s += " (not FAT32: Deck > SD card can format it)";
+  }
   if (what & WIFI_OFF) add("wifi off", !wifi::enabled());
   if (what & WIFI_ON) add("wifi", wifi::connected());
   return s;

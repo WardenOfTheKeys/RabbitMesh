@@ -15,7 +15,7 @@ Built on [Squatch Mesh](https://github.com/BamBam1121/inw-mesh), with tools that
 ## What you need
 
 - A **LilyGo T-Deck or T-Deck Plus**. The Plus has GPS built in; a plain T-Deck needs one added for the GPS tools.
-- A **microSD card** for the logs (wardrive, WiGLE, tracks, camera map). Most tools still run without one.
+- A **microSD card** for the logs (wardrive, WiGLE, tracks, camera map), formatted **FAT32** (see [The SD card](#the-sd-card)). Most tools still run without one.
 - A computer with **Chrome or Edge** to flash it.
 
 ## Install
@@ -96,7 +96,20 @@ RabbitMesh tracks [MeshCore](https://github.com/meshcore-dev/MeshCore): each Mes
 - **Or watch this repository:** Watch > Custom > Releases on GitHub emails you when there's a new one.
 - **To update:** flash the new **update** file at `0x10000` (see Install). Your settings and contacts stay.
 
+## The SD card
+
+The T-Deck reads **FAT32** only. Cards of 32 GB and under usually come that way. Bigger cards (64 GB and up) come as **exFAT**, which the T-Deck can't read, so it acts as if there's no card. Any size works once it's FAT32.
+
+- **Easiest: on the T-Deck.** Put the card in, open Deck > SD card (`c`). If the card can't be read, it offers **format it as FAT32**. That erases the card.
+- **Windows:** File Explorer only offers FAT32 up to 32 GB. For a bigger card use a free tool such as [Rufus](https://rufus.ie) (Boot selection: Non bootable, File system: FAT32) or format it on the T-Deck.
+- **Mac:** Disk Utility > View > Show All Devices, select the card itself (not the volume under it), Erase, Format: **MS-DOS (FAT)**, Scheme: **Master Boot Record**.
+- **Linux:** `sudo mkfs.vfat -F 32 /dev/sdX1` (check the device name first).
+
+Push the card in until it clicks. You can put it in with the T-Deck on; the SD card page looks again each time you open it.
+
 ## Troubleshooting
+
+- **"No sd card" with a card in.** Open Deck > SD card. "Can't be read" means it isn't FAT32: format it there (or see [The SD card](#the-sd-card)). "No sd card found" means the slot doesn't see it: push it in until it clicks, or try another card.
 
 - **The clock is wrong or shows UTC.** Get a GPS fix outside once, connect the phone app, or save a WiFi network. With none of those, it sets the clock from the mesh once three nearby nodes agree on the time.
 - **"No camera map".** Flock > update camera map. It needs an SD card and a saved WiFi network; it turns the WiFi on and off by itself.

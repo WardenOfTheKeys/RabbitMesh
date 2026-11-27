@@ -124,6 +124,30 @@ index 3602ec0..6c4d0b5 100644
  // For ota.cpp: the two take turns on the network.
  bool reportPosting() { return report::posting(); }
 +#endif  // BOARD_HAS_REPORTS
+diff --git a/src/dataio.cpp b/src/dataio.cpp
+index a67e056..cb0b990 100644
+--- a/src/dataio.cpp
++++ b/src/dataio.cpp
+@@ -105,6 +105,7 @@ static uint32_t s_lookedAt = 0;
+ static uint32_t s_failedAt = 0;
+ static constexpr uint32_t SD_REST_MS = 300000;
+ static void sdLookAgain() { s_lookedAt = 0; s_failedAt = 0; }
++void sdLookNow() { sdLookAgain(); }
+ 
+ void sdWriteFailed(const char* what) {
+   if (!s_sd) return;
+diff --git a/src/dataio.h b/src/dataio.h
+index 3e7226c..5132bda 100644
+--- a/src/dataio.h
++++ b/src/dataio.h
+@@ -20,6 +20,7 @@ enum SdState : uint8_t { SD_NONE, SD_UNREADABLE, SD_MOUNTED };
+ SdState sdState();
+ // Formats a card that does NOT mount as FAT32; refuses one that mounts. Erases the card.
+ const char* sdFormat();
++void sdLookNow();   // forget the last failed look: the next sdMount() looks in the slot at once
+ #if INW_DEV
+ const char* sdTest(const char* what);   // developer build: info | ls | keep | gpt | back | format
+ #endif
 diff --git a/src/fieldtools.cpp b/src/fieldtools.cpp
 index db1df0d..0c97b8b 100644
 --- a/src/fieldtools.cpp

@@ -207,7 +207,7 @@ static void start() {
   if (!s_wifiMem || !s_bleMem) { nav.toast("out of memory"); return; }
   if (!s_wifiSeen) s_wifiSeen = new Seen(s_wifiMem, SEEN_SLOTS); else s_wifiSeen->clear();
   if (!s_bleSeen) s_bleSeen = new Seen(s_bleMem, SEEN_SLOTS); else s_bleSeen->clear();
-  if (!openLog()) { s_path[0] = 0; nav.toast("no sd card: scanning without a log", 3000); }
+  if (!openLog()) { s_path[0] = 0; nav.toast((String(needs::sdShort()) + ": scanning without a log").c_str(), 3000); }
   s_weRaisedWifi = false;
   if (s_wifiOn && !wifi::enabled()) {           // Squatch's wifi is off: bring the radio up just to scan
     WiFi.mode(WIFI_STA);
@@ -387,7 +387,7 @@ static void livePage() {
                   (s_bleOn ? (s_bleNote[0] ? String("  (") + s_bleNote + ")" : String("")) : String("  (scanning off)")));
     out.push_back(String("rows  ") + s_rows + (s_full ? String("  (table full: ") + s_full + " not logged)" : String("")));
     const char* file = strrchr(s_path, '/');        // the name only: the folder is on the menu
-    out.push_back(s_path[0] ? String("log   ") + (file ? file + 1 : s_path) : String("log   none (no sd card)"));
+    out.push_back(s_path[0] ? String("log   ") + (file ? file + 1 : s_path) : String("log   none (") + needs::sdShort() + ")");
     out.push_back("");
     bool any = false;
     for (int i = 0; i < 6; i++) {
