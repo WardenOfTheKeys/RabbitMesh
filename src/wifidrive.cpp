@@ -111,23 +111,29 @@ static void flush() {
   s_buf = "";
 }
 
-static void remember(const char* what) {
-  s_recent[s_recentNext] = what;
+// One of the latest seen, for the live page: the name and signal, and under it (dimmed) its
+// address and channel, as the flock hunt shows a camera's. A Bluetooth device on a random
+// address (most phones, for privacy) says so: that address changes, it isn't the device's own.
+static void remember(bool ble, const uint8_t mac[6], int ch, int rssi, bool open, bool randomAddr, const char* name) {
+  char top[48], m[18], sub[48];
+  snprintf(top, sizeof top, "%s %4d  %.30s", ble ? "BT  " : (open ? "OPEN" : "WiFi"), rssi, name && name[0] ? name : "(no name)");
+  macString(m, mac);
+  if (ble) snprintf(sub, sizeof sub, "#      %s%s", m, randomAddr ? "  (random)" : "");
+  else snprintf(sub, sizeof sub, "#      %s  ch %d", m, ch);
+  s_recent[s_recentNext] = String(top) + "\n" + sub;
   s_recentNext = (s_recentNext + 1) % 6;
 }
 
 // One sighting: counted, and logged if it's new or due again.
 static void sighting(bool ble, const uint8_t mac[6], const char* name, const char* caps, int ch, int freq, int mfgr,
-                     int rssi, bool open, double la, double lo, const char* when) {
+                     int rssi, bool open, double la, double lo, const char* when, bool randomAddr = false) {
   Seen* seen = ble ? s_bleSeen : s_wifiSeen;
   const int r = seen->note(macKey(mac), millis() / 1000, RESEEN_S, la, lo, RESEEN_MOVE_M);
   if (r == 0) return;
   if (r < 0) { s_full++; return; }
   if (r == 1) {
     if (ble) s_bleN++; else { s_wifiN++; if (open) s_openN++; }
-    char what[48];
-    snprintf(what, sizeof what, "%s %4d  %.30s", ble ? "BT  " : (open ? "OPEN" : "WiFi"), rssi, name && name[0] ? name : "(no name)");
-    remember(what);
+    remember(ble, mac, ch, rssi, open, randomAddr, name);
   }
   char m[18], line[256];
   macString(m, mac);
@@ -137,10 +143,8 @@ static void sighting(bool ble, const uint8_t mac[6], const char* name, const cha
 }
 
 // Seen without a GPS fix: shown on the live page, not counted or logged (WiGLE needs a position).
-static void glimpse(bool ble, int rssi, bool open, const char* name) {
-  char what[48];
-  snprintf(what, sizeof what, "%s %4d  %.30s", ble ? "BT  " : (open ? "OPEN" : "WiFi"), rssi, name && name[0] ? name : "(no name)");
-  remember(what);
+static void glimpse(bool ble, const uint8_t mac[6], int ch, int rssi, bool open, bool randomAddr, const char* name) {
+  remember(ble, mac, ch, rssi, open, randomAddr, name);
 }
 
 static void bleDone(BLEScanResults) { s_bleDone = true; }
@@ -243,7 +247,7 @@ static void wifiTick(uint32_t now, bool have, double la, double lo, const char* 
       const uint8_t a = (uint8_t)WiFi.encryptionType(i);
       const int ch = WiFi.channel(i);
       if (have) sighting(false, b, WiFi.SSID(i).c_str(), authString(a), ch, wifiFreqMHz(ch), -1, WiFi.RSSI(i), a == AUTH_OPEN, la, lo, when);
-      else glimpse(false, WiFi.RSSI(i), a == AUTH_OPEN, WiFi.SSID(i).c_str());
+      else glimpse(false, b, ch, WiFi.RSSI(i), a == AUTH_OPEN, false, WiFi.SSID(i).c_str());
     }
     WiFi.scanDelete();
     return;
@@ -281,8 +285,9 @@ static void bleTick(uint32_t now, bool have, double la, double lo, const char* w
           const std::string md = d.getManufacturerData();
           if (md.size() >= 2) mfgr = (uint8_t)md[0] | ((uint8_t)md[1] << 8);
         }
-        if (have) sighting(true, mac, nm.c_str(), BLE_CAPS, 0, 0, mfgr, d.getRSSI(), false, la, lo, when);
-        else glimpse(true, d.getRSSI(), false, nm.c_str());
+        const bool rnd = d.getAddressType() == BLE_ADDR_TYPE_RANDOM;
+        if (have) sighting(true, mac, nm.c_str(), BLE_CAPS, 0, 0, mfgr, d.getRSSI(), false, la, lo, when, rnd);
+        else glimpse(true, mac, 0, d.getRSSI(), false, rnd, nm.c_str());
       }
     }
     sc->clearResults();
@@ -338,7 +343,11 @@ static void livePage() {
     bool any = false;
     for (int i = 0; i < 6; i++) {
       const String& r = s_recent[(s_recentNext + 5 - i) % 6];
-      if (r.length()) { out.push_back(r); any = true; }
+      if (!r.length()) continue;
+      const int nl = r.indexOf('\n');                // the name line, then its address line
+      out.push_back(nl < 0 ? r : r.substring(0, nl));
+      if (nl >= 0) out.push_back(r.substring(nl + 1));
+      any = true;
     }
     if (!any) out.push_back(s_on ? "nothing seen yet" : "");
     out.push_back("");
