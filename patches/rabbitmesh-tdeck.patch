@@ -1,5 +1,5 @@
 diff --git a/platformio.ini b/platformio.ini
-index 5dbc895..c0f3c8c 100644
+index 5dbc895..ed4e994 100644
 --- a/platformio.ini
 +++ b/platformio.ini
 @@ -85,7 +85,7 @@ lib_deps =
@@ -24,7 +24,7 @@ index 5dbc895..c0f3c8c 100644
 +build_flags =
 +    ${env:t-deck.build_flags}
 +    -D RABBITMESH=1
-+    -D RABBITMESH_VERSION=\"0.1.1\"
++    -D RABBITMESH_VERSION=\"0.1.2\"
 +
  ; Local only, never built by CI: the T-Deck build plus the USB test commands (gps,
  ; gpsprobe, shot, key ...). pio run -e t-deck-dev

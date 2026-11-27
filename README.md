@@ -6,7 +6,7 @@ Mesh firmware for the **LilyGo T-Deck / T-Deck Plus**, with a cyberpunk rabbit. 
 
 - **Wardriving:** LoRa mesh coverage, and WiFi + Bluetooth to a WiGLE file, with one press (**Drive mode**).
 - **Flock hunt:** a map of ALPR cameras around you, warnings as you approach, and the radio listening for them.
-- **Signal tools:** fox hunt (LoRa or WiFi, with a "which way is stronger" hint), spectrum analyzer, RF monitor and packet log.
+- **Signal tools:** fox hunt (LoRa, WiFi or Bluetooth, with a "which way is stronger" arrow), spectrum analyzer, RF monitor and packet log.
 - **Field tools:** MECP emergency messages, SOS, range test, trip logging with GPX, nearby-contacts radar.
 - **Themes:** Neon Rabbit, Red Team and Blue Team, and holiday costumes that come round by themselves.
 
@@ -53,9 +53,9 @@ esptool.py --chip esp32s3 write_flash 0x10000 rabbitmesh-0.1.0-tdeck-update.bin 
 |---|---|---|
 | `d` | **Drive** | one press starts the trip, mesh survey, WiFi + BT wardrive and camera warnings; a summary when you stop |
 | `w` | **Wardrive** | mesh coverage: which repeaters hear you, and how well, on the map |
-| `b` | **WiFi/BT** | WiFi networks and Bluetooth devices to a WiGLE CSV you can upload at wigle.net |
+| `b` | **WiFi/BT** | WiFi networks and Bluetooth devices to a WiGLE CSV you can upload at wigle.net; "follow one" walks one down with the arrow |
 | `f` | **Flock** | the ALPR camera map, approach warnings, and listening for cameras |
-| `x` | **Fox** | walk a signal down: any mesh signal, one repeater, or one WiFi network |
+| `x` | **Fox** | walk a signal down: any mesh signal, one repeater, one WiFi network or one Bluetooth device |
 | `t` | **Trip** | speed, distance, time and a GPX track; survives a restart |
 | `r` | **RF Monitor** | signal, noise, the latest packets; pick one to see who sent it; `l` logs every packet |
 | `s` | **Spectrum** | a sweep of the band around your mesh channel (the mesh pauses while it sweeps) |

@@ -28,6 +28,13 @@ namespace wifidrive {
   void openMenu();
   // For Drive mode (drive.cpp).
   void setRunning(bool on);
+  // The fox hunt borrows the radios to follow one network or device: scanning pauses meanwhile
+  // (counts and the log stay as they are) and picks up again after.
+  void setPaused(bool on);
+  bool paused();
+  // What it has seen lately (the last two minutes), strongest first, to pick one to follow.
+  struct Recent { uint8_t mac[6]; uint8_t ch; bool ble, randomAddr; int8_t rssi; char name[24]; uint32_t at; };
+  size_t recent(Recent* out, size_t max);
   uint32_t openCount();        // open networks logged
   uint32_t rowsLogged();
   const char* logPath();       // "" if none

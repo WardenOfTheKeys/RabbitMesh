@@ -14,6 +14,9 @@
 #include "netwifi.h"
 #include "wifidrive.h"
 #include "flock.h"
+#include <BLEDevice.h>
+#include <BLEScan.h>
+#include "ble_up.h"
 
 namespace fox {
 
@@ -21,17 +24,20 @@ using namespace foxcore;
 
 constexpr uint32_t PROBE_MS = 8000;      // a ping every 8 s: zero-hop, but it's still airtime
 constexpr uint32_t HARVEST_MS = 5000;    // answers come in within this
-constexpr uint32_t STALE_ANY_MS = 20000, STALE_REP_MS = 25000, STALE_WIFI_MS = 5000;
+constexpr uint32_t STALE_ANY_MS = 20000, STALE_REP_MS = 25000, STALE_WIFI_MS = 5000, STALE_BT_MS = 6000;
+constexpr uint32_t BT_LIST_S = 3, BT_FOLLOW_S = 1;   // a 3 s listen for the list, then 1 s listens
 constexpr uint32_t WIFI_EVERY_MS = 700;  // one channel, one network: a reading about every second
 constexpr uint8_t WIFI_MISSES_WIDEN = 3; // not on its channel this many times: look on every channel
 
 struct Target { uint8_t key[4]; char name[24]; };
-struct Ap { uint8_t bssid[6]; uint8_t ch; int8_t rssi; char name[28]; };
-enum Mode : uint8_t { ANY = 0, REP, WIFI };
+struct Ap { uint8_t bssid[6]; uint8_t ch; int8_t rssi; char name[28]; bool rnd; };   // a WiFi network or a BT device
+enum Mode : uint8_t { ANY = 0, REP, WIFI, BT, MODES };
 
 // The scan-done event: the core reports a scan that ran past 6 s as failed even once its results
 // are in, so the event ends a scan and the results are counted directly (as wifidrive.cpp does).
 static volatile bool s_wifiDone = false;
+static volatile bool s_btDone = false;
+static void btDone(BLEScanResults) { s_btDone = true; }
 
 static ToneStep s_click[] = {{1200, 12}};
 static const Jingle CLICK_J = {"fox-click", s_click, 1, WAVE_SQUARE, false};
@@ -39,11 +45,26 @@ static const Jingle CLICK_J = {"fox-click", s_click, 1, WAVE_SQUARE, false};
 class FoxView : public View {
 public:
   FoxView() { if (g_node) _gen = g_node->pktGen; }
-  ~FoxView() override { if (_mode == WIFI) wifiLeave(); }
+  ~FoxView() override { leaveMode(); }
+
+  // Opened from the WiFi + BT wardrive's "follow one": straight to that network or device.
+  void follow(bool ble, const uint8_t mac[6], uint8_t ch, bool rnd, const char* name) {
+    leaveMode();
+    _mode = ble ? BT : WIFI;
+    enterMode();
+    Ap a = {};
+    memcpy(a.bssid, mac, 6);
+    a.ch = ch; a.rnd = rnd;
+    snprintf(a.name, sizeof a.name, "%s %02x%02x", name && name[0] ? name : "(no name)", mac[4], mac[5]);
+    _aps.clear();
+    _aps.push_back(a);
+    _apPick = 0;
+    _wAt = 0;
+  }
 
   void tick() override {
     const uint32_t now = millis();
-    if (_mode == REP) repeaterTick(now); else if (_mode == WIFI) wifiTick(now); else anyTick();
+    if (_mode == REP) repeaterTick(now); else if (_mode == WIFI) wifiTick(now); else if (_mode == BT) btTick(now); else anyTick();
     if (_m.n != _fedN) {                         // a new reading: where it was taken, for the direction
       _fedN = _m.n;
       if (gps.hasFix() && !(gps.fix().lat == 0 && gps.fix().lon == 0)) _g.add(gps.fix().lat, gps.fix().lon, _m.last, now);
@@ -63,7 +84,8 @@ public:
 
   void draw(Canvas& g) override {
     const Theme& t = nav.theme();
-    drawHeader(g, "Fox hunt", _mode == REP ? "repeater  m: wifi" : _mode == WIFI ? "wifi  m: any" : "any signal  m: repeater");
+    drawHeader(g, "Fox hunt", _mode == REP ? "repeater  m: wifi" : _mode == WIFI ? "wifi  m: bluetooth" : _mode == BT ? "bluetooth  m: any"
+                                                                                                         : "any signal  m: repeater");
     const uint32_t now = millis();
     const bool fresh = _m.fresh(now, staleMs());
     int y = L::BODY_Y + 4;
@@ -71,8 +93,10 @@ public:
     g.setFont(&fonts::Font2);
     g.setTextColor(t.dim);
     char line[64];
-    if (_mode == WIFI) {
-      if (_aps.empty()) snprintf(line, sizeof line, _wListing ? "listing wifi networks..." : "press: list wifi networks");
+    if (_mode == WIFI || _mode == BT) {
+      if (_aps.empty()) snprintf(line, sizeof line, _wListing ? (_mode == BT ? "listening for bluetooth..." : "listing wifi networks...")
+                                                              : (_mode == BT ? "press: list bluetooth devices" : "press: list wifi networks"));
+      else if (_mode == BT) snprintf(line, sizeof line, "target  %.23s  %u/%u </>", _aps[_apPick].name, (unsigned)_apPick + 1, (unsigned)_aps.size());
       else snprintf(line, sizeof line, "target  %.23s ch%u  %u/%u </>", _aps[_apPick].name, (unsigned)_aps[_apPick].ch,
                     (unsigned)_apPick + 1, (unsigned)_aps.size());   // fits the screen: names are cut
     } else if (_mode == REP) {
@@ -115,7 +139,7 @@ public:
       const unsigned ago = (now - _m.at) / 1000;
       snprintf(line, sizeof line, "last %d dBm  peak %d dBm  %us ago", (int)lroundf(_m.last), (int)lroundf(_m.peak), ago);
     } else {
-      snprintf(line, sizeof line, _mode == REP ? "waiting for an answer" : _mode == WIFI ? (_aps.empty() ? "" : "waiting for a reading")
+      snprintf(line, sizeof line, _mode == REP ? "waiting for an answer" : (_mode == WIFI || _mode == BT) ? (_aps.empty() ? "" : "waiting for a reading")
                                                                                   : "waiting for a packet");
     }
     g.drawString(line, 8, y);
@@ -131,17 +155,19 @@ public:
   void press() override {
     if (_mode == REP) startScan();
     else if (_mode == WIFI) listNetworks();
+    else if (_mode == BT) listBt();
     dirty = true;
   }
   void rotate(int d) override { pickTarget(d); }
   bool roll(int dx, int dy) override { if (dx) pickTarget(dx); return dx != 0; }
   void key(char c) override {
     if (c == 'm' || c == 'M') {
-      if (_mode == WIFI) wifiLeave();
-      _mode = (Mode)((_mode + 1) % 3);
+      leaveMode();
+      _mode = (Mode)((_mode + 1) % MODES);
       clearReadings(); _note[0] = 0; _probeAt = 0;
+      _aps.clear(); _apPick = 0;
       if (_mode == ANY && g_node) _gen = g_node->pktGen;
-      if (_mode == WIFI) wifiEnter();
+      enterMode();
     }
     if (c == 's' || c == 'S') _sound = !_sound;
     if (c == 'p' || c == 'P') _m.resetPeak();
@@ -189,8 +215,8 @@ private:
     return y + 18;
   }
   void clearReadings() { _m.clear(); _g.clear(); _fedN = 0; }
-  uint32_t staleMs() const { return _mode == REP ? STALE_REP_MS : _mode == WIFI ? STALE_WIFI_MS : STALE_ANY_MS; }
-  float level(float rssi) const { return _mode == WIFI ? strength(rssi, WIFI_LO, WIFI_HI) : strength(rssi); }
+  uint32_t staleMs() const { return _mode == REP ? STALE_REP_MS : _mode == WIFI ? STALE_WIFI_MS : _mode == BT ? STALE_BT_MS : STALE_ANY_MS; }
+  float level(float rssi) const { return (_mode == WIFI || _mode == BT) ? strength(rssi, WIFI_LO, WIFI_HI) : strength(rssi); }
   uint32_t _gen = 0, _clickAt = 0, _drawn = 0, _probeAt = 0, _lastProbe = 0;
   std::vector<Target> _targets;
   size_t _pick = 0;
@@ -251,6 +277,7 @@ private:
   // The radio is the firmware's own (netwifi.h): with its WiFi off it's brought up just for this
   // and turned off again after; the wardrive and the flock hunt have it first.
   void wifiEnter() {
+    pauseWardrive();
     _wScanning = _wListing = false;
     _wMiss = 0;
     _wAt = 0;
@@ -258,7 +285,7 @@ private:
     if (!_wEvt) _wEvt = WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { s_wifiDone = true; },
                                      ARDUINO_EVENT_WIFI_SCAN_DONE);
     _wRaised = false;
-    if (!wifi::enabled() && !wifidrive::running() && !flockhunt::listening() && WiFi.getMode() == WIFI_OFF) {
+    if (!wifi::enabled() && !flockhunt::listening() && WiFi.getMode() == WIFI_OFF) {
       WiFi.mode(WIFI_STA);
       WiFi.disconnect(false);
       _wRaised = true;
@@ -269,11 +296,102 @@ private:
     if (_wEvt) { WiFi.removeEvent(_wEvt); _wEvt = 0; }
     if (_wRaised && !wifi::enabled() && !wifidrive::running() && !flockhunt::listening()) WiFi.mode(WIFI_OFF);
     _wRaised = false;
+    resumeWardrive();
   }
+  // The WiFi + BT wardrive pauses while this has the radios (it carries on after); the flock
+  // hunt's listening can't be paused like that, so it has to be stopped first.
   const char* wifiBusy() const {
-    if (wifidrive::running()) return "the wifi + bt wardrive is using the radio";
-    if (flockhunt::listening()) return "the flock hunt is listening on wifi";
+    if (flockhunt::listening()) return "the flock hunt is listening: stop it first";
     return nullptr;
+  }
+  bool _pausedWd = false;
+  void pauseWardrive() { if (wifidrive::running() && !wifidrive::paused()) { wifidrive::setPaused(true); _pausedWd = true; } }
+  void resumeWardrive() { if (_pausedWd) { wifidrive::setPaused(false); _pausedWd = false; } }
+  void enterMode() { if (_mode == WIFI) wifiEnter(); else if (_mode == BT) btEnter(); }
+  void leaveMode() { if (_mode == WIFI) wifiLeave(); else if (_mode == BT) btLeave(); }
+
+  // ---- bluetooth: one device, by its address ----------------------------------------------------
+  // Listens for it (passively: nothing is sent) a second at a time. A device on a random address
+  // (most phones) changes it every few minutes, and then can't be followed by it.
+  void btEnter() {
+    pauseWardrive();
+    _wScanning = _wListing = false;
+    _wMiss = 0; _wAt = 0;
+    s_btDone = false;
+    if (!rabbit_ble::up()) { strlcpy(_note, "bluetooth wouldn't start", sizeof _note); return; }
+    BLEScan* sc = BLEDevice::getScan();
+    sc->setActiveScan(false);
+    sc->setInterval(100);
+    sc->setWindow(90);                           // listening nearly all the time
+  }
+  void btLeave() {
+    if (_wScanning) { BLEDevice::getScan()->stop(); BLEDevice::getScan()->clearResults(); _wScanning = _wListing = false; }
+    resumeWardrive();
+  }
+  bool btScan(uint32_t secs, uint32_t now) {
+    s_btDone = false;
+    if (!BLEDevice::getScan()->start(secs, btDone, false)) { strlcpy(_note, "couldn't start a bluetooth listen, retrying", sizeof _note); return false; }
+    _wScanning = true;
+    _wStart = now;
+    return true;
+  }
+  void listBt() {
+    if (const char* b = wifiBusy()) { strlcpy(_note, b, sizeof _note); return; }
+    if (_wScanning) return;
+    if (btScan(BT_LIST_S, millis())) { _wListing = true; _note[0] = 0; }
+  }
+  void btTick(uint32_t now) {
+    if (const char* b = wifiBusy()) { strlcpy(_note, b, sizeof _note); return; }
+    if (_wScanning) {
+      if (!s_btDone && now - _wStart < (_wListing ? BT_LIST_S : BT_FOLLOW_S) * 1000 + 3000) return;
+      _wScanning = false;
+      s_btDone = false;
+      BLEScan* sc = BLEDevice::getScan();
+      BLEScanResults res = sc->getResults();
+      const int n = res.getCount();
+      if (_wListing) {
+        _wListing = false;
+        _aps.clear();
+        for (int i = 0; i < n; i++) {
+          BLEAdvertisedDevice d = res.getDevice(i);
+          const uint8_t* mac = (const uint8_t*)d.getAddress().getNative();
+          bool dup = false;
+          for (auto& a : _aps) if (!memcmp(a.bssid, mac, 6)) dup = true;
+          if (dup) continue;
+          Ap a = {};
+          memcpy(a.bssid, mac, 6);
+          a.rssi = (int8_t)d.getRSSI();
+          a.rnd = d.getAddressType() == BLE_ADDR_TYPE_RANDOM;
+          const std::string nm = d.haveName() ? d.getName() : std::string();
+          snprintf(a.name, sizeof a.name, "%.18s %02x%02x", nm.empty() ? "(no name)" : nm.c_str(), mac[4], mac[5]);
+          for (char* p = a.name; *p; p++) if ((uint8_t)*p < 32 || (uint8_t)*p > 126) *p = '?';
+          _aps.push_back(a);
+        }
+        // fixed addresses first (they can be followed), each lot strongest first
+        std::sort(_aps.begin(), _aps.end(), [](const Ap& x, const Ap& y) { return x.rnd != y.rnd ? !x.rnd : x.rssi > y.rssi; });
+        if (_aps.size() > 30) _aps.resize(30);
+        _apPick = 0;
+        clearReadings();
+        strlcpy(_note, _aps.empty() ? "no bluetooth devices heard - press to listen again" : "", sizeof _note);
+        _wMiss = 0; _wAt = 0;
+      } else if (!_aps.empty()) {
+        const Ap& t = _aps[_apPick];
+        bool got = false;
+        for (int i = 0; i < n && !got; i++) {
+          BLEAdvertisedDevice d = res.getDevice(i);
+          if (memcmp(d.getAddress().getNative(), t.bssid, 6)) continue;
+          _m.feed(d.getRSSI(), now);
+          got = true;
+        }
+        if (got) { _wMiss = 0; _note[0] = 0; }
+        else if (_wMiss < 250 && ++_wMiss >= 3)
+          strlcpy(_note, t.rnd ? "not heard - a random address may have changed" : "not heard lately - out of range?", sizeof _note);
+      }
+      sc->clearResults();
+      return;
+    }
+    if (_aps.empty()) return;
+    btScan(BT_FOLLOW_S, now);
   }
   bool wifiScan(uint8_t ch, const uint8_t* bssid, uint32_t now) {
     if (WiFi.getMode() == WIFI_OFF) { WiFi.mode(WIFI_STA); WiFi.disconnect(false); _wRaised = !wifi::enabled(); }
@@ -365,7 +483,7 @@ private:
   }
 
   void pickTarget(int d) {
-    if (_mode == WIFI) {
+    if (_mode == WIFI || _mode == BT) {
       if (_aps.empty()) return;
       _apPick = (_apPick + _aps.size() + (d > 0 ? 1 : -1)) % _aps.size();
       clearReadings();
@@ -384,5 +502,11 @@ private:
 };
 
 void open() { nav.push(new FoxView()); }
+
+void follow(bool ble, const uint8_t mac[6], uint8_t ch, bool randomAddr, const char* name) {
+  auto* v = new FoxView();
+  v->follow(ble, mac, ch, randomAddr, name);
+  nav.push(v);
+}
 
 }  // namespace fox

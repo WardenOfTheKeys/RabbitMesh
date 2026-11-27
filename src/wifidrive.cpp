@@ -1,6 +1,8 @@
 // RabbitMesh WiFi + Bluetooth wardrive (see wifidrive.h).
 #include "wifidrive.h"
 #include <WiFi.h>
+#include <vector>
+#include <algorithm>
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include "ble_up.h"
@@ -17,6 +19,7 @@
 #include "wigle_core.h"
 #include "flock.h"
 #include "needs.h"
+#include "fox.h"
 #include <esp_idf_version.h>
 #include <esp_system.h>
 
@@ -54,6 +57,23 @@ static uint32_t s_wifiScanStart = 0;
 static uint16_t s_wifiNow = 0, s_bleNow = 0;   // in range in the last scan, fix or not
 static String s_buf;
 static String s_recent[6];
+// Lately seen, one per address, for "follow one" (the fox hunt); see recent().
+static constexpr size_t CANDS = 24;
+static Recent s_cands[CANDS];
+static bool s_paused = false;
+static void noteCand(bool ble, const uint8_t mac[6], int ch, int rssi, bool rnd, const char* name) {
+  size_t slot = 0;
+  for (size_t i = 0; i < CANDS; i++) {
+    if (s_cands[i].at && !memcmp(s_cands[i].mac, mac, 6) && s_cands[i].ble == ble) { slot = i; break; }
+    if (!s_cands[i].at) { slot = i; break; }
+    if (s_cands[i].at < s_cands[slot].at) slot = i;          // full: the longest-ago one goes
+  }
+  Recent& c = s_cands[slot];
+  memcpy(c.mac, mac, 6);
+  c.ch = (uint8_t)ch; c.ble = ble; c.randomAddr = rnd; c.rssi = (int8_t)rssi; c.at = millis() | 1;
+  snprintf(c.name, sizeof c.name, "%s", name && name[0] ? name : "(no name)");
+  for (char* p = c.name; *p; p++) if ((uint8_t)*p < 32 || (uint8_t)*p > 126) *p = '?';
+}
 static uint8_t s_recentNext = 0;
 static const char* s_wifiNote = "";
 static const char* s_bleNote = "";
@@ -115,6 +135,7 @@ static void flush() {
 // address and channel, as the flock hunt shows a camera's. A Bluetooth device on a random
 // address (most phones, for privacy) says so: that address changes, it isn't the device's own.
 static void remember(bool ble, const uint8_t mac[6], int ch, int rssi, bool open, bool randomAddr, const char* name) {
+  noteCand(ble, mac, ch, rssi, randomAddr, name);
   char top[48], m[18], sub[48];
   snprintf(top, sizeof top, "%s %4d  %.30s", ble ? "BT  " : (open ? "OPEN" : "WiFi"), rssi, name && name[0] ? name : "(no name)");
   macString(m, mac);
@@ -207,6 +228,7 @@ static void start() {
   s_wifiScanning = s_bleScanning = false;
   s_bleDone = false;
   s_wifiDoneEvt = false;
+  s_paused = false;
   s_wifiNow = s_bleNow = 0;
   s_wifiNote = "";
   if (!s_wifiEvtId) s_wifiEvtId = WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t) { s_wifiDoneEvt = true; },
@@ -246,6 +268,7 @@ static void wifiTick(uint32_t now, bool have, double la, double lo, const char* 
       if (!b) continue;
       const uint8_t a = (uint8_t)WiFi.encryptionType(i);
       const int ch = WiFi.channel(i);
+      noteCand(false, b, ch, WiFi.RSSI(i), false, WiFi.SSID(i).c_str());
       if (have) sighting(false, b, WiFi.SSID(i).c_str(), authString(a), ch, wifiFreqMHz(ch), -1, WiFi.RSSI(i), a == AUTH_OPEN, la, lo, when);
       else glimpse(false, b, ch, WiFi.RSSI(i), a == AUTH_OPEN, false, WiFi.SSID(i).c_str());
     }
@@ -286,6 +309,7 @@ static void bleTick(uint32_t now, bool have, double la, double lo, const char* w
           if (md.size() >= 2) mfgr = (uint8_t)md[0] | ((uint8_t)md[1] << 8);
         }
         const bool rnd = d.getAddressType() == BLE_ADDR_TYPE_RANDOM;
+        noteCand(true, mac, 0, d.getRSSI(), rnd, nm.c_str());
         if (have) sighting(true, mac, nm.c_str(), BLE_CAPS, 0, 0, mfgr, d.getRSSI(), false, la, lo, when, rnd);
         else glimpse(true, mac, 0, d.getRSSI(), false, rnd, nm.c_str());
       }
@@ -300,8 +324,32 @@ static void bleTick(uint32_t now, bool have, double la, double lo, const char* w
   else s_bleNote = rabbit_ble::up() ? "couldn't start a scan, retrying" : "bluetooth wouldn't start";
 }
 
+void setPaused(bool on) {
+  if (on == s_paused) return;
+  s_paused = on;
+  if (on) {                                     // hand the radios over clean
+    if (s_wifiScanning) { WiFi.scanDelete(); s_wifiScanning = false; }
+    if (s_bleScanning) { BLEDevice::getScan()->stop(); BLEDevice::getScan()->clearResults(); s_bleScanning = false; }
+    s_bleDone = false;
+  } else {
+    s_wifiAt = s_bleAt = 0;                     // scan again straight away
+  }
+}
+bool paused() { return s_paused; }
+
+size_t recent(Recent* out, size_t max) {
+  const uint32_t now = millis();
+  std::vector<Recent> v;
+  for (const Recent& c : s_cands) if (c.at && now - c.at < 120000) v.push_back(c);
+  std::sort(v.begin(), v.end(), [](const Recent& a, const Recent& b) { return a.rssi > b.rssi; });
+  size_t n = 0;
+  for (const Recent& c : v) { if (n >= max) break; out[n++] = c; }
+  return n;
+}
+
 void tick() {
   if (!s_on) return;
+  if (s_paused) { if (millis() - s_flushAt > 5000) flush(); return; }   // the fox hunt has the radios
   const uint32_t now = millis();
   double la = 0, lo = 0;
   char when[24] = "";
@@ -352,9 +400,33 @@ static void livePage() {
     if (!any) out.push_back(s_on ? "nothing seen yet" : "");
     out.push_back("");
     out.push_back(s_on ? "press: stop" : "press: start");
+    out.push_back("#to walk one down with the arrow: menu > follow one");
   }, 1000);
   v->onPress = [] { if (s_on) stop(); else start(); };
   nav.push(v);
+}
+
+// Pick one of what it has seen lately and follow it in the fox hunt: the signal meter, the
+// Geiger click and, walking with a GPS fix, the "which way is stronger" arrow.
+static void followMenu() {
+  auto* m = new MenuView("Follow one");
+  m->rebuild = [](MenuView& v) {
+    Recent list[16];
+    const size_t n = recent(list, 16);
+    if (!n) { v.info("nothing", []() -> String { return String(s_on ? "seen in the last 2 minutes yet" : "start the wardrive first"); }); return; }
+    v.info("how", []() -> String { return String("pick one: the fox hunt follows it, with the arrow"); });
+    for (size_t i = 0; i < n; i++) {
+      const Recent c = list[i];
+      char label[48];
+      snprintf(label, sizeof label, "%s %4d  %.20s%s", c.ble ? "BT  " : "WiFi", c.rssi, c.name, c.randomAddr ? " (random)" : "");
+      v.action(label, [c] {
+        if (c.ble && c.randomAddr) nav.toast("a random address: it may change and vanish", 3000);
+        fox::follow(c.ble, c.mac, c.ch, c.randomAddr, c.name);
+      });
+    }
+  };
+  m->rebuild(*m);
+  nav.push(m);
 }
 
 void openMenu() {
@@ -371,6 +443,7 @@ void openMenu() {
       else { start(); if (s_on && s_path[0]) nav.toast("scanning - logs go to the sd card", 3000); }
     });
     v.action("live view", [] { livePage(); });
+    v.action("follow one (with the direction arrow)", [] { followMenu(); });
     v.header("scan");
     v.toggle("wifi access points", [] { return s_wifiOn; }, [] { s_wifiOn = !s_wifiOn; savePrefs(); });
     v.toggle("bluetooth le devices", [] { return s_bleOn; }, [] { s_bleOn = !s_bleOn; savePrefs(); });
