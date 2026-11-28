@@ -1,164 +1,206 @@
-// RabbitMesh "Burrow Breach": the picture (see bricks_core.h). In the theme's own colours, so the
-// Neon Rabbit, Red Team and Blue Team themes each give it their look: a dark grid, neon firewall
-// blocks, white ICE that cracks, the rabbit's hoverboard with its ears up, a glowing packet with
-// a trail, and falling carrots.
+// RabbitMesh "Burrow Breaker": the picture (see bricks_core.h), made from the concept art
+// (art/game/burrow_breaker_concept.png, turned into bricks_art.h by tools/make_game_art.py):
+// the framed screen with the hooded rabbit and the city, server-rack blocks, steel plates that
+// crack, the bunny-eared hoverboard, carrots with their trail, the packet with its trail, and
+// magenta sparks where a block breaks. The whole screen, title bar included.
 #pragma once
 #include <stdio.h>
 #include "bricks_core.h"
-#include "deck_draw.h"     // mix(), the screen size
+#include "bricks_art.h"
 
 namespace bricks {
 
-using deckdraw::mix;
+namespace A = bricksart;
 
-template <class G>
-inline void centre(G& g, const char* s, int y, int x0 = 0, int w = FW) { g.drawString(s, x0 + (w - (int)g.textWidth(s)) / 2, y); }
-
-// A carrot, 9 x 13, its tip at the bottom: what a broken block sometimes drops.
-template <class G>
-inline void carrot(G& g, const Theme& t, int cx, int cy, uint8_t kind) {
-  const uint16_t orange = mix(t.amber, t.red, 0.25f);
-  g.fillTriangle(cx - 4, cy - 3, cx + 4, cy - 3, cx, cy + 7, orange);
-  g.drawFastHLine(cx - 2, cy, 3, mix(orange, t.bg, 0.4f));
-  g.drawFastHLine(cx - 1, cy + 3, 2, mix(orange, t.bg, 0.4f));
-  g.drawLine(cx, cy - 4, cx - 3, cy - 7, t.green);
-  g.drawLine(cx, cy - 4, cx, cy - 8, t.green);
-  g.drawLine(cx, cy - 4, cx + 3, cy - 7, t.green);
-  static const char* L[] = {"", "W", "M", "S", "+"};
-  g.setFont(&fonts::Font0);
-  g.setTextColor(t.white);
-  g.drawString(L[kind < 5 ? kind : 0], cx + 6, cy - 3);
+inline uint16_t mix565(uint16_t a, uint16_t b, float f) {
+  if (f <= 0) return a;
+  if (f >= 1) return b;
+  const int r = ((a >> 11) & 31) + (int)((((b >> 11) & 31) - ((a >> 11) & 31)) * f);
+  const int g = ((a >> 5) & 63) + (int)((((b >> 5) & 63) - ((a >> 5) & 63)) * f);
+  const int bl = (a & 31) + (int)(((b & 31) - (a & 31)) * f);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
 }
+constexpr uint16_t C_WHITE = 0xFFFF, C_LAVENDER = 0xAC9A, C_PANEL = 0x1045, C_PURPLE = 0x6150;
 
-// The rabbit's hoverboard: a neon bar with a glow under it and two ears standing up from it.
-template <class G>
-inline void board(G& g, const Theme& t, int x0, int y0, float px, float w, float phase) {
-  const int x = x0 + (int)lroundf(px - w / 2), y = y0 + PADDLE_Y, iw = (int)lroundf(w);
-  g.fillRoundRect(x - 2, y + 2, iw + 4, PADDLE_H + 2, 3, mix(t.bg, t.green, 0.25f));   // the glow under it
-  g.fillRoundRect(x, y, iw, PADDLE_H, 2, t.green);
-  g.drawFastHLine(x + 2, y + 1, iw - 4, mix(t.green, t.white, 0.6f));
-  // the ears, leaning a little with the hover
-  const int lean = (int)lroundf(sinf(phase * 3.0f));
-  const int ex = x + iw / 2;
-  const uint16_t pink = mix(t.red, t.white, 0.45f);
-  g.fillEllipse(ex - 7 + lean, y - 7, 3, 7, t.green);
-  g.fillEllipse(ex + 7 + lean, y - 7, 3, 7, t.green);
-  g.fillEllipse(ex - 7 + lean, y - 7, 1, 5, pink);
-  g.fillEllipse(ex + 7 + lean, y - 7, 1, 5, pink);
-  // thrusters
-  for (int k = 0; k < 3; k++) {
-    const int fx = x + 4 + k * (iw - 8) / 2;
-    const int fl = 2 + (int)((sinf(phase * 20.0f + k * 2.1f) * 0.5f + 0.5f) * 3);
-    g.drawFastVLine(fx, y + PADDLE_H, fl, mix(t.bg, t.blue, 0.8f));
+// The sparks: a handful of magenta squares thrown from each block that breaks. Kept by the
+// screen (it's only looks), fed from Game::burst.
+struct Sparks {
+  struct P { float x, y, vx, vy, life; };
+  P p[48];
+  uint32_t seed = 0x9E3779B9u;
+  Sparks() { for (auto& q : p) q.life = 0; }
+  float rnd() { seed ^= seed << 13; seed ^= seed >> 17; seed ^= seed << 5; return (seed % 1000) / 1000.0f; }
+  void add(const Game& g) {
+    for (int i = 0; i < g.nburst; i++) {
+      int made = 0;
+      for (auto& q : p) {
+        if (q.life > 0) continue;
+        q.x = g.burst[i].x + (rnd() - 0.5f) * BW * 0.8f; q.y = g.burst[i].y + (rnd() - 0.5f) * BH;
+        q.vx = (rnd() - 0.5f) * 90; q.vy = (rnd() - 0.7f) * 70; q.life = 0.35f + rnd() * 0.35f;
+        if (++made == 8) break;
+      }
+    }
   }
+  void step(float dt) {
+    for (auto& q : p) if (q.life > 0) { q.x += q.vx * dt; q.y += q.vy * dt; q.vy += 120 * dt; q.life -= dt; }
+  }
+};
+
+// The background, unpacked (W x H, byte-swapped): once, into memory the caller gives.
+inline void unpackBackground(uint16_t* out) {
+  int n = 0;
+  for (int i = 0; i < A::BG_NRUNS; i++)
+    for (int k = 0; k < A::BG_RUNS[i * 2]; k++) if (n < A::W * A::H) out[n++] = A::BG_RUNS[i * 2 + 1];
 }
 
-// The whole field at (x0, y0): FW x FH. best: the saved best score; sound: on or off.
+// The score's digits, 5 x 7, in the art's cyan.
+static const uint8_t DIGITS[10][7] = {
+  {0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E}, {0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E},
+  {0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F}, {0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E},
+  {0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02}, {0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E},
+  {0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E}, {0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08},
+  {0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E}, {0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C},
+};
 template <class G>
-inline void draw(G& g, const Theme& t, const Game& gm, int x0, int y0, float phase, uint32_t best, bool sound) {
+inline void digit(G& g, int n, int x, int y) {
+  for (int r = 0; r < 7; r++)
+    for (int c = 0; c < 5; c++)
+      if (DIGITS[n][r] & (0x10 >> c)) g.drawPixel(x + c, y + r, A::C_CYAN);
+}
+template <class G>
+inline void score(G& g, uint32_t v, int x, int y) {
+  char s[8];
+  snprintf(s, sizeof s, "%06lu", (unsigned long)(v % 1000000));
+  for (int i = 0; i < 6; i++) digit(g, s[i] - '0', x + (int)lroundf(i * 6.4f), y);
+}
+
+// The board, its middle stretched for the wide one (the ears stay where they are on it).
+template <class G>
+inline void board(G& g, float px, float w) {
+  const int extra = (int)lroundf(w) - PADDLE_W;
+  const int x = (int)lroundf(px - w / 2) - A::BOARD_BAR_X, y = PADDLE_Y - A::BOARD_BAR_Y;
+  if (extra <= 0) { g.pushImage(x, y, A::BOARD_W, A::BOARD_H, (const lgfx::swap565_t*)A::BOARD, lgfx::swap565_t(A::KEY)); return; }
+  constexpr int MAXW = A::BOARD_W + (PADDLE_WIDE - PADDLE_W);
+  static uint16_t wide[A::BOARD_H * MAXW];
+  const int ex = extra > PADDLE_WIDE - PADDLE_W ? PADDLE_WIDE - PADDLE_W : extra;
+  const int ww = A::BOARD_W + ex, mid = A::BOARD_W / 2 - 1;     // the column repeated: bar only
+  for (int r = 0; r < A::BOARD_H; r++)
+    for (int c = 0; c < ww; c++) {
+      const int sc = c <= mid ? c : c <= mid + ex ? mid : c - ex;
+      wide[r * ww + c] = A::BOARD[r * A::BOARD_W + sc];
+    }
+  g.pushImage(x, y, ww, A::BOARD_H, (const lgfx::swap565_t*)wide, lgfx::swap565_t(A::KEY));
+}
+
+template <class G>
+inline void panel(G& g, int x, int y, int w, int h) {
+  g.fillRect(x, y, w, h, C_PANEL);
+  g.drawRect(x, y, w, h, A::C_MAGENTA);
+  g.drawRect(x + 2, y + 2, w - 4, h - 4, C_PURPLE);
+}
+template <class G>
+inline void centre(G& g, const char* s, int y) { g.drawString(s, (FW - (int)g.textWidth(s)) / 2, y); }
+
+// The whole screen. bg: the unpacked background (unpackBackground), or null to draw on what's there.
+template <class G>
+inline void draw(G& g, const Game& gm, const Sparks& sp, const uint16_t* bg, uint32_t best, bool sound) {
   char s[48];
-  // the grid
-  const uint16_t grid = mix(t.bg, t.line, 0.35f);
-  for (int x = 16; x < FW; x += 32) for (int y = HUD_H + 2; y < FH; y += 4) g.drawPixel(x0 + x, y0 + y, grid);
-  for (int y = HUD_H + 18; y < FH; y += 24) for (int x = 0; x < FW; x += 4) g.drawPixel(x0 + x, y0 + y, grid);
+  if (bg) g.pushImage(0, 0, A::W, A::H, (const lgfx::swap565_t*)bg, lgfx::swap565_t(A::KEY));
 
-  // the top line: score, level, lives (as pairs of ears)
-  g.setFont(&fonts::Font0);
-  g.setTextColor(t.green);
-  snprintf(s, sizeof s, "%06lu", (unsigned long)gm.score);
-  g.drawString(s, x0 + 4, y0 + 2);
-  g.setTextColor(t.dim);
-  snprintf(s, sizeof s, "L%u %s", (unsigned)(gm.level + 1), gm.lvl().name);
-  centre(g, s, y0 + 2, x0);
-  for (int i = 0; i < gm.lives && i < 5; i++) {                 // a rabbit's head for each life
-    const int lx = x0 + FW - 8 - i * 12;
-    g.fillEllipse(lx - 2, y0 + 3, 1, 3, t.green);
-    g.fillEllipse(lx + 2, y0 + 3, 1, 3, t.green);
-    g.fillCircle(lx, y0 + 8, 3, t.green);
-    g.drawPixel(lx - 1, y0 + 8, t.bg); g.drawPixel(lx + 1, y0 + 8, t.bg);
+  // the title bar: the score, and the lives: a pair of ears each, where the art has them, or
+  // past two, one pair and how many
+  score(g, gm.score, 219, 7);
+  auto ears = [&](int x) { g.pushImage(x, 4, A::EARS_W, A::EARS_H, (const lgfx::swap565_t*)A::EARS, lgfx::swap565_t(A::KEY)); };
+  if (gm.lives <= 2) { for (int i = 0; i < gm.lives; i++) ears(275 + i * 19); }
+  else {
+    ears(275);
+    for (int r = 0; r < 5; r++) for (int c = 0; c < 5; c++) if ((r == c || r == 4 - c)) g.drawPixel(296 + c, 9 + r, A::C_CYAN);   // x
+    digit(g, gm.lives > 9 ? 9 : gm.lives, 303, 7);
   }
-  if (gm.lives > 5) { snprintf(s, sizeof s, "+%u", (unsigned)(gm.lives - 5)); g.setTextColor(t.green); g.drawString(s, x0 + FW - 80, y0 + 2); }
-  g.drawFastHLine(x0, y0 + HUD_H, FW, mix(t.bg, t.line, 0.7f));
 
-  // the firewall: a colour per row; ICE white, cracked once hit
-  const uint16_t rowc[ROWS] = {t.red, t.amber, mix(t.amber, t.green, 0.5f), t.green, t.blue, mix(t.blue, t.red, 0.5f), t.red};
+  // the wall
   for (int r = 0; r < ROWS; r++)
     for (int c = 0; c < COLS; c++) {
       if (!gm.hp[r][c]) continue;
-      const int bx = x0 + Game::brickX(c), by = y0 + Game::brickY(r);
-      if (gm.ice[r][c]) {
-        g.fillRect(bx, by, BW, BH, mix(t.bg, t.white, 0.28f));
-        g.drawRect(bx, by, BW, BH, t.white);
-        g.drawFastHLine(bx + 2, by + 2, BW - 4, mix(t.white, t.blue, 0.3f));
-        if (gm.hp[r][c] == 1) {                      // cracked
-          g.drawLine(bx + 8, by, bx + 12, by + 5, t.bg);
-          g.drawLine(bx + 12, by + 5, bx + 10, by + BH - 1, t.bg);
-          g.drawLine(bx + 12, by + 5, bx + 19, by + 3, t.bg);
-        }
-      } else {
-        const uint16_t c0 = rowc[r];
-        g.fillRect(bx, by, BW, BH, mix(t.bg, c0, 0.38f));
-        g.drawRect(bx, by, BW, BH, c0);
-        g.drawFastHLine(bx + 1, by + 1, BW - 2, mix(c0, t.white, 0.35f));
-        g.drawFastVLine(bx + BW / 2, by + 3, BH - 6, mix(t.bg, c0, 0.7f));   // a circuit trace
-      }
+      const int k = gm.kind[r][c] == K_STEEL ? (gm.hp[r][c] == 1 ? 4 : 3) : gm.kind[r][c] - 1;
+      g.pushImage(Game::brickX(c), Game::brickY(r), A::BRICK_W, A::BRICK_H, (const lgfx::swap565_t*)A::BRICK[k], lgfx::swap565_t(A::KEY));
     }
 
-  for (const Falling& f : gm.drop) if (f.kind) carrot(g, t, x0 + (int)f.x, y0 + (int)f.y, f.kind);
-  board(g, t, x0, y0, gm.px, gm.paddleW(), phase);
+  // carrots, each with the dotted trail it falls along, and what it gives
+  for (const Falling& f : gm.drop) {
+    if (!f.kind) continue;
+    const int cx = (int)f.x, cy = (int)f.y;
+    for (int k = 1; k <= 3; k++) g.fillRect(cx - 1, cy - A::CARROT_H / 2 - k * 4, 2, 2, mix565(A::C_BG, A::C_CARROT_DOT, 1.0f - k * 0.25f));
+    g.pushImage(cx - A::CARROT_W / 2, cy - A::CARROT_H / 2, A::CARROT_W, A::CARROT_H, (const lgfx::swap565_t*)A::CARROT, lgfx::swap565_t(A::KEY));
+    static const char* L[] = {"", "W", "M", "S", "+"};
+    g.setFont(&fonts::Font0); g.setTextColor(C_WHITE);
+    g.drawString(L[f.kind < 5 ? f.kind : 0], cx + A::CARROT_W / 2 + 1, cy - 3);
+  }
 
-  // the packets, each with a fading trail
+  board(g, gm.px, gm.paddleW());
+
+  // sparks
+  for (const auto& q : sp.p) {
+    if (q.life <= 0) continue;
+    const uint16_t c = mix565(A::C_BG, A::C_MAGENTA, q.life > 0.3f ? 1.0f : q.life / 0.3f);
+    const int sz = q.life > 0.25f ? 2 : 1;
+    g.fillRect((int)q.x, (int)q.y, sz, sz, c);
+  }
+
+  // the packets: a fading teal streak behind, a white core with a soft edge
   for (const Ball& b : gm.ball) {
     if (!b.on) continue;
     if (gm.state == PLAY || gm.state == PAUSED)
-      for (int i = TRAIL - 1; i >= 0; i--) g.fillCircle(x0 + (int)b.tx[i], y0 + (int)b.ty[i], 2, mix(t.bg, t.blue, 0.6f - i * 0.12f));
-    g.fillCircle(x0 + (int)b.x, y0 + (int)b.y, (int)BALL_R + 2, mix(t.bg, t.blue, 0.55f));
-    g.fillCircle(x0 + (int)b.x, y0 + (int)b.y, (int)BALL_R, t.white);
+      for (int i = TRAIL - 1; i >= 1; i--) {
+        const float f = 1.0f - (float)i / TRAIL;
+        const int sz = i < TRAIL / 3 ? 2 : 1;
+        g.fillRect((int)b.tx[i] - sz / 2, (int)b.ty[i] - sz / 2, sz, sz, mix565(A::C_BG, mix565(A::C_TRAIL, A::C_CYAN, f), 0.4f + 0.6f * f));
+      }
+    g.fillCircle((int)b.x, (int)b.y, 3, mix565(A::C_BG, C_WHITE, 0.4f));
+    g.fillCircle((int)b.x, (int)b.y, 2, C_WHITE);
   }
 
-  // power-ups running, beside the score (W: wide board, S: slow packet), seconds left
-  const bool live = gm.state == PLAY || gm.state == PAUSED || gm.state == SERVE;
-  int hx = x0 + 52;
+  // power-ups running: above the board, between the cities
   g.setFont(&fonts::Font0);
-  if (live && gm.wideS > 0) { snprintf(s, sizeof s, "W%d", (int)ceilf(gm.wideS)); g.setTextColor(t.green); g.drawString(s, hx, y0 + 2); hx += 24; }
-  if (live && gm.slowS > 0) { snprintf(s, sizeof s, "S%d", (int)ceilf(gm.slowS)); g.setTextColor(t.blue); g.drawString(s, hx, y0 + 2); }
+  const bool live = gm.state == PLAY || gm.state == PAUSED || gm.state == SERVE;
+  if (live && gm.wideS > 0) { snprintf(s, sizeof s, "WIDE %d", (int)ceilf(gm.wideS)); g.setTextColor(A::C_CYAN); g.drawString(s, 64, 186); }
+  if (live && gm.slowS > 0) { snprintf(s, sizeof s, "SLOW %d", (int)ceilf(gm.slowS)); g.setTextColor(A::C_MAGENTA); g.drawString(s, 256 - (int)g.textWidth(s), 186); }
 
-  // what's going on, across the middle under the blocks
-  const int my = y0 + Game::brickY(ROWS - 1) + BH + 22;
-  auto panel = [&](int h) {
-    g.fillRoundRect(x0 + 40, my - 6, FW - 80, h, 4, mix(t.bg, t.panel, 0.85f));
-    g.drawRoundRect(x0 + 40, my - 6, FW - 80, h, 4, mix(t.bg, t.green, 0.6f));
-  };
+  // what's going on, in a framed panel across the middle
+  const int py = 128;
   if (gm.state == SERVE) {
-    panel(42);
-    g.setFont(&fonts::Font2); g.setTextColor(t.green);
+    panel(g, 46, py, FW - 92, 50);
+    g.setFont(&fonts::Font2); g.setTextColor(A::C_CYAN);
     snprintf(s, sizeof s, "LEVEL %u: %s", (unsigned)(gm.level + 1), gm.lvl().name);
-    centre(g, s, my, x0);
-    g.setFont(&fonts::Font0); g.setTextColor(t.dim);
-    centre(g, "roll: move   press: launch   p: pause", my + 20, x0);
+    centre(g, s, py + 8);
+    g.setFont(&fonts::Font0); g.setTextColor(C_LAVENDER);
+    centre(g, "roll: move  press: launch  p: pause", py + 32);
   } else if (gm.state == PAUSED) {
-    panel(42);
-    g.setFont(&fonts::Font2); g.setTextColor(t.amber);
-    centre(g, "PAUSED", my, x0);
-    g.setFont(&fonts::Font0); g.setTextColor(t.dim);
-    snprintf(s, sizeof s, "press: go on  s: sound %s  back: quit", sound ? "on" : "off");
-    centre(g, s, my + 20, x0);
+    panel(g, 46, py, FW - 92, 58);
+    g.setFont(&fonts::Font2); g.setTextColor(A::C_MAGENTA);
+    centre(g, "PAUSED", py + 8);
+    g.setFont(&fonts::Font0); g.setTextColor(C_LAVENDER);
+    snprintf(s, sizeof s, "press: go on  s: sound %s", sound ? "on" : "off");
+    centre(g, s, py + 32);
+    centre(g, "back: quit", py + 41);
   } else if (gm.state == CLEARED) {
-    panel(42);
-    g.setFont(&fonts::Font2); g.setTextColor(t.green);
-    centre(g, "FIREWALL BREACHED", my, x0);
-    g.setFont(&fonts::Font0); g.setTextColor(t.dim);
+    panel(g, 46, py, FW - 92, 50);
+    g.setFont(&fonts::Font2); g.setTextColor(A::C_CYAN);
+    centre(g, "FIREWALL BREACHED", py + 8);
+    g.setFont(&fonts::Font0); g.setTextColor(C_LAVENDER);
     snprintf(s, sizeof s, "+%u   next: %s", 100u * (gm.level + 1), LEVELS[(gm.level + 1) % NLEVELS].name);
-    centre(g, s, my + 20, x0);
+    centre(g, s, py + 32);
   } else if (gm.state == OVER) {
-    panel(54);
-    g.setFont(&fonts::Font2); g.setTextColor(t.red);
-    centre(g, "CONNECTION LOST", my, x0);
-    g.setFont(&fonts::Font0); g.setTextColor(gm.score >= best && gm.score ? t.green : t.dim);
-    snprintf(s, sizeof s, gm.score >= best && gm.score ? "score %lu   NEW BEST" : "score %lu   best %lu", (unsigned long)gm.score, (unsigned long)best);
-    centre(g, s, my + 20, x0);
-    g.setTextColor(t.dim);
-    centre(g, "press: play again   back: quit", my + 33, x0);
+    panel(g, 46, py - 6, FW - 92, 62);
+    g.setFont(&fonts::Font2); g.setTextColor(A::C_MAGENTA);
+    centre(g, "CONNECTION LOST", py + 2);
+    g.setFont(&fonts::Font0);
+    const bool nb = gm.score && gm.score >= best;
+    g.setTextColor(nb ? A::C_CYAN : C_LAVENDER);
+    snprintf(s, sizeof s, nb ? "score %lu   NEW BEST" : "score %lu   best %lu", (unsigned long)gm.score, (unsigned long)best);
+    centre(g, s, py + 26);
+    g.setTextColor(C_LAVENDER);
+    centre(g, "press: play again   back: quit", py + 40);
   }
 }
 

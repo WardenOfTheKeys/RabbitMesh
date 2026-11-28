@@ -1,8 +1,9 @@
-// RabbitMesh "Burrow Breach": a brick-breaker in the rabbit's cyberpunk style. The rabbit's
-// hoverboard (the paddle) bats a data packet (the ball) into a firewall (the bricks); ICE
-// blocks take two hits. Broken blocks sometimes drop a carrot: a wider board, more packets, a
-// slower packet, or a life. The game itself, with no screen or keys: bricks_draw.h draws it,
-// bricks.cpp runs it on the T-Deck, test/bricks_core_test.cpp plays it on a computer.
+// RabbitMesh "Burrow Breaker": a brick-breaker in the rabbit's cyberpunk style. The rabbit's
+// hoverboard (the paddle) bats a data packet (the ball) into a wall of servers (the bricks);
+// steel blocks take two hits. Broken blocks sometimes drop a carrot: a wider board, more
+// packets, a slower packet, or a life. The game itself, with no screen or keys: bricks_draw.h
+// draws it (with the art in bricks_art.h), bricks.cpp runs it on the T-Deck, and
+// test/bricks_core_test.cpp plays it on a computer.
 #pragma once
 #include <stdint.h>
 #include <math.h>
@@ -10,27 +11,30 @@
 
 namespace bricks {
 
-// The field, in pixels: the screen under the header (320 x 198 on the T-Deck).
-constexpr int FW = 320, FH = 198;
-constexpr int HUD_H = 12;                          // score, level and lives across the top
-constexpr int COLS = 10, ROWS = 7;
-constexpr int BW = 30, BH = 10, GAP = 1;
-constexpr int BX0 = (FW - COLS * (BW + GAP) + GAP) / 2, BY0 = HUD_H + 8;
-constexpr int PADDLE_Y = FH - 14, PADDLE_H = 5, PADDLE_W = 46, PADDLE_WIDE = 70;
+// Screen pixels (320 x 240), laid out as the art is (art/game/burrow_breaker_concept.png): the
+// title bar across the top, the frame's walls, the board near the bottom.
+constexpr int FW = 320, FH = 240;
+constexpr int L_WALL = 10, R_WALL = 312, TOP_WALL = 31;   // where the packet bounces
+constexpr int COLS = 8, ROWS = 6;
+constexpr int BW = 36, BH = 12, BY0 = 34, ROW_PITCH = 14;
+constexpr int BRICK_X[COLS] = {12, 50, 88, 125, 162, 199, 237, 274};
+constexpr int PADDLE_Y = 208, PADDLE_H = 7, PADDLE_W = 47, PADDLE_WIDE = 69;
 constexpr float BALL_R = 3.0f;
-constexpr int MAX_BALLS = 3, MAX_DROPS = 4, TRAIL = 4;
+constexpr int MAX_BALLS = 3, MAX_DROPS = 4, TRAIL = 14, MAX_BURSTS = 6;
 constexpr float PADDLE_SPEED = 720.0f;             // px/s toward where the trackball put it
 constexpr float BASE_SPEED = 150.0f, SPEED_STEP = 12.0f, SPEED_CAP = 270.0f;
 
-// The levels: '.' nothing, '1' a firewall block, '2' an ICE block (two hits). Past the last
-// they come round again, faster.
+// The blocks' kinds, as the art draws them; STEEL takes two hits.
+enum Kind : uint8_t { K_NONE = 0, K_CYAN, K_PURPLE, K_AMBER, K_STEEL };
+// The levels: '.' nothing, 'c' 'p' 'a' a cyan, purple or amber server, 'S' steel. Past the last
+// they come round again, faster. The first is the concept art's wall.
 struct Level { const char* name; const char* rows[ROWS]; };
 constexpr Level LEVELS[] = {
-  {"PORT SCAN", {"..........", "1111111111", "1111111111", "1111111111", "1111111111", "..........", ".........."}},
-  {"FIREWALL", {"2222222222", "1.1.1.1.1.", ".1.1.1.1.1", "1111111111", "1.1.1.1.1.", ".1.1.1.1.1", ".........."}},
-  {"CARROT", {"....22....", "...2112...", "...1111...", "..111111..", "...1111...", "....11....", ".........."}},
-  {"EARS", {".22....22.", ".11....11.", ".11....11.", ".11....11.", "1111111111", "1111111111", "1121111211"}},
-  {"MAINFRAME", {"2222222222", "2111111112", "21.2112.12", "2111111112", "21.1221.12", "2111111112", "2222222222"}},
+  {"PORT SCAN", {"cpaScpac", "acpcaSpa", "pSacpacp", "cpacpacS", "........", "........"}},
+  {"FIREWALL", {"SSSSSSSS", "c.c.c.c.", ".p.p.p.p", "aaaaaaaa", "c.c.c.c.", "........"}},
+  {"CARROT", {"..c..c..", "...cc...", "..aaaa..", "..aaaa..", "...aa...", "...aa..."}},
+  {"EARS", {".pp..pp.", ".pc..cp.", ".pc..cp.", "pppppppp", "cScaacSc", "aaaaaaaa"}},
+  {"MAINFRAME", {"SSSSSSSS", "SccccccS", "Sc.SS.cS", "SppppppS", "Sa.aa.aS", "SSSSSSSS"}},
 };
 constexpr int NLEVELS = sizeof(LEVELS) / sizeof(LEVELS[0]);
 
@@ -41,10 +45,11 @@ enum Event : uint16_t { E_BRICK = 1, E_ICE = 2, E_PADDLE = 4, E_WALL = 8, E_LOST
 
 struct Ball { float x, y, vx, vy; bool on; float tx[TRAIL], ty[TRAIL]; };
 struct Falling { float x, y; uint8_t kind; };
+struct Burst { float x, y; uint8_t kind; };       // a block that broke this step, for the sparks
 
 struct Game {
   uint8_t hp[ROWS][COLS];          // 0 gone, 1 or 2 hits left
-  uint8_t ice[ROWS][COLS];         // started as ICE (drawn cracked once hit)
+  uint8_t kind[ROWS][COLS];        // Kind: how it's drawn (steel cracked once hit)
   Ball ball[MAX_BALLS];
   Falling drop[MAX_DROPS];
   float px = FW / 2, target = FW / 2;
@@ -55,6 +60,8 @@ struct Game {
   State state = SERVE;
   float stateS = 0;                // seconds in this state
   uint16_t events = 0;
+  Burst burst[MAX_BURSTS];         // blocks broken in the last step
+  uint8_t nburst = 0;
   uint32_t rng = 0x2545F491u;
 
   void seed(uint32_t s) { rng = s ? s : 0x2545F491u; }
@@ -67,8 +74,8 @@ struct Game {
     if (s > SPEED_CAP) s = SPEED_CAP;
     return slowS > 0 ? s * 0.7f : s;
   }
-  static int brickX(int c) { return BX0 + c * (BW + GAP); }
-  static int brickY(int r) { return BY0 + r * (BH + GAP); }
+  static int brickX(int c) { return BRICK_X[c]; }
+  static int brickY(int r) { return BY0 + r * ROW_PITCH; }
 
   void newGame() { score = 0; lives = 3; level = 0; loadLevel(); }
   void loadLevel() {
@@ -76,8 +83,8 @@ struct Game {
     for (int r = 0; r < ROWS; r++)
       for (int c = 0; c < COLS; c++) {
         const char k = lvl().rows[r][c];
-        hp[r][c] = k == '2' ? 2 : k == '1' ? 1 : 0;
-        ice[r][c] = k == '2';
+        kind[r][c] = k == 'c' ? K_CYAN : k == 'p' ? K_PURPLE : k == 'a' ? K_AMBER : k == 'S' ? K_STEEL : K_NONE;
+        hp[r][c] = kind[r][c] == K_STEEL ? 2 : kind[r][c] ? 1 : 0;
         if (hp[r][c]) left++;
       }
     for (auto& d : drop) d.kind = D_NONE;
@@ -109,11 +116,12 @@ struct Game {
   void nudge(float dx) { setTarget(target + dx); }
   void setTarget(float x) {
     const float h = paddleW() / 2;
-    target = x < h ? h : x > FW - h ? FW - h : x;
+    target = x < L_WALL + h ? L_WALL + h : x > R_WALL - h ? R_WALL - h : x;
   }
 
   void step(float dt) {
     events = 0;
+    nburst = 0;
     stateS += dt;
     if (state == PAUSED || state == OVER) return;
     if (state == CLEARED) {
@@ -152,19 +160,19 @@ struct Game {
   }
 
   bool hitBricks(float x, float y) {
-    const int c0 = (int)floorf((x - BALL_R - BX0) / (BW + GAP)), c1 = (int)floorf((x + BALL_R - BX0) / (BW + GAP));
-    const int r0 = (int)floorf((y - BALL_R - BY0) / (BH + GAP)), r1 = (int)floorf((y + BALL_R - BY0) / (BH + GAP));
+    const int r0 = (int)floorf((y - BALL_R - BY0) / ROW_PITCH), r1 = (int)floorf((y + BALL_R - BY0) / ROW_PITCH);
     bool hit = false;
     for (int r = r0; r <= r1; r++)
-      for (int c = c0; c <= c1; c++) {
-        if (r < 0 || r >= ROWS || c < 0 || c >= COLS || !hp[r][c]) continue;
+      for (int c = 0; c < COLS; c++) {
+        if (r < 0 || r >= ROWS || !hp[r][c]) continue;
         const float bx = brickX(c), by = brickY(r);
         if (x + BALL_R <= bx || x - BALL_R >= bx + BW || y + BALL_R <= by || y - BALL_R >= by + BH) continue;
         hit = true;
         if (--hp[r][c]) { events |= E_ICE; continue; }
         left--;
         events |= E_BRICK;
-        score += ice[r][c] ? 25 : 10;
+        score += kind[r][c] == K_STEEL ? 25 : 10;
+        if (nburst < MAX_BURSTS) burst[nburst++] = {bx + BW / 2.0f, by + BH / 2.0f, kind[r][c]};
         if (rnd() % 7 == 0) spawnDrop(bx + BW / 2.0f, by + BH / 2.0f);
       }
     return hit;
@@ -178,11 +186,11 @@ struct Game {
     const int n = (int)ceilf(fmaxf(fabsf(dx), fabsf(dy)) / 2.0f) + 1;
     for (int i = 0; i < n && b.on; i++) {
       b.x += dx / n;
-      if (b.x < BALL_R) { b.x = BALL_R; b.vx = fabsf(b.vx); events |= E_WALL; }
-      if (b.x > FW - BALL_R) { b.x = FW - BALL_R; b.vx = -fabsf(b.vx); events |= E_WALL; }
+      if (b.x < L_WALL + BALL_R) { b.x = L_WALL + BALL_R; b.vx = fabsf(b.vx); events |= E_WALL; }
+      if (b.x > R_WALL - BALL_R) { b.x = R_WALL - BALL_R; b.vx = -fabsf(b.vx); events |= E_WALL; }
       if (hitBricks(b.x, b.y)) { b.x -= dx / n; b.vx = -b.vx; break; }
       b.y += dy / n;
-      if (b.y < HUD_H + BALL_R) { b.y = HUD_H + BALL_R; b.vy = fabsf(b.vy); events |= E_WALL; }
+      if (b.y < TOP_WALL + BALL_R) { b.y = TOP_WALL + BALL_R; b.vy = fabsf(b.vy); events |= E_WALL; }
       if (hitBricks(b.x, b.y)) { b.y -= dy / n; b.vy = -b.vy; break; }
       // the board: where it's hit sets the angle, up to 60 degrees off straight up
       const float h = paddleW() / 2;

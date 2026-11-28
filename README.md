@@ -64,16 +64,16 @@ esptool.py --chip esp32s3 write_flash 0x10000 rabbitmesh-0.1.0-tdeck-update.bin 
 | `e` | **MECP** | emergency codes: write them, and get alerted by MAYDAY/URGENT |
 | `i` | **Field** | range test, SOS, breadcrumb trail |
 | `c` | **SD card** | what's on the card; look at or delete files; formats a card the T-Deck can't read |
-| `g` | **Game** | Burrow Breach: knock down the firewall with the rabbit's hoverboard (see below) |
+| `g` | **Game** | Burrow Breaker: knock down the server wall with the rabbit's hoverboard (see below) |
 | `o` | **More** | every other tool and setting |
 
 Each tool says what it's waiting for, such as `needs: gps fix ok, sd card NO`. The details of every tool are in **[docs/TOOLS.md](docs/TOOLS.md)**.
 
-### Burrow Breach
+### Burrow Breaker
 
-![Burrow Breach](docs/burrow-breach.png)
+![Burrow Breaker](docs/burrow-breaker.png)
 
-A brick-breaker for the downtime. The rabbit's hoverboard bats a data packet into a firewall, five levels of it, then round again faster. White ICE blocks take two hits. Broken blocks sometimes drop a carrot: **W** a wider board, **M** three packets, **S** a slower packet, **+** a life. Roll the trackball (or `a` / `d`, or a finger on the screen) to move, press to launch, `p` to pause, `s` for sound, backspace to quit. Your best score is kept. The mesh carries on while you play: messages arrive as usual, and the game pauses itself when the screen goes dark.
+A brick-breaker for the downtime. The rabbit's bunny-eared hoverboard bats a data packet into a wall of servers, five levels of it, then round again faster. Steel plates take two hits. Broken blocks sometimes drop a carrot: **W** a wider board, **M** three packets, **S** a slower packet, **+** a life. Roll the trackball (or `a` / `d`, or a finger on the screen) to move, press to launch, `p` to pause, `s` for sound, backspace to quit. Your best score is kept. The mesh carries on while you play: messages arrive as usual, and the game pauses itself when the screen goes dark.
 
 ## Themes
 

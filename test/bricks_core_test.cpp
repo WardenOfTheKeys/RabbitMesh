@@ -1,6 +1,7 @@
-// Host tests for Burrow Breach (src/bricks_core.h): the rules, and an autopilot that plays.
+// Host tests for Burrow Breaker (src/bricks_core.h): the rules, and an autopilot that plays.
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include "bricks_core.h"
 using namespace bricks;
 static int fails = 0;
@@ -33,23 +34,27 @@ int main() {
     for (int r = 0; r < ROWS; r++) { CHECK(strlen(LEVELS[i].rows[r]) == (size_t)COLS); for (int c = 0; c < COLS; c++) n += LEVELS[i].rows[r][c] != '.'; }
     CHECK(n > 0);
   }
-  // the bricks fit on the field
-  CHECK(Game::brickX(0) >= 0 && Game::brickX(COLS - 1) + BW <= FW);
+  // the bricks fit between the walls, in order, without overlapping
+  CHECK(Game::brickX(0) >= L_WALL && Game::brickX(COLS - 1) + BW <= R_WALL);
+  for (int c = 1; c < COLS; c++) CHECK(Game::brickX(c) >= Game::brickX(c - 1) + BW);
+  // every letter in a level is one the game knows
+  for (int i = 0; i < NLEVELS; i++) for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) CHECK(strchr(".cpaS", LEVELS[i].rows[r][c]));
   CHECK(Game::brickY(ROWS - 1) + BH < PADDLE_Y - 40);
 
   Game g;
   g.seed(1);
   g.newGame();
-  CHECK(g.state == SERVE && g.lives == 3 && g.left == 40 && standing(g) == 40);
+  CHECK(g.state == SERVE && g.lives == 3 && g.left == 32 && standing(g) == 32);
+  CHECK(g.kind[0][0] == K_CYAN && g.kind[0][3] == K_STEEL && g.hp[0][3] == 2);
   // on the board until launched, and it goes along with it
   g.setTarget(60);
   for (int i = 0; i < 100; i++) g.step(0.01f);
   CHECK(std::fabs(g.px - 60) < 0.01f && std::fabs(g.ball[0].x - 60) < 0.01f);
   // the board stays on the field
   g.nudge(-1000); for (int i = 0; i < 100; i++) g.step(0.01f);
-  CHECK(g.px - g.paddleW() / 2 >= 0);
+  CHECK(g.px - g.paddleW() / 2 >= L_WALL);
   g.nudge(5000); for (int i = 0; i < 100; i++) g.step(0.01f);
-  CHECK(g.px + g.paddleW() / 2 <= FW);
+  CHECK(g.px + g.paddleW() / 2 <= R_WALL);
   // launched: up, at the level's speed
   g.press();
   CHECK(g.state == PLAY && g.ball[0].vy < 0);
@@ -72,7 +77,7 @@ int main() {
     for (int i = 0; i < 10; i++) m.step(0.008f);
     CHECK(m.ball[0].vy < 0 && std::fabs(m.ball[0].vx) < 0.06f * m.speed());   // up to 3 degrees off
   }
-  // ICE takes two hits
+  // steel takes two hits
   {
     Game h; h.level = 1; h.loadLevel();
     CHECK(h.hp[0][0] == 2);
@@ -81,7 +86,12 @@ int main() {
     // clear what's between, so the packet reaches the top row
     for (int r = 1; r < ROWS; r++) if (h.hp[r][0]) { h.hp[r][0] = 0; h.left--; }
     h.step(0.02f);
-    CHECK(h.hp[0][0] == 1 && (h.events & E_ICE) && h.ball[0].vy > 0);
+    CHECK(h.hp[0][0] == 1 && (h.events & E_ICE) && h.ball[0].vy > 0 && h.nburst == 0);
+    // the second hit breaks it, and it's reported where it was, for the sparks
+    h.ball[0].x = Game::brickX(0) + BW / 2.0f; h.ball[0].y = Game::brickY(0) + BH + BALL_R + 1; h.ball[0].vx = 0; h.ball[0].vy = -150;
+    h.step(0.02f);
+    CHECK(h.hp[0][0] == 0 && (h.events & E_BRICK) && h.nburst == 1 && h.burst[0].kind == K_STEEL);
+    CHECK(std::fabs(h.burst[0].x - (Game::brickX(0) + BW / 2.0f)) < 0.01f);
   }
   // power-ups
   {
@@ -114,7 +124,7 @@ int main() {
       if (a.events & E_CLEAR) cleared++;
       for (auto& b : a.ball) {
         if (!b.on) continue;
-        if (b.x < BALL_R - 0.01f || b.x > FW - BALL_R + 0.01f || b.y < HUD_H + BALL_R - 0.01f) out = true;
+        if (b.x < L_WALL + BALL_R - 0.01f || b.x > R_WALL - BALL_R + 0.01f || b.y < TOP_WALL + BALL_R - 0.01f) out = true;
         for (int r = 0; r < ROWS; r++) for (int c = 0; c < COLS; c++) {
           if (!a.hp[r][c]) continue;
           const float bx = Game::brickX(c), by = Game::brickY(r);

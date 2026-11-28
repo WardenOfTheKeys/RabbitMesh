@@ -701,7 +701,7 @@ private:
     else if (flockhunt::mappedCount()) snprintf(t[T_FLOCK].stat, sizeof t[T_FLOCK].stat, "%lu mapped", (unsigned long)flockhunt::mappedCount());
     else snprintf(t[T_FLOCK].stat, sizeof t[T_FLOCK].stat, "alpr cameras");
     setTile(t[T_SD], "SD CARD", _sdText.c_str(), IC_SD, false, TILE_KEY[T_SD]);
-    setTile(t[T_GAME], "GAME", "burrow breach", IC_GAME, false, TILE_KEY[T_GAME]);
+    setTile(t[T_GAME], "GAME", "burrow breaker", IC_GAME, false, TILE_KEY[T_GAME]);
     setTile(t[T_MORE], "MORE", "all tools", IC_MORE, false, TILE_KEY[T_MORE]);
   }
   void launch(int i) {

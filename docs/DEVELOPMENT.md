@@ -58,7 +58,9 @@ src/fox.{h,cpp}                  the fox hunt (any signal, a repeater, a WiFi ne
 src/spectrum.{h,cpp}             the spectrum analyzer: borrowing the radio, the sweep, handing it back
 src/mecp.{h,cpp}                 MECP emergency messages: write, inbox, alerts
 src/sdview.{h,cpp}               the SD card viewer (and formatting a card it can't read)
-src/bricks*.{h,cpp}              Burrow Breach: the game (bricks_core.h), its look (bricks_draw.h), the screen
+src/bricks*.{h,cpp}              Burrow Breaker: the game (bricks_core.h), its look (bricks_draw.h), its art
+                                 (bricks_art.*, made from art/game/burrow_breaker_concept.png by
+                                 tools/make_game_art.py), the screen
 src/needs.h                      the "needs: gps fix ok, sd card NO" line
 src/meshclock.{h,cpp}            the clock from the mesh
 src/tzauto.{h,cpp}               the time zone from location
@@ -90,7 +92,7 @@ preview/                         the host renderer: the real drawing code over a
 docs/                            these pages and their pictures
 ```
 
-The generated sprite files are committed, so building doesn't need Python. To change the art, see [the character](CHARACTER.md).
+The generated sprite files are committed, so building doesn't need Python. To change the art, see [the character](CHARACTER.md). The game's look comes from one picture, `art/game/burrow_breaker_concept.png`: a 320 x 240 screen drawn larger. Change it and run `python3 tools/make_game_art.py` to regenerate `src/bricks_art.*` (it also writes `art/game/background.png`, the background with the moving parts taken out, to check).
 
 ## Releasing
 

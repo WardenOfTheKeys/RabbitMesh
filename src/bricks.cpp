@@ -1,6 +1,7 @@
-// RabbitMesh "Burrow Breach" on the T-Deck (see bricks.h).
+// RabbitMesh "Burrow Breaker" on the T-Deck (see bricks.h).
 #include "bricks.h"
 #include <Preferences.h>
+#include <esp_heap_caps.h>
 #include "app.h"
 #include "backlight.h"    // the idle dimmer: the game holds while the screen is dark
 #include "audio_jingle.h"
@@ -32,11 +33,14 @@ public:
     Preferences p;
     if (p.begin("rm-game", true)) { _best = p.getULong("best", 0); _sound = p.getBool("sound", true); p.end(); }
     _saved = _best; _savedSound = _sound;
+    // the background, unpacked once (150 KB, in PSRAM): each frame is then one copy of it
+    _bg = (uint16_t*)heap_caps_malloc(bricksart::W * bricksart::H * 2, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (_bg) unpackBackground(_bg);
     _g.seed(esp_random());
     _g.newGame();
     _last = millis();
   }
-  ~BricksView() override { save(); }
+  ~BricksView() override { save(); if (_bg) heap_caps_free(_bg); }
 
   void tick() override {
     const uint32_t now = millis();
@@ -50,6 +54,8 @@ public:
       _acc -= STEP_MS;
       _g.step(STEP_MS / 1000.0f);
       ev |= _g.events;
+      _sparks.add(_g);
+      _sparks.step(STEP_MS / 1000.0f);
     }
     if (ev) sounds(ev);
     if (ev & E_OVER) save();
@@ -57,12 +63,11 @@ public:
   }
   void resume() override { if (_g.state == PLAY) _g.pause(); _last = millis(); dirty = true; }
 
+  // The whole screen, as the art has it: its own title bar where the status bar and header
+  // would be. Toasts and message banners still show over it.
   void draw(Canvas& g) override {
-    const Theme& t = nav.theme();
-    char r[32];
-    snprintf(r, sizeof r, "best %lu", (unsigned long)(_g.score > _best ? _g.score : _best));
-    drawHeader(g, "Burrow Breach", r);
-    bricks::draw(g, t, _g, 0, L::BODY_Y, millis() / 1000.0f, _best, _sound);
+    if (!_bg) g.fillScreen(bricksart::C_BG);
+    bricks::draw(g, _g, _sparks, _bg, _best, _sound);
   }
 
   void rotate(int d) override { _g.nudge(d * ROLL_PX); }
@@ -93,6 +98,8 @@ public:
 
 private:
   Game _g;
+  Sparks _sparks;
+  uint16_t* _bg = nullptr;
   uint32_t _best = 0, _last = 0, _acc = 0, _drawn = 0, _saved = 0;
   bool _sound = true;
 

@@ -40,7 +40,7 @@ int main() {
     {"RF MON", "noise -121", IC_RF, false, 'r'},    {"SPECTRUM", "sweep band", IC_SPECTRUM, false, 's'},
     {"AIRTIME", "load 3.4%", IC_AIR, false, 'a'},       {"RADAR", "12 placed", IC_RADAR, false, 'n'},
     {"MECP", "1 urgent", IC_MECP, true, 'e'},           {"FIELD", "sos range trl", IC_FIELD, false, 'i'},
-    {"SD CARD", "27.3 GB free", IC_SD, false, 'c'},     {"GAME", "burrow breach", IC_GAME, false, 'g'},
+    {"SD CARD", "27.3 GB free", IC_SD, false, 'c'},     {"GAME", "burrow breaker", IC_GAME, false, 'g'},
     {"MORE", "all tools", IC_MORE, false, 'o'}};
   clear(); hub(d, t, tiles, 15, 13, 1.3f); save(d, "deck_hub", t, "Deck");
 
