@@ -1,0 +1,951 @@
+#include "node.h"
+#include "history.h"
+#include "sleep_deadline.h"
+#include <SPIFFS.h>
+#include <esp_bt.h>
+#include <esp_bt_main.h>
+#include <esp_heap_caps.h>
+#include <new>
+#include <array>
+#include <vector>
+#include "app.h"
+#include "regions.h"
+#include <helpers/esp32/SerialBLEInterface.h>
+#include <helpers/TxtDataHelpers.h>
+#include <helpers/AdvertDataHelpers.h>
+
+// Same values MyMesh.cpp uses internally.
+#ifndef REQ_TYPE_GET_STATUS
+#define REQ_TYPE_GET_STATUS 0x01
+#endif
+#ifndef REQ_TYPE_GET_TELEMETRY_DATA
+#define REQ_TYPE_GET_TELEMETRY_DATA 0x03
+#endif
+#define CTL_DISCOVER_REQ  0x80
+#define CTL_DISCOVER_RESP 0x90
+
+InwNode* g_node = nullptr;
+// MyMesh publishes its private deadline when queried on the main-loop thread.
+// Refresh it immediately before building the sleep budget; never use stale data.
+static uint32_t s_contactSaveAt = 0;
+void inwNoteContactSaveDeadline(unsigned long at) { s_contactSaveAt = (uint32_t)at; }
+DataStore g_store(SPIFFS, rtc_clock);
+MultiSerialInterface g_ifaces;
+static SerialBLEInterface g_ble;
+static SimpleMeshTables g_tables;
+static StdRNG g_rng;
+
+// Settings the node needs from the app, owned by settings.cpp.
+extern bool inwAutoRetry();
+extern bool inwAutoResetPath();
+extern bool inwBleWanted();
+
+// ---------------------------------------------------------------------------
+InwNode::InwNode(mesh::Radio& radio, mesh::RNG& rng, mesh::RTCClock& rtc,
+                 SimpleMeshTables& tables, DataStore& store)
+    : MyMesh(radio, rng, rtc, tables, store, nullptr), _ds(store) {
+  _idlePacketCount = _mgr->getFreeCount();
+  memset(_echo, 0, sizeof(_echo));
+  memset(discovered, 0, sizeof(discovered));
+  memset(pktLog, 0, sizeof(pktLog));
+  memset(cliLog, 0, sizeof(cliLog));
+}
+
+static uint8_t hopsOf(mesh::Packet* pkt) {
+  return pkt->isRouteFlood() ? pkt->getPathHashCount() : 0xFF;
+}
+
+// The repeaters that carried a flood packet: first byte of each path hash,
+// oldest hop first. Direct packets have no path.
+static uint8_t pathOf(mesh::Packet* pkt, uint8_t* out, uint8_t cap) {
+  if (!pkt->isRouteFlood()) return 0;
+  const uint8_t sz = pkt->getPathHashSize();
+  uint8_t n = min<uint8_t>(pkt->getPathHashCount(), cap);
+  for (uint8_t i = 0; i < n; i++) out[i] = pkt->path[i * sz];
+  return n;
+}
+
+// The same repeaters in full: each one's whole path hash, however many bytes the mesh
+// uses (History::route), so two repeaters sharing a first byte can be told apart.
+// The region a received flood came in on (GitHub issue #6). A scoped flood carries
+// transport code = HMAC(region key, type + payload) (TransportKey::calcTransportCode),
+// not the name, so it is checked against every region this device knows of: the
+// list, the default, and the channel's own scope. One it has no name for shows as
+// that; a message that came direct says nothing about regions and records nothing.
+static void keepRegion(uint32_t id, const mesh::Packet* pkt, const char* channelScope) {
+  if (!id || !pkt->isRouteFlood()) return;
+  if (!pkt->hasTransportCodes()) { history.setRegion(id, History::REGION_PLAIN); return; }
+  static char names[regions::LIST_MAX + 2][regions::NAME_LEN + 1];
+  int n = regions::list(names, regions::LIST_MAX);
+  if (*regions::defaultName()) strlcpy(names[n++], regions::defaultName(), sizeof(names[0]));
+  if (channelScope && *channelScope) strlcpy(names[n++], channelScope, sizeof(names[0]));
+  for (int i = 0; i < n; i++) {
+    TransportKey k;
+    regions::keyFor(names[i], k.key);
+    if (k.calcTransportCode(pkt) == pkt->transport_codes[0]) {
+      history.setRegion(id, names[i]);
+#if INW_DEV
+      Serial.printf("[region] msg %lu came in on %s\n", (unsigned long)id, names[i]);
+#endif
+      return;
+    }
+  }
+  history.setRegion(id, History::REGION_UNKNOWN);
+#if INW_DEV
+  Serial.printf("[region] msg %lu: code %04x matches none of %d known\n", (unsigned long)id, pkt->transport_codes[0], n);
+#endif
+}
+
+static void keepRoute(uint32_t id, mesh::Packet* pkt, const char* channelScope = nullptr) {
+  if (id && pkt->isRouteFlood() && pkt->getPathHashCount())
+    history.setRoute(id, pkt->path, pkt->getPathHashSize(), pkt->getPathHashCount());
+  keepRegion(id, pkt, channelScope);
+}
+
+static bool mentions(const char* text, const char* me) {
+  if (!me || !*me) return false;
+  char tag[40];
+  snprintf(tag, sizeof(tag), "@[%s]", me);
+  if (strstr(text, tag)) return true;
+  snprintf(tag, sizeof(tag), "@%s", me);
+  return strcasestr(text, tag) != nullptr;
+}
+
+// ---- DMs ---------------------------------------------------------------------
+PendingDM* InwNode::freePending() {
+  for (auto& p : _pending) if (!p.used) return &p;
+  // Table full: the oldest pending gives up rather than the new message.
+  PendingDM* oldest = &_pending[0];
+  for (auto& p : _pending) if (p.sentAt < oldest->sentAt) oldest = &p;
+  history.setStatus(oldest->histId, ST_FAILED, oldest->attempt + 1);
+  oldest->used = false;
+  return oldest;
+}
+
+bool InwNode::transmitDM(PendingDM& p, const char* text) {
+  ContactInfo* c = contact(p.pub);
+  if (!c) return false;
+  uint32_t ack = 0, est = 0;
+  const int r = sendMessage(*c, p.ts, p.attempt, text, ack, est);
+#if INW_DEV
+  Serial.printf("[dm] try %u to %s: %s, route %d, waits %lu ms\n", p.attempt + 1, c->name,
+                r == MSG_SEND_FAILED ? "NOT SENT" : r == MSG_SEND_SENT_FLOOD ? "flood" : "direct",
+                c->out_path_len == OUT_PATH_UNKNOWN ? -1 : (int)(c->out_path_len & 63), (unsigned long)est);
+#endif
+  if (r == MSG_SEND_FAILED) return false;
+  p.acks[p.attempt & 3] = ack;
+  p.sentAt = millis();
+  p.deadline = p.sentAt + est + 2000;
+  // From the fourth try the gap grows (3 s more each time, up to 30 s): the tries are
+  // spread over a few minutes instead of filling the air at once.
+  if (p.attempt >= 3) p.deadline += min<uint32_t>(30000, (p.attempt - 2) * 3000UL);
+  if (_awaitCount < 4) _awaitTx[_awaitCount++] = p.histId;
+  return true;
+}
+
+bool InwNode::sendDM(const uint8_t* pub, const char* text, uint32_t histId) {
+  PendingDM* p = freePending();
+  memset(p, 0, sizeof(*p));
+  p->used = true;
+  memcpy(p->pub, pub, 32);
+  p->histId = histId;
+  p->ts = getRTCClock()->getCurrentTimeUnique();
+  p->attempt = 0;
+  if (!transmitDM(*p, text)) { p->used = false; history.setStatus(histId, ST_FAILED, 1); return false; }
+  history.setStatus(histId, ST_SENDING, 1);
+  return true;
+}
+
+bool InwNode::resendDM(const uint8_t* pub, const char* text, uint32_t histId) {
+  return sendDM(pub, text, histId);
+}
+
+uint8_t InwNode::radioSleepBlock() const {
+  if (_idlePacketCount <= 0) return 1;
+  if (_mgr->getOutboundTotal() > 0) return 2;
+  if (_mgr->getFreeCount() < _idlePacketCount) return 3;
+  return 0;
+}
+
+bool InwNode::radioWorkPending() const {
+  // Only real packets block sleep. A future contacts save is a wake deadline.
+  // Allocated slots still cover delayed RX and in-flight TX, not just queues.
+  return radioSleepBlock() != 0;
+}
+
+uint32_t InwNode::sleepBudgetMs(uint32_t now) const {
+  SleepDeadline next(now);
+  (void)MyMesh::hasPendingWork(); // synchronously refresh s_contactSaveAt
+  if (s_contactSaveAt) next.at(s_contactSaveAt);
+  for (const auto& p : _pending) if (p.used) next.at(p.deadline);
+  if (_loginState == 1) next.at(_loginDeadline);
+  return next.ms();
+}
+
+void InwNode::tick() {
+  const uint32_t now = millis();
+  for (auto& p : _pending) {
+    if (!p.used || (int32_t)(now - p.deadline) < 0) continue;
+    HistMsg* m = history.find(p.histId);
+    // Up to 15 tries (the receiving end shows a retried copy once). A try past the
+    // fourth carries its number in two more bytes, which the longest texts have no room for.
+    uint8_t maxAttempts = inwAutoRetry() ? 15 : 1;
+    if (m && maxAttempts > 4 && strlen(m->text) > MAX_TEXT_LEN - 2) maxAttempts = 4;
+    if (m && p.attempt + 1 < maxAttempts) {
+      p.attempt++;
+      // Third try: the stored route may be stale, so drop it and flood from here on.
+      if (p.attempt == 2 && inwAutoResetPath()) {
+        ContactInfo* c = contact(p.pub);
+        if (c && c->out_path_len != OUT_PATH_UNKNOWN) resetPathTo(*c);
+      }
+      if (transmitDM(p, m->text)) { history.setStatus(p.histId, ST_SENDING, p.attempt + 1); continue; }
+    }
+#if INW_DEV
+    Serial.printf("[dm] FAILED after %u tries\n", p.attempt + 1);
+#endif
+    history.setStatus(p.histId, ST_FAILED, p.attempt + 1);
+    p.used = false;
+    emit(NodeEvent::Failed, &p.histId);
+  }
+  if (_loginState == 1 && (int32_t)(now - _loginDeadline) >= 0) {
+    _loginState = 3;
+    emit(NodeEvent::LoginFail);
+  }
+}
+
+ContactInfo* InwNode::processAck(const uint8_t* data) {
+  uint32_t ack;
+  memcpy(&ack, data, 4);
+  for (auto& p : _pending) {
+    if (!p.used) continue;
+    for (uint8_t a = 0; a < 4; a++) {
+      if (!p.acks[a] || p.acks[a] != ack) continue;
+      const uint32_t rtt = millis() - p.sentAt;
+#if INW_DEV
+      Serial.printf("[dm] DELIVERED on try %u (ack of try %u), %lu ms after it\n", p.attempt + 1, a + 1, (unsigned long)rtt);
+#endif
+      history.setStatus(p.histId, ST_DELIVERED, p.attempt + 1, (uint16_t)min<uint32_t>(rtt / 10, 65535));
+      p.used = false;
+      emit(NodeEvent::Delivered, &p.histId);
+      ContactInfo* c = contact(p.pub);
+      return c ? c : MyMesh::processAck(data);
+    }
+  }
+  return MyMesh::processAck(data);
+}
+
+// ---- channels ----------------------------------------------------------------
+bool InwNode::sendChannel(uint8_t idx, const char* text, uint32_t histId) {
+  ChannelDetails ch;
+  if (!getChannel(idx, ch) || !ch.name[0]) { history.setStatus(histId, ST_FAILED); return false; }
+  const uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  const bool ok = sendGroupMessage(ts, ch.channel, getNodeName(), text, strlen(text));
+  history.setStatus(histId, ok ? ST_SENT : ST_FAILED);
+  if (ok && _awaitCount < 4) _awaitTx[_awaitCount++] = histId;
+  return ok;
+}
+
+// Set while MeshCore handles a command from the phone app (tools/patch_meshcore.py).
+static bool s_fromApp = false;
+void inwAppFrame(bool on) { s_fromApp = on; }
+
+void InwNode::sendFloodScoped(const mesh::GroupChannel& channel, mesh::Packet* pkt, uint32_t delay_millis) {
+  if (s_fromApp) { MyMesh::sendFloodScoped(channel, pkt, delay_millis); return; }
+  const char* region = regions::forChannel(channel.secret);
+  if (!*region) { floodInDefault(pkt, delay_millis); return; }
+  TransportKey scope;
+  regions::keyFor(region, scope.key);
+  MyMesh::sendFloodScoped(scope, pkt, delay_millis);
+}
+
+void InwNode::sendFloodScoped(const ContactInfo& to, mesh::Packet* pkt, uint32_t delay_millis) {
+  if (s_fromApp) { MyMesh::sendFloodScoped(to, pkt, delay_millis); return; }
+  floodInDefault(pkt, delay_millis);
+}
+
+// The default region's own key, as MeshCore keeps it (the app can set one); all
+// zeros, the whole mesh.
+void InwNode::floodInDefault(mesh::Packet* pkt, uint32_t delay_millis) {
+  TransportKey scope;
+  memcpy(scope.key, prefs().default_scope_key, sizeof(scope.key));
+  MyMesh::sendFloodScoped(scope, pkt, delay_millis);
+}
+
+int InwNode::findChannelBySecret(const uint8_t* secret6) {
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (getChannel(i, ch) && ch.name[0] && !memcmp(ch.channel.secret, secret6, 6)) return i;
+  }
+  return -1;
+}
+
+bool InwNode::addChannelNamed(const char* name, const uint8_t* secret16) {
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (!getChannel(i, ch)) return false;
+    if (ch.name[0]) {
+      if (!memcmp(ch.channel.secret, secret16, 16)) return false;   // already have it
+      continue;
+    }
+    memset(&ch, 0, sizeof(ch));
+    strlcpy(ch.name, name, sizeof(ch.name));
+    memcpy(ch.channel.secret, secret16, 16);
+    setChannel(i, ch);
+    saveChannelsNow();
+    return true;
+  }
+  return false;
+}
+
+bool InwNode::removeChannel(uint8_t idx) {
+  ChannelDetails ch;
+  memset(&ch, 0, sizeof(ch));
+  if (!setChannel(idx, ch)) return false;
+  saveChannelsNow();
+  return true;
+}
+
+// ---- receive hooks -------------------------------------------------------------
+// The message (its history id) that this one is a copy of, by sender, timestamp and
+// text; 0 if it is new. `hash` comes back for gotDM().
+uint32_t InwNode::copyOf(const uint8_t* pub, uint32_t ts, const char* text, uint32_t& hash) {
+  uint32_t who;
+  memcpy(&who, pub, 4);
+  hash = 2166136261u;
+  for (const char* p = text; *p; p++) hash = (hash ^ (uint8_t)*p) * 16777619u;
+  for (const GotDM& g : _got) if (ts && g.ts == ts && g.who == who && g.textHash == hash) return g.histId;
+  return 0;
+}
+
+void InwNode::gotDM(const uint8_t* pub, uint32_t ts, uint32_t hash, uint32_t histId) {
+  uint32_t who;
+  memcpy(&who, pub, 4);
+  _got[_gotNext] = {who, ts, hash, histId};
+  _gotNext = (_gotNext + 1) % (sizeof(_got) / sizeof(_got[0]));
+}
+
+void InwNode::onMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t ts, const char* text) {
+  // A copy of one we have, because our ack was lost on the way back. Same timestamp:
+  // the sender's own retry. A new timestamp but the same words as this sender's last
+  // message, under three minutes ago with nothing said in between: they gave up and
+  // pressed "send again". Either way MeshCore acks it again after this returns, and it
+  // is counted on the message already shown: not added, queued for the phone or
+  // announced a second time.
+  const ConvKey conv = ConvKey::contact(from.id.pub_key);
+  uint32_t hash = 0;
+  uint32_t had = copyOf(from.id.pub_key, ts, text, hash);
+  if (!had) {
+    HistMsg* prev = history.last(conv);
+    const uint32_t now = getRTCClock()->getCurrentTime();
+    if (prev && !(prev->flags & HF_OUT) && prev->status == ST_RECV && now >= prev->ts && now - prev->ts <= 180 &&
+        !strncmp(prev->text, text, sizeof(prev->text) - 1)) {
+      had = prev->id;
+      gotDM(from.id.pub_key, ts, hash, had);      // and its own retries after this one
+    }
+  }
+#if INW_DEV
+  Serial.printf("[dm] got one from %s: %u hops, snr %.1f%s\n", from.name, hopsOf(pkt), pkt->getSNR(),
+                had ? " - counted on the one already shown" : "");
+#endif
+  if (had) { history.bumpRepeat(had); return; }
+  MyMesh::onMessageRecv(from, pkt, ts, text);
+  const bool room = from.type == ADV_TYPE_ROOM;
+  uint8_t flags = mentions(text, getNodeName()) ? HF_MENTION : 0;
+  if (room) flags |= HF_ROOM;
+  uint8_t hp[8];
+  const uint8_t hn = pathOf(pkt, hp, sizeof(hp));
+  const uint32_t id = history.add(conv, flags, ST_RECV, from.name, text,
+                                  getRTCClock()->getCurrentTime(), hopsOf(pkt), (int8_t)(pkt->getSNR() * 4), hp, hn);
+  keepRoute(id, pkt);
+  gotDM(from.id.pub_key, ts, hash, id);
+  emit(room ? NodeEvent::RoomMsg : NodeEvent::DirectMsg, &from);
+}
+
+void InwNode::onSignedMessageRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t ts,
+                                  const uint8_t* sender_prefix, const char* text) {
+  MyMesh::onSignedMessageRecv(from, pkt, ts, sender_prefix, text);
+  // Room server posts: `from` is the room, the author is identified by prefix.
+  char who[24];
+  ContactInfo* author = lookupContactByPubKey(sender_prefix, 4);
+  if (author) strlcpy(who, author->name, sizeof(who));
+  else if (!memcmp(sender_prefix, self_id.pub_key, 4)) strlcpy(who, getNodeName(), sizeof(who));
+  else snprintf(who, sizeof(who), "%02x%02x%02x%02x", sender_prefix[0], sender_prefix[1],
+                sender_prefix[2], sender_prefix[3]);
+  uint8_t flags = HF_ROOM | (mentions(text, getNodeName()) ? HF_MENTION : 0);
+  if (!memcmp(sender_prefix, self_id.pub_key, 4)) flags |= HF_OUT;
+  uint8_t hp[8];
+  const uint8_t hn = pathOf(pkt, hp, sizeof(hp));
+  keepRoute(history.add(ConvKey::contact(from.id.pub_key), flags, (flags & HF_OUT) ? ST_DELIVERED : ST_RECV,
+                        who, text, ts ? ts : getRTCClock()->getCurrentTime(), hopsOf(pkt), (int8_t)(pkt->getSNR() * 4), hp, hn), pkt);
+  emit(NodeEvent::RoomMsg, &from);
+}
+
+void InwNode::onCommandDataRecv(const ContactInfo& from, mesh::Packet* pkt, uint32_t ts, const char* text) {
+  MyMesh::onCommandDataRecv(from, pkt, ts, text);
+  cliAppend("", text);
+  emit(NodeEvent::CliReply, &from);
+}
+
+void InwNode::onChannelMessageRecv(const mesh::GroupChannel& ch, mesh::Packet* pkt, uint32_t ts,
+                                   const char* text) {
+  MyMesh::onChannelMessageRecv(ch, pkt, ts, text);
+  // Channel text travels as "<sender>: <message>".
+  char who[24] = "";
+  const char* body = text;
+  const char* sep = strstr(text, ": ");
+  if (sep && sep - text < (int)sizeof(who)) {
+    memcpy(who, text, sep - text);
+    who[sep - text] = 0;
+    body = sep + 2;
+  }
+  const uint8_t flags = mentions(body, getNodeName()) ? HF_MENTION : 0;
+  uint8_t hp[8];
+  const uint8_t hn = pathOf(pkt, hp, sizeof(hp));
+  keepRoute(history.add(ConvKey::channel(ch.secret), flags, ST_RECV, who, body,
+                        getRTCClock()->getCurrentTime(), hopsOf(pkt), (int8_t)(pkt->getSNR() * 4), hp, hn), pkt,
+            regions::forChannel(ch.secret));
+  int idx = findChannelIdx(ch);
+  emit(NodeEvent::ChannelMsg, &idx);
+}
+
+void InwNode::onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) {
+  MyMesh::onDiscoveredContact(contact, is_new, path_len, path);
+  _contactsGen++;
+  if (is_new) emit(NodeEvent::NewContact, &contact);
+  else emit(NodeEvent::ContactsChanged);
+}
+
+void InwNode::onContactPathUpdated(const ContactInfo& contact) {
+  MyMesh::onContactPathUpdated(contact);
+  _contactsGen++;
+}
+
+// ---- requests: login / status / telemetry ------------------------------------------
+bool InwNode::login(const uint8_t* pub, const char* password) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint32_t est = 0;
+  if (sendLogin(*c, password, est) == MSG_SEND_FAILED) return false;
+  memcpy(_loginPub, pub, 4);
+  _loginState = 1;
+  _loginAdmin = false;
+  _loginDeadline = millis() + est + 4000;
+  return true;
+}
+
+uint8_t InwNode::loginState(const uint8_t* pub) const {
+  if (!pub || memcmp(pub, _loginPub, 4)) return 0;
+  return _loginState;
+}
+
+bool InwNode::requestStatus(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint32_t tag = 0, est = 0;
+  if (sendRequest(*c, REQ_TYPE_GET_STATUS, tag, est) == MSG_SEND_FAILED) return false;
+  _statusTag = tag; memcpy(_statusPub, pub, 4); _statusSent = millis();
+  _status.valid = false;
+  return true;
+}
+
+bool InwNode::requestTelemetry(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint32_t tag = 0, est = 0;
+  if (sendRequest(*c, REQ_TYPE_GET_TELEMETRY_DATA, tag, est) == MSG_SEND_FAILED) return false;
+  _telemTag = tag; memcpy(_telemPub, pub, 4);
+  telemetryText[0] = 0;
+  return true;
+}
+
+// ANON_REQ_TYPE_REGIONS (simple_repeater): {type}{reply path length}{reply path}.
+// A reply path of none sends the answer straight back, as the question came.
+bool InwNode::requestRegions(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  ContactInfo direct = *c;
+  direct.out_path_len = 0;          // zero hops: a repeater ignores this request flooded
+  const uint8_t req[2] = {0x01, 0};
+  uint32_t tag = 0, est = 0;
+  if (sendAnonReq(direct, req, sizeof(req), tag, est) == MSG_SEND_FAILED) return false;
+  _regionsTag = tag;
+  return true;
+}
+
+bool InwNode::sendCli(const uint8_t* pub, const char* cmd) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint32_t est = 0;
+  const uint32_t ts = getRTCClock()->getCurrentTimeUnique();
+  if (sendCommandData(*c, ts, 0, cmd, est) == MSG_SEND_FAILED) return false;
+  cliAppend("> ", cmd);
+  return true;
+}
+
+void InwNode::cliAppend(const char* prefix, const char* text) {
+  // One entry per line of the reply, wrapped to the panel.
+  const char* p = text;
+  bool first = true;
+  while (*p || first) {
+    const char* nl = strchr(p, '\n');
+    size_t n = nl ? (size_t)(nl - p) : strlen(p);
+    do {
+      const size_t take = min<size_t>(n, 64);
+      if (cliCount == CLI_LINES) { memmove(cliLog[0], cliLog[1], sizeof(cliLog[0]) * (CLI_LINES - 1)); cliCount--; }
+      snprintf(cliLog[cliCount++], sizeof(cliLog[0]), "%s%.*s", first ? prefix : "  ", (int)take, p);
+      first = false;
+      p += take; n -= take;
+    } while (n);
+    if (!nl) break;
+    p = nl + 1;
+  }
+  cliGen++;
+}
+
+// CayenneLPP: enough of it to read what repeaters and sensors actually send.
+static void decodeLpp(const uint8_t* d, int len, char* out, size_t cap) {
+  size_t w = 0;
+  out[0] = 0;
+  int i = 0;
+  auto add = [&](const char* fmt, double v) {
+    if (w < cap) w += snprintf(out + w, cap - w, fmt, v);
+  };
+  while (i + 2 <= len) {
+    const uint8_t ch = d[i], type = d[i + 1];
+    i += 2;
+    switch (type) {
+      case 116: if (i + 2 > len) return; add("battery %.2f V\n", ((d[i] << 8) | d[i + 1]) / 100.0); i += 2; break;
+      case 103: {
+        // Channel 1 is the node itself, where MeshCore reports its chip's temperature.
+        if (i + 2 > len) return;
+        const double c = (int16_t)((d[i] << 8) | d[i + 1]) / 10.0;
+        if (ui_settings.miles) add(ch == 1 ? "board temp %.0f F\n" : "temp %.1f F\n", c * 1.8 + 32);
+        else add(ch == 1 ? "board temp %.0f C\n" : "temp %.1f C\n", c);
+        i += 2; break;
+      }
+      case 104: if (i + 1 > len) return; add("humidity %.0f %%\n", d[i] / 2.0); i += 1; break;
+      case 115: if (i + 2 > len) return; add("pressure %.1f hPa\n", ((d[i] << 8) | d[i + 1]) / 10.0); i += 2; break;
+      case 101: if (i + 2 > len) return; add("light %.0f lux\n", (double)((d[i] << 8) | d[i + 1])); i += 2; break;
+      case 117: if (i + 2 > len) return; add("current %.3f A\n", ((d[i] << 8) | d[i + 1]) / 1000.0); i += 2; break;
+      case 128: if (i + 2 > len) return; add("power %.0f W\n", (double)((d[i] << 8) | d[i + 1])); i += 2; break;
+      case 2:   if (i + 2 > len) return; add("analog %.2f\n", (int16_t)((d[i] << 8) | d[i + 1]) / 100.0); i += 2; break;
+      case 136: {
+        if (i + 9 > len) return;
+        auto s24 = [&](int o) { int32_t v = (d[o] << 16) | (d[o + 1] << 8) | d[o + 2]; if (v & 0x800000) v |= 0xFF000000; return v; };
+        if (w < cap) w += snprintf(out + w, cap - w, "gps %.4f %.4f\n", s24(i) / 10000.0, s24(i + 3) / 10000.0);
+        i += 9; break;
+      }
+      default: return;   // unknown type: length unknown, stop rather than misread
+    }
+  }
+}
+
+void InwNode::onContactResponse(const ContactInfo& contact, const uint8_t* data, uint8_t len) {
+  uint32_t tag = 0;
+  if (len >= 4) memcpy(&tag, data, 4);
+
+  if (_loginState == 1 && len >= 5 && !memcmp(_loginPub, contact.id.pub_key, 4)) {
+    if (!memcmp(&data[4], "OK", 2)) {
+      _loginState = 2;
+    } else if (data[4] == RESP_SERVER_LOGIN_OK) {
+      _loginState = 2;
+      const uint16_t keepAlive = len > 5 ? (uint16_t)data[5] * 16 : 0;
+      if (keepAlive) startConnection(contact, keepAlive);
+      _loginAdmin = (len > 6 && data[6]) || (len > 7 && (data[7] & 3) == 3);
+    } else {
+      _loginState = 3;
+    }
+    emit(_loginState == 2 ? NodeEvent::LoginOk : NodeEvent::LoginFail, &contact);
+    return;
+  }
+  // A regions answer: {our tag}{their clock}{names, comma after each}. Matched on
+  // the tag alone, so it can't be taken for a status reply from the same repeater.
+  if (_regionsTag && tag == _regionsTag && len >= 8) {
+    memcpy(regionsReply.pub, contact.id.pub_key, 32);
+    const size_t n = min<size_t>(len - 8, sizeof(regionsReply.names) - 1);
+    memcpy(regionsReply.names, &data[8], n);
+    regionsReply.names[n] = 0;
+    _regionsTag = 0;
+    regionsGen++;
+    emit(NodeEvent::Regions, &contact);
+    return;
+  }
+  if (_statusTag && len > 4 && (tag == _statusTag || !memcmp(_statusPub, contact.id.pub_key, 4))) {
+    struct { uint16_t batt, txq; int16_t nf, rssi; uint32_t recv, sent, air, up, sf, sd, rf, rd;
+             uint16_t err; int16_t snr; } s;
+    memset(&s, 0, sizeof(s));
+    memcpy(&s, &data[4], min<size_t>(len - 4, sizeof(s)));
+    _status.valid = true;
+    memcpy(_status.pub, contact.id.pub_key, 6);
+    _status.battMv = s.batt; _status.txQueue = s.txq; _status.noiseFloor = s.nf;
+    _status.lastRssi = s.rssi; _status.lastSnr4 = s.snr;
+    _status.recv = s.recv; _status.sent = s.sent; _status.airSecs = s.air; _status.upSecs = s.up;
+    _status.sentFlood = s.sf; _status.sentDirect = s.sd; _status.recvFlood = s.rf; _status.recvDirect = s.rd;
+    _status.rtt = millis() - _statusSent;
+    _statusTag = 0;
+    emit(NodeEvent::Status, &contact);
+    return;
+  }
+  if (_telemTag && len > 4 && (tag == _telemTag || !memcmp(_telemPub, contact.id.pub_key, 4))) {
+    decodeLpp(&data[4], len - 4, telemetryText, sizeof(telemetryText));
+    if (!telemetryText[0]) strlcpy(telemetryText, "no readable sensors", sizeof(telemetryText));
+    _telemTag = 0;
+    emit(NodeEvent::Telemetry, &contact);
+    return;
+  }
+  MyMesh::onContactResponse(contact, data, len);
+}
+
+// ---- trace / discover -----------------------------------------------------------------
+bool InwNode::trace(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint8_t hashSz = 1, n = 0;
+  const uint8_t* src = nullptr;
+  if (c->out_path_len != OUT_PATH_UNKNOWN) {
+    hashSz = (c->out_path_len >> 6) + 1;
+    n = c->out_path_len & 63;
+    src = c->out_path;
+  }
+  // The trace hash width must be 1, 2 or 4 bytes; a prefix of a longer hash
+  // still matches, so anything else is traced on its first byte.
+  const uint8_t sz = (hashSz == 2 || hashSz == 4) ? hashSz : 1;
+  const uint8_t pathSz = sz == 1 ? 0 : sz == 2 ? 1 : 2;
+  uint8_t list[48];
+  uint8_t cnt = 0;
+  auto push = [&](const uint8_t* h) { if ((cnt + 1) * sz <= sizeof(list)) { memcpy(&list[cnt * sz], h, sz); cnt++; } };
+  for (uint8_t i = 0; i < n; i++) push(&src[i * hashSz]);
+  const bool infra = c->type == ADV_TYPE_REPEATER || c->type == ADV_TYPE_ROOM;
+  if (infra) push(c->id.pub_key);        // it forwards, so it can be the far end
+  for (int i = (int)n - 1 - (infra ? 0 : 1); i >= 0; i--) push(&src[i * hashSz]);
+  if (!cnt) return false;                // a chat node with no repeaters between us
+
+  _traceTag = getRNG()->nextInt(1, 0x7FFFFFFF);
+  mesh::Packet* pkt = createTrace(_traceTag, 0, pathSz);
+  if (!pkt) return false;
+  sendDirect(pkt, list, cnt * sz);
+  _traceSent = millis();
+  _trace.valid = false;
+  return true;
+}
+
+void InwNode::onTraceRecv(mesh::Packet* packet, uint32_t tag, uint32_t auth_code, uint8_t flags,
+                          const uint8_t* path_snrs, const uint8_t* path_hashes, uint8_t path_len) {
+  MyMesh::onTraceRecv(packet, tag, auth_code, flags, path_snrs, path_hashes, path_len);
+  if (!_traceTag || tag != _traceTag) return;
+  const uint8_t sz = 1 << (flags & 3);
+  _trace.valid = true;
+  _trace.hops = min<uint8_t>(path_len / sz, 16);
+  for (uint8_t i = 0; i < _trace.hops; i++) {
+    _trace.snr4[i] = (int8_t)path_snrs[i];
+    _trace.hashes[i] = path_hashes[i * sz];
+  }
+  _trace.finalSnr4 = (int8_t)(packet->getSNR() * 4);
+  _trace.rtt = millis() - _traceSent;
+  _traceTag = 0;
+  emit(NodeEvent::Trace);
+}
+
+bool InwNode::discover() {
+  uint8_t data[10];
+  _discoverTag = getRNG()->nextInt(1, 0x7FFFFFFF);
+  data[0] = CTL_DISCOVER_REQ;
+  data[1] = (1 << ADV_TYPE_REPEATER) | (1 << ADV_TYPE_ROOM) | (1 << ADV_TYPE_SENSOR);
+  memcpy(&data[2], &_discoverTag, 4);
+  memset(&data[6], 0, 4);
+  mesh::Packet* pkt = createControlData(data, sizeof(data));
+  if (!pkt) return false;
+  sendZeroHop(pkt);
+  discoveredCount = 0;
+  discoverStarted = millis();
+  return true;
+}
+
+// Zero-hop, so it is never repeated: only repeaters in direct range hear it, and each
+// answers once. The answer counts as a heard packet (logRxRaw), which is all the
+// signal bars need; its tag matches no Discover in progress, so that list is untouched.
+bool InwNode::signalCheck() {
+  uint8_t data[10];
+  const uint32_t tag = getRNG()->nextInt(1, 0x7FFFFFFF);
+  data[0] = CTL_DISCOVER_REQ;
+  data[1] = (1 << ADV_TYPE_REPEATER);
+  memcpy(&data[2], &tag, 4);
+  memset(&data[6], 0, 4);
+  mesh::Packet* pkt = createControlData(data, sizeof(data));
+  if (!pkt) return false;
+  sendZeroHop(pkt);
+  return true;
+}
+
+void InwNode::onControlDataRecv(mesh::Packet* packet) {
+  if ((packet->payload[0] & 0xF0) == CTL_DISCOVER_RESP && packet->payload_len >= 6 + PUB_KEY_SIZE && _discoverTag) {
+    uint32_t tag;
+    memcpy(&tag, &packet->payload[2], 4);
+    if (tag == _discoverTag) {
+      const uint8_t* pub = &packet->payload[6];
+      DiscoverHit* h = nullptr;
+      for (uint8_t i = 0; i < discoveredCount; i++) if (!memcmp(discovered[i].pub, pub, 32)) h = &discovered[i];
+      if (!h && discoveredCount < DISCOVER_MAX) h = &discovered[discoveredCount++];
+      if (h) {
+        memcpy(h->pub, pub, 32);
+        h->type = packet->payload[0] & 0x0F;
+        h->theirSnr4 = (int8_t)packet->payload[1];
+        h->ourSnr4 = (int8_t)(packet->getSNR() * 4);
+        h->rssi = (int16_t)radio_driver.getLastRSSI();
+        h->at = millis();
+        emit(NodeEvent::Discover, h);
+      }
+    }
+  }
+  MyMesh::onControlDataRecv(packet);
+}
+
+// ---- adverts / contacts ------------------------------------------------------------------
+bool InwNode::advertZeroHop() { return advert(); }
+
+bool InwNode::advertFlood() {
+  NodePrefs& p = prefs();
+  double lat = sensors.node_lat, lon = sensors.node_lon;
+  inwLocShare(lat, lon);                                  // as exact as Settings > position says
+  mesh::Packet* pkt = p.advert_loc_policy == ADVERT_LOC_NONE
+      ? createSelfAdvert(p.node_name)
+      : createSelfAdvert(p.node_name, lat, lon);
+  if (!pkt) return false;
+  sendFlood(pkt, (uint32_t)0, (uint8_t)(p.path_hash_mode + 1));
+  return true;
+}
+
+bool InwNode::shareContact(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  return c && shareContactZeroHop(*c);
+}
+
+void InwNode::resetPath(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return;
+  resetPathTo(*c);
+  _contactsGen++;
+  saveContactsNow();
+}
+
+bool InwNode::forgetContact(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return false;
+  uint8_t key[32];
+  memcpy(key, pub, 32);
+  if (!removeContact(*c)) return false;
+  _ds.deleteBlobByKey(key, PUB_KEY_SIZE);
+  _contactsGen++;
+  saveContactsNow();
+  return true;
+}
+
+// "Heard" is lastmod: this pager's own time for the last advert or message from
+// the contact, the same time the contact list shows. last_advert_timestamp is the
+// sender's clock, which can be anything, so it isn't used.
+static bool isStale(const ContactInfo& c, uint32_t cutoff) {
+  if (c.flags & 0x01) return false;          // favourite
+  if (!c.lastmod) return false;              // never heard by time: don't guess
+  return c.lastmod < cutoff;
+}
+
+int InwNode::countStale(uint32_t days) {
+  if (!app::timeValid()) return -1;
+  const uint32_t cutoff = app::now() - days * 86400UL;
+  int n = 0;
+  ContactInfo c;
+  for (int i = 0; i < getNumContacts(); i++)
+    if (getContactByIdx(i, c) && isStale(c, cutoff)) n++;
+  return n;
+}
+
+int InwNode::forgetStale(uint32_t days) {
+  if (!app::timeValid()) return -1;
+  const uint32_t cutoff = app::now() - days * 86400UL;
+  // Collect first: removing shifts the table under an index loop.
+  std::vector<std::array<uint8_t, 32>> gone;
+  ContactInfo c;
+  for (int i = 0; i < getNumContacts(); i++)
+    if (getContactByIdx(i, c) && isStale(c, cutoff)) {
+      std::array<uint8_t, 32> k;
+      memcpy(k.data(), c.id.pub_key, 32);
+      gone.push_back(k);
+    }
+  int n = 0;
+  for (auto& k : gone) {
+    ContactInfo* p = contact(k.data());
+    if (p && removeContact(*p)) { _ds.deleteBlobByKey(k.data(), PUB_KEY_SIZE); n++; }
+  }
+  if (n) { _contactsGen++; saveContactsNow(); }
+  return n;
+}
+
+void InwNode::toggleFavourite(const uint8_t* pub) {
+  ContactInfo* c = contact(pub);
+  if (!c) return;
+  c->flags ^= 0x01;
+  _contactsGen++;
+  saveContactsNow();
+}
+
+static bool saveFilter(const ContactInfo& c) { return c.type != ADV_TYPE_NONE; }
+void InwNode::saveContactsNow() { _ds.saveContacts(this, saveFilter); }
+void InwNode::saveChannelsNow() { _ds.saveChannels(this); }
+
+void InwNode::applyRadio() {
+  NodePrefs& p = prefs();
+  radio_driver.setParams(p.freq, p.bw, p.sf, p.cr);
+  radio_driver.setTxPower(p.tx_power_dbm);
+  radio_driver.setRxBoostedGainMode(p.rx_boosted_gain);
+}
+
+// ---- packet log / repeat counting ----------------------------------------------------------
+void InwNode::logPacket(bool tx, uint8_t header, uint8_t pathLen, uint8_t len, float snr, float rssi) {
+  PacketLogEntry& e = pktLog[pktHead];
+  e.at = millis();
+  e.tx = tx;
+  e.routeType = header & 0x03;
+  e.payloadType = (header >> 2) & 0x0F;
+  e.hops = pathLen & 63;
+  e.len = len;
+  e.snr4 = (int8_t)(snr * 4);
+  e.rssi = (int16_t)rssi;
+  pktHead = (pktHead + 1) % PKT_LOG_MAX;
+  if (pktCount < PKT_LOG_MAX) pktCount++;
+  pktGen++;
+}
+
+void InwNode::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
+  MyMesh::logRxRaw(snr, rssi, raw, len);
+  if (len < 2) return;
+  heardAt = millis() | 1;
+  heardSnr = (int8_t)constrain((int)lroundf(snr), -127, 127);
+  heardTimes[heardNext] = heardAt;
+  heardSnrs[heardNext] = heardSnr;
+  heardNext = (heardNext + 1) % 16;
+  const uint8_t header = raw[0];
+  const uint8_t route = header & 0x03;
+  // Transport-coded routes carry 4 bytes of codes before the path length.
+  const int pl = (route == 0 || route == 3) ? 5 : 1;
+  logPacket(false, header, len > pl ? raw[pl] : 0, (uint8_t)min(len, 255), snr, rssi);
+}
+
+void InwNode::logTx(mesh::Packet* packet, int len) {
+  MyMesh::logTx(packet, len);
+  logPacket(true, packet->header, packet->path_len, (uint8_t)min(len, 255), 0, 0);
+  // A text post leaving with an empty path is one we originated.
+  const uint8_t t = packet->getPayloadType();
+  if ((t == PAYLOAD_TYPE_GRP_TXT || t == PAYLOAD_TYPE_TXT_MSG) && packet->getPathHashCount() == 0 &&
+      packet->isRouteFlood() && _awaitCount) {
+    Echo& e = _echo[_echoHead];
+    packet->calculatePacketHash(e.hash);
+    e.histId = _awaitTx[0];
+    e.at = millis();
+    _echoHead = (_echoHead + 1) % ECHO_MAX;
+    memmove(_awaitTx, _awaitTx + 1, sizeof(uint32_t) * 3);
+    _awaitCount--;
+  } else if ((t == PAYLOAD_TYPE_TXT_MSG) && _awaitCount && !packet->isRouteFlood()) {
+    // Direct DM: nothing to count echoes of, just release the slot.
+    memmove(_awaitTx, _awaitTx + 1, sizeof(uint32_t) * 3);
+    _awaitCount--;
+  }
+}
+
+void InwNode::logRx(mesh::Packet* packet, int len, float score) {
+  MyMesh::logRx(packet, len, score);
+  const uint8_t t = packet->getPayloadType();
+  if (t != PAYLOAD_TYPE_GRP_TXT && t != PAYLOAD_TYPE_TXT_MSG) return;
+  uint8_t h[MAX_HASH_SIZE];
+  packet->calculatePacketHash(h);
+  const uint32_t now = millis();
+  for (auto& e : _echo) {
+    if (e.histId && now - e.at < 120000 && !memcmp(e.hash, h, MAX_HASH_SIZE)) {
+      history.bumpRepeat(e.histId);
+      // Every repeater in its path carried it: the last is the one we heard, the
+      // ones before it passed it along.
+      if (packet->getPathHashCount())
+        history.heardVia(e.histId, packet->path, packet->getPathHashSize(), packet->getPathHashCount());
+      return;
+    }
+  }
+}
+
+// ---- bring-up ----------------------------------------------------------------------------
+bool nodeBegin() {
+  if (!radio_init()) return false;
+  g_rng.begin(radio_driver.getRngSeed());
+
+  // ~250 KB with 1000 contacts: PSRAM, not the internal heap BLE needs.
+  void* mem = heap_caps_malloc(sizeof(InwNode), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  if (!mem) mem = malloc(sizeof(InwNode));
+  if (!mem) return false;
+  g_node = new (mem) InwNode(radio_driver, g_rng, rtc_clock, g_tables, g_store);
+
+  g_store.begin();
+  g_node->begin(false);
+
+  g_ble.begin(BLE_NAME_PREFIX, g_node->getNodePrefs()->node_name, g_node->getBLEPin());
+  g_ifaces.addInterface(InterfaceType::Bluetooth, &g_ble);
+  g_node->startInterface(g_ifaces);
+  if (!inwBleWanted()) g_ifaces.disableBluetooth();
+  sensors.begin();
+  return true;
+}
+
+void nodeLoop() {
+  if (!g_node) return;
+  // Store writes no longer happen here (tools/patch_meshcore.py moves them to a
+  // background task), yet the slow log still showed steady ~250 ms "msh"
+  // stalls. Name the packet that was being handled when one happens, so the
+  // cause is measured rather than guessed.
+  const uint32_t t0 = millis();
+  g_node->loop();
+  const uint32_t t1 = millis();
+  g_node->tick();
+  rtc_clock.tick();
+  const uint32_t tLoop = t1 - t0, tTick = millis() - t1;
+  if (tLoop > 120 || tTick > 120) {
+    static const char* N[] = {"REQ", "RESP", "TXT", "ACK", "ADVERT", "GRP_TXT", "GRP_DATA", "ANON",
+                              "PATH", "TRACE", "MULTI", "CTRL", "?12", "?13", "?14", "RAW"};
+    static const char* R[] = {"tflood", "flood", "direct", "tdirect"};
+    const uint8_t n = g_node->pktCount;
+    if (n) {
+      const PacketLogEntry& e = g_node->pktLog[(g_node->pktHead + InwNode::PKT_LOG_MAX - 1) % InwNode::PKT_LOG_MAX];
+      Serial.printf("[W] mesh slow: loop %lums tick %lums; last pkt %s %s %s %uB %uh %lums ago, %d contacts\n",
+                    (unsigned long)tLoop, (unsigned long)tTick, e.tx ? "TX" : "rx", N[e.payloadType & 15],
+                    R[e.routeType & 3], e.len, e.hops, (unsigned long)(millis() - e.at), g_node->getNumContacts());
+    } else {
+      Serial.printf("[W] mesh slow: loop %lums tick %lums; no packets yet\n", (unsigned long)tLoop, (unsigned long)tTick);
+    }
+  }
+}
+
+bool bleEnabled()   { return g_ifaces.isBluetoothEnabled(); }
+// The normal Bluetooth toggle only stops services/advertising. Manual light
+// sleep also needs the idle host/controller stopped. Keep BLE allocations and
+// bonds, and resume the same stack when the user enables Bluetooth again.
+bool blePrepareLightSleep() {
+  if (bleEnabled() || bleConnected()) return false;
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_ENABLED &&
+      esp_bluedroid_disable() != ESP_OK) return false;
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_ENABLED &&
+      esp_bt_controller_disable() != ESP_OK) {
+    esp_bluedroid_enable();
+    return false;
+  }
+  return esp_bt_controller_get_status() != ESP_BT_CONTROLLER_STATUS_ENABLED;
+}
+void bleSetEnabled(bool on) {
+  if (!on) { g_ifaces.disableBluetooth(); return; }
+  if (esp_bt_controller_get_status() == ESP_BT_CONTROLLER_STATUS_INITED &&
+      esp_bt_controller_enable(ESP_BT_MODE_BLE) != ESP_OK) {
+    Serial.println("[power] Bluetooth controller resume failed"); return;
+  }
+  if (esp_bluedroid_get_status() == ESP_BLUEDROID_STATUS_INITIALIZED &&
+      esp_bluedroid_enable() != ESP_OK) {
+    Serial.println("[power] Bluetooth host resume failed"); return;
+  }
+  g_ifaces.enableBluetooth();
+}
+bool bleConnected() { return g_ifaces.isConnected(); }
+uint32_t blePin()   { return g_node ? g_node->getBLEPin() : 0; }

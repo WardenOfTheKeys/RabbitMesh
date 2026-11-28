@@ -1,0 +1,1268 @@
+// Chat list and conversation thread.
+
+#include "app.h"
+#include "node.h"
+#include "history.h"
+#include "regions.h"
+#include "archive.h"
+void openChannelRegionScope(const uint8_t* secret16);   // settings_ui.cpp
+#include "notify.h"
+#include "fx.h"
+#include "chats.h"
+
+ConvKey g_openConv;                 // the thread on screen, for notification muting
+
+// Chat text size (Settings > Display > chat text size, GitHub #14). Only the
+// messages themselves grow; names, times and the rest of the screen stay as they
+// are. Normal is the 16 px font every build has used, at the same 17 px lines.
+// Older saved settings read this byte from what was spare space: anything out of
+// range is normal.
+static uint8_t chatSize() { return ui_settings.chatText <= 2 ? ui_settings.chatText : 0; }
+static const lgfx::IFont* chatFont() {
+  switch (chatSize()) {
+    case 1:  return &fonts::DejaVu18;
+    case 2:  return &fonts::DejaVu24;
+    default: return &fonts::Font2;
+  }
+}
+// Line spacing for the font set now, and how far down an emoji (16 px) sits to
+// line up with it. Normal: 17 and 0, as before.
+static int chatLineH(lgfx::LovyanGFX& g) { return chatSize() ? g.fontHeight() + 2 : 17; }
+static int chatEmojiDrop(lgfx::LovyanGFX& g) { return chatSize() ? max(0, ((int)g.fontHeight() - 16) / 2) : 0; }
+// A bigger font fits fewer words: on a wide screen (the pager's) the bubbles may
+// then use the full width.
+static int chatBubbleMax() { return chatSize() ? max(320, L::W - 16) : 320; }
+// The box you type in grows with it, and what you type is in the same font. Normal
+// is the 24 px bar as before; the messages end 4 px above it.
+static int composeH() { return chatSize() == 2 ? 36 : chatSize() == 1 ? 30 : 24; }
+static int composeTop() { return L::H - composeH() - 4; }
+
+// ---- helpers ------------------------------------------------------------------------
+static bool channelName(const ConvKey& k, char* out, size_t cap, int* idxOut = nullptr) {
+  if (!g_node) return false;
+  const int idx = g_node->findChannelBySecret(k.id);
+  if (idx < 0) return false;
+  ChannelDetails ch;
+  g_node->getChannel(idx, ch);
+  strlcpy(out, ch.name, cap);
+  if (idxOut) *idxOut = idx;
+  return true;
+}
+
+static void convName(const ConvKey& k, char* out, size_t cap, uint8_t* kind = nullptr) {
+  if (k.type == CONV_CHANNEL) {
+    if (kind) *kind = 10;
+    if (!channelName(k, out, cap)) strlcpy(out, "(removed channel)", cap);
+    return;
+  }
+  ContactInfo* c = g_node ? g_node->contactByPrefix(k.id, 6) : nullptr;
+  if (kind) *kind = c ? c->type : 1;
+  if (c) { strlcpy(out, c->name, cap); return; }
+  HistMsg* m = history.last(k);
+  if (m && !(m->flags & HF_OUT) && m->sender[0]) strlcpy(out, m->sender, cap);
+  else snprintf(out, cap, "%02x%02x%02x%02x", k.id[0], k.id[1], k.id[2], k.id[3]);
+}
+
+// ---- quick replies / message actions -----------------------------------------------------
+class ThreadView;
+static void openQuickReplies(ThreadView* t);
+static void openEmojiPicker(ThreadView* t);
+static void openMessageActions(ThreadView* t, uint32_t id);
+
+// ---- thread ---------------------------------------------------------------------------------
+class ThreadView : public View {
+public:
+  explicit ThreadView(const ConvKey& k) : _key(k) {
+    g_openConv = k;
+    // Where "new" starts. Captured before marking read, and kept while the
+    // thread stays open, so the line doesn't vanish the moment you look.
+    if (history.unread(k)) _newAfter = history.readMark(k);
+    history.markRead(k);
+    refresh();
+    // A room server only talks to logged-in clients; try the guest login once.
+    ContactInfo* c = contact();
+    if (c && c->type == ADV_TYPE_ROOM && g_node->loginState(c->id.pub_key) == 0)
+      g_node->login(c->id.pub_key, "");
+  }
+  ~ThreadView() override { if (g_openConv == _key) g_openConv = ConvKey(); }
+  bool wantsAllKeys() override { return true; }
+
+  ContactInfo* contact() {
+    return (_key.type == CONV_CONTACT && g_node) ? g_node->contactByPrefix(_key.id, 6) : nullptr;
+  }
+
+  void resume() override { g_openConv = _key; refresh(); dirty = true; }
+
+  void refresh() {
+    _n = history.collect(_key, _ids, MAX_IDS);
+    _gen = history.gen;
+    if (_sel >= _n) _sel = _n - 1;
+    history.markRead(_key);
+    _gen = history.gen;
+    noticeChanges();
+  }
+
+  void tick() override {
+    if (history.gen != _gen) { refresh(); dirty = true; }
+    if (millis() - _blinkAt > 530) { _blinkAt = millis(); _caret = !_caret; if (_sel < 0) dirty = true; }
+    if (_revealId && millis() - _revealAt < REVEAL_MS + 60) dirty = true;   // the decrypt effect
+  }
+
+  void setCompose(const String& s) { _compose = s; _cur = -1; _spaceAt = -1; _sel = -1; dirty = true; }
+  // Text put in where the cursor is (an emoji from the picker).
+  void insertAtCursor(const String& s) {
+    if ((int)(_compose.length() + s.length()) > maxLen() + 4) return;
+    const int at = cursorAt();
+    _compose = _compose.substring(0, at) + s + _compose.substring(at);
+    if (_cur >= 0) _cur = at + s.length();
+    _spaceAt = -1; _sel = -1; dirty = true;
+  }
+  const String& compose() const { return _compose; }
+  const ConvKey& key() const { return _key; }
+
+  void key(char c) override {
+    if (c == '\n') { send(); return; }
+    if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E) return;
+    if ((int)_compose.length() >= maxLen()) return;
+    const int at = cursorAt();
+    if (_cur < 0) _compose += c;                      // at the end, as it always was
+    else { _compose = _compose.substring(0, at) + c + _compose.substring(at); _cur = at + 1; }
+    _spaceAt = c == ' ' ? at : -1;                    // a space a hold-and-turn may take back
+    caretOn();
+    _sel = -1;
+    _tAnchor = -1; _px = 0;                // typing: back to the newest
+    dirty = true;
+  }
+
+  bool backspace() override {
+    if (_sel >= 0) { _sel = -1; dirty = true; return true; }
+    if (!_compose.length()) return false;
+    // Drop the whole UTF-8 character before the cursor (an emoji is 4 bytes).
+    const int at = cursorAt();
+    if (at == 0) { dirty = true; return true; }      // nothing before it: the draft stays
+    const int n = prevChar(at);
+    _compose.remove(n, at - n);
+    if (_cur >= 0) _cur = n;
+    _spaceAt = -1;
+    caretOn();
+    dirty = true;
+    return true;
+  }
+
+  void rotate(int d) override {
+    if (!_n) return;
+    _tAnchor = -1; _px = 0;                // the wheel goes message by message
+    // Up (negative) walks back through history, down returns to composing.
+    int s = _sel < 0 ? _n : _sel;
+    s += d;
+    if (s >= _n) _sel = -1;
+    else _sel = max(0, s);
+    dirty = true;
+  }
+
+  // The text cursor: hold space and turn the wheel (pager), or roll the trackball left
+  // and right (T-Deck). Typing, backspace and emoji then go in where it is.
+  bool moveCursor(int steps, bool firstOfHold) override {
+    if (!_compose.length() || !steps) return false;
+    if (firstOfHold && _spaceAt >= 0 && _spaceAt < (int)_compose.length() && _compose[_spaceAt] == ' ') {
+      _compose.remove(_spaceAt, 1);                    // the space that started the hold
+      if (_cur > _spaceAt) _cur--;
+    }
+    _spaceAt = -1;
+    int at = cursorAt();
+    for (; steps < 0 && at > 0; steps++) at = prevChar(at);
+    for (; steps > 0 && at < (int)_compose.length(); steps--) at = nextChar(at);
+    _cur = at >= (int)_compose.length() ? -1 : at;
+    _sel = -1;
+    caretOn();
+    dirty = true;
+    return true;
+  }
+#if BOARD_HAS_TRACKBALL
+  bool roll(int dx, int dy) override {
+    if (dy || !dx || _sel >= 0 || !_compose.length()) return false;
+    return moveCursor(dx, false);
+  }
+#endif
+
+  void press() override {
+    if (_sel >= 0 && _sel < _n) { openMessageActions(this, _ids[_sel]); return; }
+    openEmojiPicker(this);
+  }
+
+  // Touch: tap a message for its actions, tap the compose bar for emoji and
+  // quick replies, drag to go back through the conversation.
+  bool touch(const TouchEvent& e) override {
+    switch (e.type) {
+      case TouchEvent::Down: return false;
+      case TouchEvent::Drag: {
+        // The conversation moves with the finger, by the pixel (it used to jump a
+        // message for every 36 px). _tAnchor is the message whose bottom edge sits
+        // _px below the bottom of the page; -1 is the normal view, on the newest.
+        if (!_n || !e.dy) return false;
+        if (_tAnchor < 0 || _tAnchor >= _n) { _tAnchor = _sel >= 0 ? _sel : _n - 1; _px = 0; }
+        _sel = -1;                            // a finger took over: the highlight goes
+        if (e.dy > 0) {                       // finger down: older messages come in
+          // Only as far as the oldest message reaching the top of the page: how much
+          // conversation there is above the bottom edge, counted up from the anchor
+          // until it is plainly more than a pageful.
+          const int viewH = composeTop() - 2 - (L::BODY_Y + 2);
+          int above = -_px;
+          for (int k = _tAnchor; k >= 0 && above < viewH + e.dy; k--) above += heightOf(k);
+          const int dy = max(0, min((int)e.dy, above - viewH));
+          _px += dy;
+          for (int h = heightOf(_tAnchor); _tAnchor > 0 && h > 0 && _px >= h; h = heightOf(_tAnchor)) { _px -= h; _tAnchor--; }
+        } else {
+          _px += e.dy;
+          while (_px < 0) {
+            if (_tAnchor >= _n - 1) { _px = 0; break; }
+            _tAnchor++;
+            _px += heightOf(_tAnchor);
+          }
+        }
+        if (_tAnchor >= _n - 1 && _px <= 0) { _tAnchor = -1; _px = 0; }   // on the newest again: new arrivals show
+        return true;
+      }
+      case TouchEvent::Tap:
+        if (e.y >= composeTop()) {
+          // On the draft's words: the cursor goes there. The right end (the count),
+          // or an empty bar: emoji and quick replies, as before.
+          if (_compose.length() && e.x < L::W - 70) { placeCursorAt(e.x); return true; }
+          openEmojiPicker(this); return true;
+        }
+        // A channel's title (its right half: the "<" is back): Set Region Scope, as
+        // the app's channel menu.
+        if (e.y >= L::HEAD_Y && e.y < L::HEAD_Y + L::HEAD_H && e.x >= L::W / 2 && _key.type == CONV_CHANNEL && g_node) {
+          ChannelDetails ch;
+          const int idx = g_node->findChannelBySecret(_key.id);
+          if (idx >= 0 && g_node->getChannel(idx, ch)) { openChannelRegionScope(ch.channel.secret); return true; }
+          return false;
+        }
+        for (uint8_t k = 0; k < _hitN; k++)
+          if (e.y >= _hitTop[k] && e.y < _hitBot[k]) { _sel = _hitIdx[k]; openMessageActions(this, _ids[_sel]); return true; }
+        return false;
+      default: return false;
+    }
+  }
+
+  int maxLen() const {
+    // MeshCore text payload is 160 bytes; channel posts also carry "<name>: ".
+    if (_key.type == CONV_CHANNEL && g_node) return max(40, 150 - (int)strlen(g_node->name()));
+    return 150;
+  }
+
+  void send() {
+    if (!_compose.length() || !g_node) return;
+    char text[168];
+    strlcpy(text, _compose.c_str(), sizeof(text));
+    if (_key.type == CONV_CHANNEL) {
+      const int idx = g_node->findChannelBySecret(_key.id);
+      if (idx < 0) { nav.toast("channel no longer exists"); return; }
+      const uint32_t id = history.add(_key, HF_OUT, ST_SENDING, g_node->name(), text, app::now());
+      g_node->sendChannel(idx, text, id);
+    } else {
+      ContactInfo* c = contact();
+      if (!c) { nav.toast("contact no longer exists"); return; }
+      uint8_t pub[32];
+      memcpy(pub, c->id.pub_key, 32);
+      const uint32_t id = history.add(_key, HF_OUT | (c->type == ADV_TYPE_ROOM ? HF_ROOM : 0), ST_SENDING,
+                                      g_node->name(), text, app::now());
+      g_node->sendDM(pub, text, id);
+    }
+    _compose = "";
+    _sel = -1;
+    _tAnchor = -1; _px = 0;
+    fx::burst(L::W - 40, L::H - 14);                  // off it goes, in the theme's style
+    refresh();
+    dirty = true;
+  }
+
+  void resend(uint32_t id) {
+    HistMsg* m = history.find(id);
+    if (!m || !g_node) return;
+    char text[168];
+    strlcpy(text, m->text, sizeof(text));
+    // Sent again as the SAME message, not a new one: the copies heard of every send
+    // count together on it ("heard x3") and the chat doesn't show it twice. Its details
+    // count the tries.
+    const uint8_t tries = m->attempts ? m->attempts : 1;
+    history.setStatus(id, ST_SENDING, tries < 250 ? tries + 1 : 250);
+    if (_key.type == CONV_CHANNEL) {
+      const int idx = g_node->findChannelBySecret(_key.id);
+      if (idx >= 0) g_node->sendChannel(idx, text, id);
+    } else if (ContactInfo* c = contact()) {
+      uint8_t pub[32];
+      memcpy(pub, c->id.pub_key, 32);
+      g_node->sendDM(pub, text, id);
+    }
+    _sel = -1;
+    refresh();
+  }
+
+  void draw(Canvas& g) override {
+    const Theme& t = nav.theme();
+    char title[40];
+    uint8_t kind = 1;
+    convName(_key, title, sizeof(title), &kind);
+    char sub[40] = "";
+    if (_key.type == CONV_CHANNEL) {
+      // As the app's chat title does: the region its messages go out in, if any
+      // (regions.h). Only repeaters that carry it pass them on.
+      const char* region = regions::effective(_key.id);
+      if (*region) snprintf(sub, sizeof(sub), L::W < 400 ? "Region: %s" : "Region: %s  %u msgs", region, _n);
+      else snprintf(sub, sizeof(sub), "%u messages", _n);
+    } else if (ContactInfo* c = contact()) {
+      if (c->type == ADV_TYPE_ROOM) {
+        const uint8_t ls = g_node->loginState(c->id.pub_key);
+        snprintf(sub, sizeof(sub), "room  %s", ls == 2 ? "logged in" : ls == 1 ? "logging in" : ls == 3 ? "login failed" : "");
+      } else if (c->out_path_len == OUT_PATH_UNKNOWN) snprintf(sub, sizeof(sub), "flood  %s", timeAgo(c->lastmod));
+      else if ((c->out_path_len & 63) == 0) snprintf(sub, sizeof(sub), "direct  %s", timeAgo(c->lastmod));
+      else snprintf(sub, sizeof(sub), "%u hop%s  %s", c->out_path_len & 63, (c->out_path_len & 63) == 1 ? "" : "s", timeAgo(c->lastmod));
+    }
+    drawHeader(g, title, sub);
+
+    const int top = L::BODY_Y + 2, bottom = composeTop();
+    g.setClipRect(0, top, L::W, bottom - top);
+    if (!_n) {
+      g.setTextColor(t.dim, t.bg);
+      g.drawString(_key.type == CONV_CHANNEL ? "no messages yet - say something" : "no messages yet", 14, top + 10);
+    }
+    // Bottom-up: the anchor is where a finger left the page, or the selected message,
+    // or the newest.
+    const bool fingered = _tAnchor >= 0 && _tAnchor < _n;
+    const int anchor = fingered ? _tAnchor : (_sel >= 0 ? _sel : _n - 1);
+    int y = bottom - 2 + (fingered ? _px : 0);
+#if !defined(BOARD_HAS_TOUCH) || !BOARD_HAS_TOUCH
+    // With bigger chat text one message can be taller than the view: show it from its
+    // first line rather than cut off at the top. (A touchscreen scrolls through it.)
+    if (!fingered && anchor >= 0 && anchor < _n && chatSize()) {
+      if (HistMsg* am = history.find(_ids[anchor])) {
+        const int ah = ui_settings.compactChat ? drawCompact(g, *am, y, false, true) : drawBubble(g, *am, y, false, true);
+        if (ah > bottom - top - 4) y = top + 2 + ah;
+      }
+    }
+#endif
+    _posN = 0;
+    _hitN = 0;
+    // If a selection is scrolled up, keep a little of the next message visible.
+    for (int i = anchor; i >= 0 && y > top; i--) {
+      HistMsg* m = history.find(_ids[i]);
+      if (!m) continue;
+      const int below = y;
+      y -= ui_settings.compactChat ? drawCompact(g, *m, y, i == _sel) : drawBubble(g, *m, y, i == _sel);
+      if (_hitN < HIT_MAX) { _hitTop[_hitN] = max(y, top); _hitBot[_hitN] = below; _hitIdx[_hitN++] = i; }   // for touch
+      y -= 4;
+      // Red line above the first message that was unread when the thread opened.
+      if (_newAfter != NO_DIVIDER && _ids[i] > _newAfter && (i == 0 || _ids[i - 1] <= _newAfter)) {
+        y -= drawNewDivider(g, y);
+      }
+    }
+    g.clearClipRect();
+    const int behind = fingered ? _n - 1 - _tAnchor : (_sel >= 0 ? _n - 1 - _sel : 0);
+    if (behind > 0) {
+      char more[24];
+      snprintf(more, sizeof(more), "%d newer", behind);
+      drawPill(g, L::W - 90, bottom - 22, 80, 18, t.greenDim, t.white, more);
+    }
+    drawCompose(g, bottom);
+  }
+
+private:
+  static constexpr uint32_t NO_DIVIDER = 0xFFFFFFFF;
+  uint32_t _newAfter = NO_DIVIDER;
+
+  int drawNewDivider(Canvas& g, int bottomY) {
+    const Theme& t = nav.theme();
+    const int h = 16, y = bottomY - h / 2 - 2;
+    g.setFont(&fonts::Font0);
+    const char* label = "NEW";
+    const int lw = g.textWidth(label) + 10, cx = L::W / 2;
+    g.drawFastHLine(8, y, cx - lw / 2 - 12, t.red);
+    g.drawFastHLine(8, y + 1, cx - lw / 2 - 12, t.red);
+    g.drawFastHLine(cx + lw / 2 + 4, y, L::W - 8 - (cx + lw / 2 + 4), t.red);
+    g.drawFastHLine(cx + lw / 2 + 4, y + 1, L::W - 8 - (cx + lw / 2 + 4), t.red);
+    g.fillRoundRect(cx - lw / 2 - 4, y - 5, lw + 4, 12, 5, t.red);
+    g.setTextColor(t.white, t.red);
+    g.drawString(label, cx - lw / 2 + 3, y - 3);
+    g.setFont(&fonts::Font2);
+    return h;
+  }
+
+  // A message's height with the gap under it (and the "NEW" line over it, if it has
+  // one), without drawing it: what a finger's scroll steps by.
+  int heightOf(int i) {
+    if (i < 0 || i >= _n) return 0;
+    HistMsg* m = history.find(_ids[i]);
+    if (!m) return 0;
+    Canvas& g = nav.canvas();
+    g.setFont(&fonts::Font2);
+    int h = (ui_settings.compactChat ? drawCompact(g, *m, 0, false, true) : drawBubble(g, *m, 0, false, true)) + 4;
+    if (_newAfter != NO_DIVIDER && _ids[i] > _newAfter && (i == 0 || _ids[i - 1] <= _newAfter)) h += 16;
+    return h;
+  }
+
+  // Returns the height used; draws with its bottom edge at `bottomY`. measureOnly:
+  // the height alone.
+  int drawBubble(Canvas& g, const HistMsg& m, int bottomY, bool selected, bool measureOnly = false) {
+    const Theme& t = nav.theme();
+    const bool out = m.flags & HF_OUT;
+    const bool showName = !out && (_key.type == CONV_CHANNEL || (m.flags & HF_ROOM));
+    char text[200];
+    sanitize(m.text, text, sizeof(text));
+    uint16_t st[12]; uint8_t ln[12];
+    const int maxW = chatBubbleMax();
+    g.setFont(chatFont());
+    const int lh = chatLineH(g);
+    const int nl = wrapText(g, text, maxW - 16, st, ln, 12);
+    int textW = 0;
+    for (int i = 0; i < nl; i++) textW = max(textW, richWidth(g, text + st[i], ln[i]));
+    g.setFont(&fonts::Font2);                          // names and times stay this size
+    char meta[48];
+    metaText(m, meta, sizeof(meta));
+    char name[28] = "";
+    if (showName) sanitize(m.sender, name, sizeof(name));
+    const int metaW = g.textWidth(meta);
+    const int nameW = showName ? richWidth(g, name) : 0;
+    const int w = min(maxW, max(max(textW, metaW), nameW) + 16);
+    const int h = 8 + (showName ? 17 : 0) + nl * lh + 16;
+    if (measureOnly) return h;
+    const int x = out ? L::W - 8 - w : 8;
+    const int y = bottomY - h;
+    const bool mention = m.flags & HF_MENTION;
+    const uint16_t bg = out ? t.bubbleOut : (mention ? t.mentionBg : t.bubbleIn);
+    g.fillRoundRect(x, y, w, h, 8, bg);
+    if (selected) g.drawRoundRect(x - 1, y - 1, w + 2, h + 2, 9, t.green);
+    else if (mention) g.drawRoundRect(x, y, w, h, 8, t.amber);
+    int ty = y + 4;
+    if (showName) {
+      g.setTextColor(nameInk(m.sender, t.white), bg);
+      drawRich(g, name, x + 8, ty);
+      ty += 17;
+    }
+    g.setTextColor(t.white, bg);
+    scrambleIfNew(m.id, text);                        // a new arrival decrypts in front of you
+    g.setFont(chatFont());
+    richEmojiDrop(chatEmojiDrop(g));
+    for (int i = 0; i < nl; i++) {
+      drawRich(g, text + st[i], x + 8, ty, ln[i]);
+      ty += lh;
+    }
+    richEmojiDrop(0);
+    g.setFont(&fonts::Font2);
+    g.setTextColor(m.status == ST_FAILED ? t.red : t.dim, bg);
+    g.drawString(meta, x + w - 8 - metaW, ty);
+    notePos(m.id, x + w - 12, ty + 7);                // where its effects go: the status line
+    return h;
+  }
+
+  int drawCompact(Canvas& g, const HistMsg& m, int bottomY, bool selected, bool measureOnly = false) {
+    const Theme& t = nav.theme();
+    const bool out = m.flags & HF_OUT;
+    char text[220];
+    char body[200];
+    sanitize(m.text, body, sizeof(body));
+    char who[28];
+    sanitize(out ? "me" : (m.sender[0] ? m.sender : "?"), who, sizeof(who));
+    snprintf(text, sizeof(text), "%s> %s", who, body);
+    uint16_t st[12]; uint8_t ln[12];
+    g.setFont(chatFont());
+    const int lh = chatLineH(g);
+    const int nl = wrapText(g, text, L::W - 90, st, ln, 12);
+    const int h = nl * lh + 2;
+    if (measureOnly) { g.setFont(&fonts::Font2); return h; }
+    const int y = bottomY - h;
+    if (selected) g.fillRect(0, y, L::W, h, t.focus);
+    richEmojiDrop(chatEmojiDrop(g));
+    for (int i = 0; i < nl; i++) {
+      g.setTextColor(i == 0 ? (out ? t.green : nameInk(m.sender, t.txt)) : t.txt, selected ? t.focus : t.bg);
+      drawRich(g, text + st[i], 8, y + 1 + i * lh, ln[i]);
+    }
+    richEmojiDrop(0);
+    g.setFont(&fonts::Font2);
+    char meta[48];
+    metaText(m, meta, sizeof(meta));
+    g.setTextColor(m.status == ST_FAILED ? t.red : t.dim, selected ? t.focus : t.bg);
+    g.drawString(meta, L::W - 8 - g.textWidth(meta), y + 1);
+    notePos(m.id, L::W - 16, y + 8);
+    return h;
+  }
+
+  // ---- animation: what changed since the last look, and where it's on screen ----
+  static constexpr uint32_t REVEAL_MS = 650;
+  struct Seen { uint32_t id; uint8_t status, repeats; };
+  struct Pos  { uint32_t id; int16_t x, y; };
+  Seen _seen[16] = {};
+  uint8_t _seenN = 0;
+  Pos _pos[24] = {};
+  uint8_t _posN = 0;
+  uint32_t _maxId = 0, _revealId = 0, _revealAt = 0;
+  bool _seeded = false;
+
+  void notePos(uint32_t id, int x, int y) {
+    if (_posN < 24) _pos[_posN++] = {id, (int16_t)x, (int16_t)y};
+  }
+  const Pos* posOf(uint32_t id) const {
+    for (uint8_t i = 0; i < _posN; i++) if (_pos[i].id == id) return &_pos[i];
+    return nullptr;
+  }
+
+  // A repeat heard: a ping off the bubble. Delivered: a tick. Failed: a shake.
+  // A message that just arrived: it decrypts on screen. The first look at a
+  // thread only records what's there, so opening it doesn't set everything off.
+  void noticeChanges() {
+    const uint32_t now = millis();
+    uint32_t newest = _maxId;
+    for (int i = max(0, _n - 16); i < _n; i++) {
+      HistMsg* m = history.find(_ids[i]);
+      if (!m) continue;
+      newest = max(newest, _ids[i]);
+      if (!(m->flags & HF_OUT)) {
+        if (_seeded && _ids[i] > _maxId) { _revealId = _ids[i]; _revealAt = now; }
+        continue;
+      }
+      Seen* s = nullptr;
+      for (uint8_t k = 0; k < _seenN; k++) if (_seen[k].id == _ids[i]) s = &_seen[k];
+      if (!s) {
+        if (_seenN < 16) s = &_seen[_seenN++];
+        else { memmove(_seen, _seen + 1, sizeof(Seen) * 15); s = &_seen[15]; }
+        *s = {_ids[i], m->status, m->repeats};
+        continue;
+      }
+      if (_seeded) {
+        const Pos* p = posOf(_ids[i]);
+        if (p && m->repeats > s->repeats)
+          for (int r = 0; r < min(3, m->repeats - s->repeats); r++) fx::ping(p->x - r * 14, p->y);
+        if (m->status != s->status) {
+          if (m->status == ST_DELIVERED && p) fx::check(p->x - 4, p->y - 2);
+          if (m->status == ST_FAILED) fx::fail();
+        }
+      }
+      s->status = m->status;
+      s->repeats = m->repeats;
+    }
+    _maxId = newest;
+    _seeded = true;
+  }
+
+  // While a new message is decrypting, each character not yet revealed shows as
+  // a random glyph from the theme's set; the reveal sweeps left to right.
+  void scrambleIfNew(uint32_t id, char* text) {
+    if (id != _revealId) return;
+    const uint32_t age = millis() - _revealAt;
+    if (age >= REVEAL_MS) { _revealId = 0; return; }
+    static const char* SETS[] = {"0123456789abcdef", "#%&@$=", "*+x~^o", ".:*+~'"};
+    const char* set = SETS[nav.theme().style & 3];
+    const int setN = strlen(set);
+    int len = 0;
+    for (const char* p = text; *p; p++) if ((uint8_t)*p >= 0x20) len++;
+    const int shown = (int)(len * (age / (float)REVEAL_MS));
+    uint32_t seed = (age / 50) * 2654435761u + id;
+    int k = 0;
+    for (char* p = text; *p; p++) {
+      if (*p == 0x01 || *p == 0x02) { if (p[1]) p++; continue; }   // emoji markers stay whole
+      if ((uint8_t)*p < 0x21) { if ((uint8_t)*p >= 0x20) k++; continue; }
+      if (k++ >= shown) { seed = seed * 1103515245u + 12345u; *p = set[(seed >> 16) % setN]; }
+    }
+  }
+
+  void metaText(const HistMsg& m, char* out, size_t cap) {
+    size_t w = snprintf(out, cap, "%s", m.ts && app::timeValid() ? clockText(m.ts) : "");
+    if (m.flags & HF_OUT) {
+      const char* st = m.status == ST_SENDING ? "  sending" : m.status == ST_SENT ? "  sent"
+                     : m.status == ST_DELIVERED ? "  delivered" : m.status == ST_FAILED ? "  FAILED" : "";
+      if (_key.type == CONV_CHANNEL && m.status == ST_SENT) st = m.repeats ? "  heard" : "  sent";
+      w += snprintf(out + w, cap - w, "%s", st);
+      if (m.repeats) w += snprintf(out + w, cap - w, " x%u", m.repeats);
+      if (m.attempts > 1 && w < cap) w += snprintf(out + w, cap - w, " try%u", m.attempts);
+    } else {
+      if (ui_settings.showHops && w < cap) {
+        if (m.hops == 0xFF || m.hops == 0) w += snprintf(out + w, cap - w, "  direct");
+        else {
+          // With how many bytes of each repeater's hash it travelled (1-3), where known.
+          const Route* rt = ui_settings.hideHashBytes ? nullptr : history.route(m);
+          if (rt) w += snprintf(out + w, cap - w, "  %uh %uB", m.hops, rt->sz);
+          else w += snprintf(out + w, cap - w, "  %uh", m.hops);
+        }
+      }
+      if (ui_settings.showSnr && w < cap) w += snprintf(out + w, cap - w, "  %.1fdB", m.snr4 / 4.0);
+      // Copies of it that arrived (the sender's retries): shown once, counted here.
+      if (m.repeats && w < cap) snprintf(out + w, cap - w, "  x%u", m.repeats + 1);
+    }
+  }
+
+  void drawCompose(Canvas& g, int y) {
+    const Theme& t = nav.theme();
+    const int x = 6, w = L::W - 12, h = composeH();
+    y += 2;
+    g.fillRoundRect(x, y, w, h, 12, t.panel);
+    g.drawRoundRect(x, y, w, h, 12, _sel < 0 ? t.greenDim : t.line);
+    // What you type is in the chat text size; the hint and the count stay small.
+    const int smallY = y + (h - 16) / 2;
+    g.setFont(chatFont());
+    const int fh = g.fontHeight(), ty = y + (h - fh) / 2, caretH = max(14, fh - 2);
+    if (!_compose.length()) {
+      g.setTextColor(t.dim, t.panel);
+      char ph[48];
+      char nm[28];
+      convName(_key, nm, sizeof(nm));
+      snprintf(ph, sizeof(ph), "message %s", nm);
+      drawUtf8(g, ph, x + 12, ty, w - 180);
+      g.setFont(&fonts::Font2);
+      const char* hint = BOARD_HAS_TOUCH ? (_sel >= 0 ? "tap: actions" : "tap: emoji + replies")
+                                         : (_sel >= 0 ? "press: actions" : "press: emoji + replies");
+      g.drawString(hint, x + w - 12 - g.textWidth(hint), smallY);
+      if (_sel < 0 && _caret) g.fillRect(x + 10, ty + 1, 2, caretH, t.green);
+      return;
+    }
+    char safe[200];
+    sanitize(_compose.c_str(), safe, sizeof(safe));
+    // The cursor's place in the shown text, and a window on a long draft that keeps it
+    // in view (the end, as before, while it is at the end). Never starts inside an
+    // emoji marker.
+    const int avail = w - 70;
+    const int sp = sanitizedLen(cursorAt());
+    int start = 0;
+    if (_cur < 0) {
+      while (safe[start] && richWidth(g, safe + start) > avail) start += stepMarked(safe, start);
+    } else {
+      start = min(_winStart, sp);
+      while (start > 0 && richWidth(g, safe + start, sp - start) < avail / 3) start = prevMarked(safe, start);
+      while (start < sp && richWidth(g, safe + start, sp - start) > avail - 4) start += stepMarked(safe, start);
+    }
+    _winStart = start;
+    _textX = x + 12;
+    g.setTextColor(t.white, t.panel);
+    g.setClipRect(x + 10, y, avail + 4, h);
+    richEmojiDrop(chatEmojiDrop(g));
+    drawRich(g, safe + start, x + 12, ty);
+    richEmojiDrop(0);
+    g.clearClipRect();
+    const int cx = x + 12 + richWidth(g, safe + start, sp - start);
+    if (_caret) g.fillRect(_cur < 0 ? cx + 1 : cx - 1, ty + 1, 2, caretH, t.green);
+    g.setFont(&fonts::Font2);
+    char cnt[12];
+    snprintf(cnt, sizeof(cnt), "%d", maxLen() - (int)_compose.length());
+    g.setTextColor((int)_compose.length() > maxLen() - 15 ? t.amber : t.dim, t.panel);
+    g.drawString(cnt, x + w - 12 - g.textWidth(cnt), smallY);
+  }
+
+  // The cursor as a byte offset in _compose (-1: at the end, where typing follows it).
+  int cursorAt() const { return _cur < 0 || _cur > (int)_compose.length() ? (int)_compose.length() : _cur; }
+  int prevChar(int at) const { int n = at - 1; while (n > 0 && ((uint8_t)_compose[n] & 0xC0) == 0x80) n--; return max(0, n); }
+  int nextChar(int at) const { int n = at + 1; while (n < (int)_compose.length() && ((uint8_t)_compose[n] & 0xC0) == 0x80) n++; return n; }
+  // How long the shown (sanitized) text of the first `bytes` of the draft is.
+  int sanitizedLen(int bytes) const {
+    char pre[200], out[200];
+    const int n = max(0, min(bytes, (int)sizeof(pre) - 1));
+    memcpy(pre, _compose.c_str(), n); pre[n] = 0;
+    sanitize(pre, out, sizeof(out));
+    return strlen(out);
+  }
+  static int stepMarked(const char* s, int at) { return (s[at] == 0x01 || s[at] == 0x02) && s[at + 1] ? 2 : 1; }
+  static int prevMarked(const char* s, int at) {
+    if (at >= 2 && (s[at - 2] == 0x01 || s[at - 2] == 0x02)) return at - 2;
+    return at - 1;
+  }
+  void caretOn() { _caret = true; _blinkAt = millis(); }
+  // A tap in the draft (T-Deck): the cursor goes to the nearest gap between characters.
+  void placeCursorAt(int px) {
+    Canvas& g = nav.canvas();
+    g.setFont(chatFont());
+    char safe[200];
+    sanitize(_compose.c_str(), safe, sizeof(safe));
+    const int len = _compose.length();
+    int best = len, bestD = 1 << 30;
+    for (int b = 0; ; b = nextChar(b)) {
+      const int sp = sanitizedLen(b);
+      if (sp >= _winStart) {
+        const int d = abs(_textX + richWidth(g, safe + _winStart, sp - _winStart) - px);
+        if (d < bestD) { bestD = d; best = b; }
+      }
+      if (b >= len) break;
+    }
+    g.setFont(&fonts::Font2);
+    _cur = best >= len ? -1 : best;
+    _spaceAt = -1; _sel = -1;
+    caretOn();
+    dirty = true;
+  }
+  int _cur = -1, _spaceAt = -1, _winStart = 0, _textX = 18;
+
+  static constexpr uint16_t MAX_IDS = 200;
+  ConvKey _key;
+  uint32_t _ids[MAX_IDS];
+  int _n = 0, _sel = -1;
+  uint32_t _gen = 0, _blinkAt = 0;
+  bool _caret = true;
+  String _compose;
+  // Where each message was drawn, for touch; and the drag not yet a whole step.
+  static constexpr uint8_t HIT_MAX = 24;
+  int16_t _hitTop[HIT_MAX], _hitBot[HIT_MAX], _hitIdx[HIT_MAX];
+  uint8_t _hitN = 0;
+  int _dragAcc = 0;
+  int _tAnchor = -1, _px = 0;             // a finger's place in the conversation (touch)
+};
+
+
+// ---- emoji picker ----------------------------------------------------------------------------
+// The keyboard has no emoji, so the wheel press in a thread opens this grid.
+// Most-used first, then every other glyph we can draw; recent picks float up.
+static const uint32_t POPULAR[] = {
+  0x1F44D, 0x2764, 0x1F602, 0x1F60A, 0x1F64F, 0x1F525, 0x1F440, 0x2705, 0x1F62D, 0x1F605,
+  0x1F389, 0x1F44B, 0x1F4AF, 0x1F923, 0x1F601, 0x1F642, 0x1F60E, 0x1F914, 0x1F622, 0x1F621,
+  0x1F44C, 0x1F64C, 0x1F4AA, 0x270C, 0x1F4CD, 0x1F697, 0x26A1, 0x1F4E1, 0x1F60D, 0x1F618,
+  0x1F643, 0x1F644, 0x1F631, 0x1F634, 0x1F92F, 0x1F44E, 0x274C, 0x2753, 0x26A0, 0x1F680,
+};
+static uint32_t s_recent[11] = {0};
+
+static void utf8Append(String& s, uint32_t cp) {
+  char b[5] = {0};
+  if (cp < 0x80) b[0] = cp;
+  else if (cp < 0x800) { b[0] = 0xC0 | (cp >> 6); b[1] = 0x80 | (cp & 0x3F); }
+  else if (cp < 0x10000) { b[0] = 0xE0 | (cp >> 12); b[1] = 0x80 | ((cp >> 6) & 0x3F); b[2] = 0x80 | (cp & 0x3F); }
+  else { b[0] = 0xF0 | (cp >> 18); b[1] = 0x80 | ((cp >> 12) & 0x3F); b[2] = 0x80 | ((cp >> 6) & 0x3F); b[3] = 0x80 | (cp & 0x3F); }
+  s += b;
+}
+
+class EmojiPickerView : public View {
+public:
+  EmojiPickerView(ThreadView* tv) : _tv(tv) {
+    auto add = [&](uint32_t cp) {
+      const int i = emojiFind(cp);
+      if (i < 0) return;
+      for (int k : _order) if (k == i) return;
+      _order.push_back(i);
+    };
+    for (uint32_t cp : s_recent) if (cp) add(cp);
+    for (uint32_t cp : POPULAR) add(cp);
+    for (uint16_t i = 0; i < emojiCount(); i++) add(emojiCodepoint(i));
+  }
+  bool wantsAllKeys() override { return true; }
+  void rotate(int d) override { const int n = _order.size(); _f = ((_f + d) % n + n) % n; dirty = true; }
+  // The ball: sideways along a row, up and down by a row.
+  bool roll(int dx, int dy) override {
+    const int n = _order.size();
+    if (!n) return true;
+    int f = _f + dy * COLS;
+    if (f < 0 || f >= n) f = _f;
+    _f = constrain(f + dx, 0, n - 1);
+    dirty = true;
+    return true;
+  }
+  void key(char c) override {
+    if (c == '\n') { press(); return; }
+    if (c == 'q') { nav.pop(); openQuickReplies(_tv); return; }
+    // w/s jump a row, a/d a column: faster than spinning through 272
+    const int n = _order.size();
+    if (c == 'w') _f = max(0, _f - COLS);
+    else if (c == 's') _f = min(n - 1, _f + COLS);
+    else if (c == 'a') _f = max(0, _f - 1);
+    else if (c == 'd') _f = min(n - 1, _f + 1);
+    dirty = true;
+  }
+  void press() override {
+    const uint32_t cp = emojiCodepoint(_order[_f]);
+    // Remember it: recent picks lead the grid next time.
+    int at = 10;
+    for (int i = 0; i < 11; i++) if (s_recent[i] == cp) { at = i; break; }
+    for (int i = at; i > 0; i--) s_recent[i] = s_recent[i - 1];
+    s_recent[0] = cp;
+    String c;
+    utf8Append(c, cp);
+    ThreadView* tv = _tv;
+    nav.pop();
+    tv->insertAtCursor(c);
+  }
+  // Touch: tap an emoji to insert it, drag to scroll, tap the header's right side
+  // for quick replies.
+  bool touch(const TouchEvent& e) override {
+    const int n = _order.size();
+    const int rows = (n + COLS - 1) / COLS;
+    if (e.type == TouchEvent::Down) { _dragAcc = 0; return false; }
+    if (e.type == TouchEvent::Drag) {
+      _dragAcc += e.dy;
+      while (_dragAcc <= -CELL && _top < max(0, rows - ROWS)) { _top++; _dragAcc += CELL; }
+      while (_dragAcc >= CELL && _top > 0) { _top--; _dragAcc -= CELL; }
+      _f = constrain(_f, _top * COLS, min(n - 1, (_top + ROWS) * COLS - 1));   // keep the focus on screen, or draw() scrolls back to it
+      return true;
+    }
+    if (e.type != TouchEvent::Tap) return false;
+    if (e.y < L::BODY_Y) {
+      if (e.x > L::W / 2) { nav.pop(); openQuickReplies(_tv); return true; }
+      return false;
+    }
+    const int x0 = (L::W - COLS * CELL) / 2;
+    const int c = (e.x - x0) / CELL, r = _top + (e.y - L::BODY_Y - 4) / CELL;
+    if (e.x < x0 || c >= COLS || r < 0) return false;
+    const int i = r * COLS + c;
+    if (i >= n) return false;
+    _f = i;
+    press();
+    return true;
+  }
+  void draw(Canvas& g) override;
+private:
+  static constexpr int CELL = 42, ROWS = 4;
+  static constexpr int COLS = (L::W - 8) / CELL;   // 11 on the pager's 480, 7 on a 320-wide screen
+  ThreadView* _tv;
+  std::vector<int> _order;
+  int _f = 0, _top = 0, _dragAcc = 0;
+};
+
+static void openQuickReplies(ThreadView* tv) {
+  auto* m = new MenuView("Quick reply");
+  for (uint8_t i = 0; i < UiSettings::QUICK_MAX; i++) {
+    if (!ui_settings.quick[i][0]) continue;
+    String q = ui_settings.quick[i];
+    m->action(q, [tv, q] { nav.pop(); tv->setCompose(q); tv->send(); });
+  }
+  m->action("share my position", [tv] {
+    double la, lo;
+    if (!app::myPosition(la, lo)) { nav.toast("no position yet"); return; }
+    char b[48];
+    snprintf(b, sizeof(b), "I'm at %.5f,%.5f", la, lo);
+    nav.pop(); tv->setCompose(b); tv->send();
+  });
+  nav.push(m);
+}
+
+// A repeater in a path, from its path hash: the first sz bytes of its key, as many
+// as the mesh uses. Only repeaters and rooms are looked at (nothing else repeats).
+// Two bytes pick out one repeater; one byte can fit several in a big contact list,
+// so say so rather than guess.
+static String repeaterName(const uint8_t* h, uint8_t sz) {
+  char hex[8] = "", b[56];
+  for (uint8_t i = 0; i < sz && i < 3; i++) snprintf(hex + i * 2, 3, "%02x", h[i]);
+  if (!g_node) return String(hex);
+  char first[32] = "";
+  int n = 0;
+  ContactsIterator it = g_node->startContactsIterator();
+  ContactInfo c;
+  while (it.hasNext(g_node, c)) {
+    if ((c.type != ADV_TYPE_REPEATER && c.type != ADV_TYPE_ROOM) || memcmp(c.id.pub_key, h, sz)) continue;
+    if (!n++) strlcpy(first, c.name, sizeof(first));
+  }
+  if (!n) snprintf(b, sizeof(b), "%s  (unknown)", hex);
+  else if (n == 1) snprintf(b, sizeof(b), "%s  %s", hex, first);
+  else snprintf(b, sizeof(b), "%s  %s or %d others", hex, first, n - 1);
+  return String(b);
+}
+
+static void openMessageActions(ThreadView* tv, uint32_t id) {
+  HistMsg* msg = history.find(id);
+  if (!msg) return;
+  const bool out = msg->flags & HF_OUT;
+  const String sender = msg->sender;
+  auto* m = new MenuView("Message");
+  if (!out && sender.length()) {
+    m->action("reply with @mention", [tv, sender] {
+      nav.pop();
+      tv->setCompose("@[" + sender + "] " + tv->compose());
+    });
+    if (tv->key().type == CONV_CHANNEL && g_node) {
+      m->action("message " + sender + " privately", [sender] {
+        // Find the sender among contacts by name.
+        ContactsIterator it = g_node->startContactsIterator();
+        ContactInfo c;
+        while (it.hasNext(g_node, c)) {
+          if (c.type && !strcmp(c.name, sender.c_str())) { nav.pop(); app::openThreadForContact(c.id.pub_key); return; }
+        }
+        nav.toast("not in your contacts yet");
+      });
+    }
+  }
+  const String text = msg->text;
+  m->action("quote into reply", [tv, text] { nav.pop(); tv->setCompose("\"" + text.substring(0, 60) + "\" "); });
+  if (out && (msg->status == ST_FAILED || tv->key().type == CONV_CHANNEL))
+    m->action("send again", [tv, id] { nav.pop(); tv->resend(id); });
+  const ConvKey ck = tv->key();
+  m->value("notifications for this chat", [ck]() -> String { return notifyModeName(notifyMode(ck)); },
+           [ck] { setNotifyMode(ck, (notifyMode(ck) + 1) % NM_COUNT); });
+  // Messages that have left this device's history but were kept on the SD card (issue #7).
+  if (archive::has(ck))
+    m->action("older messages on the sd card", [ck] {
+      nav.push(new TextPageView("Older messages", [ck](std::vector<String>& out) {
+        archive::read(ck, out, 300, (L::W - 24) / 7);
+      }, 3600000UL));                              // read once: the card is not re-read every pass
+    });
+  // The app's Set Region Scope, from the channel's chat as there.
+  ChannelDetails chd;
+  const int chIdx = ck.type == CONV_CHANNEL && g_node ? g_node->findChannelBySecret(ck.id) : -1;
+  if (chIdx >= 0 && g_node->getChannel(chIdx, chd)) {
+    uint8_t secret[16];
+    memcpy(secret, chd.channel.secret, 16);
+    m->value("region scope", [secret]() -> String {
+      const char* own = regions::forChannel(secret);
+      if (*own) return String(own);
+      return *regions::defaultName() ? String("default ") + regions::defaultName() : String("none");
+    }, [secret] { openChannelRegionScope(secret); });
+  }
+  m->header("details");
+  m->info("time", [id]() -> String { HistMsg* x = history.find(id); return String(x && x->ts ? clockText(x->ts, true) : "unknown"); });
+  if (!out) {
+    m->info("route", [id]() -> String { HistMsg* x = history.find(id); if (!x) return String("");
+      return x->hops == 0xFF || !x->hops ? String("direct") : String(x->hops) + (x->hops == 1 ? " hop" : " hops"); });
+    // One row per repeater that carried it, named from contacts where we know them:
+    // by full hash where it was kept, else by the one byte older messages have.
+    const Route* rt = history.route(id);
+    HistMsg* msg2 = history.find(id);
+    const uint8_t hops = rt ? rt->n : msg2 ? msg2->path_len : 0;
+    for (uint8_t h = 0; h < hops; h++) {
+      char label[12];
+      snprintf(label, sizeof(label), "  hop %u", (unsigned)(h + 1));
+      const String name = rt ? repeaterName(rt->h + h * rt->sz, rt->sz) : repeaterName(msg2->path + h, 1);
+      m->info(label, [name]() -> String { return name; });
+    }
+    // The region it came in on, not this channel's own sending scope (issue #6).
+    if (*history.region(id))
+      m->info("came in on", [id]() -> String {
+        const char* g = history.region(id);
+        if (!strcmp(g, History::REGION_PLAIN)) return String("no region (plain flood)");
+        if (!strcmp(g, History::REGION_UNKNOWN)) return String("a region not on this device");
+        return String("region ") + g;
+      });
+    m->info("signal", [id]() -> String { HistMsg* x = history.find(id); return String(x ? x->snr4 / 4.0 : 0, 1) + " dB SNR"; });
+  } else {
+    m->info("status", [id]() -> String { HistMsg* x = history.find(id); if (!x) return String("");
+      static const char* S[] = {"received", "sending", "sent", "delivered", "failed"};
+      return String(S[x->status % 5]); });
+    m->info("repeats heard", [id]() -> String { HistMsg* x = history.find(id); return String(x ? x->repeats : 0); });
+    // Every repeater seen carrying it, in the copies that came back.
+    if (const Route* rt = history.route(id))
+      for (uint8_t h = 0; h < rt->n; h++) {
+        const String name = repeaterName(rt->h + h * rt->sz, rt->sz);
+        m->info(h ? "" : "  repeated by", [name]() -> String { return name; });
+      }
+    m->info("attempts", [id]() -> String { HistMsg* x = history.find(id); return String(x ? max<int>(1, x->attempts) : 0); });
+    m->info("round trip", [id]() -> String { HistMsg* x = history.find(id);
+      return x && x->rtt10 ? String(x->rtt10 * 10) + " ms" : String("-"); });
+  }
+  nav.push(m);
+}
+
+static void openEmojiPicker(ThreadView* t) { nav.push(new EmojiPickerView(t)); }
+
+void EmojiPickerView::draw(Canvas& g) {
+  const Theme& t = nav.theme();
+  drawHeader(g, "Emoji", BOARD_HAS_TOUCH ? "tap to insert   quick replies >" : "press insert  q quick replies  wasd move");
+  const int row = _f / COLS;
+  if (row < _top) _top = row;
+  if (row >= _top + ROWS) _top = row - ROWS + 1;
+  const int x0 = (L::W - COLS * CELL) / 2;
+  for (int r = _top; r < _top + ROWS; r++) {
+    for (int c = 0; c < COLS; c++) {
+      const int i = r * COLS + c;
+      if (i >= (int)_order.size()) break;
+      const int x = x0 + c * CELL, y = L::BODY_Y + 4 + (r - _top) * CELL;
+      if (i == _f) { g.fillRoundRect(x + 1, y + 1, CELL - 2, CELL - 2, 6, t.focus); g.drawRoundRect(x + 1, y + 1, CELL - 2, CELL - 2, 6, t.green); }
+      drawEmojiGlyph(g, _order[i], x + 5, y + 5, 2);
+    }
+  }
+  drawScrollbar(g, ((int)_order.size() + COLS - 1) / COLS, _top, ROWS, L::BODY_Y, L::H - L::BODY_Y);
+}
+
+// ---- chat list ----------------------------------------------------------------------------------
+// One row of the Messages list (ChatEntry is in chats.h, shared with home screens).
+static void fillEntry(ChatEntry& e, const ConvKey& k, int chanIdx, const char* name, uint8_t kind) {
+  e.key = k;
+  strlcpy(e.name, name, sizeof(e.name));
+  e.kind = kind;
+  HistMsg* m = history.last(k);
+  e.lastTs = m ? m->ts : 0;
+  e.lastId = m ? m->id : 0;
+  e.unread = history.unread(k);
+  e.mention = history.hasMention(k);
+  if (m) {
+    const bool out = m->flags & HF_OUT;
+    if (out) snprintf(e.preview, sizeof(e.preview), "you: %s", m->text);
+    else if (k.type == CONV_CHANNEL || (m->flags & HF_ROOM)) snprintf(e.preview, sizeof(e.preview), "%s: %s", m->sender, m->text);
+    else strlcpy(e.preview, m->text, sizeof(e.preview));
+  } else {
+    strlcpy(e.preview, chanIdx >= 0 ? "no messages yet" : "", sizeof(e.preview));
+  }
+}
+
+class ChatListView : public View {
+public:
+  ChatListView() { rebuild(); }
+  bool wantsAllKeys() override { return true; }
+  void resume() override { rebuild(); dirty = true; }
+  void tick() override {
+    if (history.gen != _hgen || (g_node && g_node->contactsGen() != _cgen && millis() - _built > 3000)) {
+      rebuild(); dirty = true;
+    }
+  }
+  void rotate(int d) override {
+    const int n = _count + 1;
+    _focus = ((_focus + d) % n + n) % n;
+    dirty = true;
+  }
+  void key(char c) override {
+    if (c == '\n') { press(); return; }
+    if ((uint8_t)c < 0x20 || _filter.length() >= 16) return;
+    _filter += c; _focus = 0; rebuild(); dirty = true;
+  }
+  bool backspace() override {
+    if (!_filter.length()) return false;
+    _filter.remove(_filter.length() - 1); _focus = 0; rebuild(); dirty = true;
+    return true;
+  }
+  // Touch: tap a conversation to open it, drag to scroll.
+  bool touch(const TouchEvent& e) override {
+    const int rowH = 44, visible = 4, n = _count + 1;
+    switch (e.type) {
+      case TouchEvent::Down: return false;
+      case TouchEvent::Drag: {
+        // By the pixel: _dragAcc is how far the list sits off a whole row.
+        const int was = _scroll, wasAcc = _dragAcc, wasFocus = _focus;
+        const int maxScroll = max(0, n - visible);
+        _dragAcc += e.dy;
+        while (_dragAcc <= -rowH && _scroll < maxScroll) { _scroll++; _dragAcc += rowH; }
+        while (_dragAcc >= rowH && _scroll > 0) { _scroll--; _dragAcc -= rowH; }
+        if (_scroll >= maxScroll && _dragAcc < 0) _dragAcc = 0;
+        if (_scroll <= 0 && _dragAcc > 0) _dragAcc = 0;
+        _focus = constrain(_focus, _scroll, _scroll + visible - 1);   // or draw() scrolls back to it
+        return _scroll != was || _dragAcc != wasAcc || _focus != wasFocus;
+      }
+      case TouchEvent::Tap: {
+        if (e.y < L::BODY_Y) return false;
+        const int rel = e.y - L::BODY_Y - _dragAcc;
+        const int i = _scroll + (rel >= 0 ? rel / rowH : -1);
+        if (i < 0 || i >= n) return false;
+        _focus = i;
+        press();
+        return true;
+      }
+      default: return false;
+    }
+  }
+  void press() override {
+    if (_focus == _count) { newChatMenu(); return; }
+    if (_focus < _count) {
+      const ChatEntry& e = _e[_focus];
+      nav.push(new ThreadView(e.key));
+    }
+  }
+
+  void draw(Canvas& g) override {
+    const Theme& t = nav.theme();
+    char right[32];
+    if (_filter.length()) snprintf(right, sizeof(right), "/%s", _filter.c_str());
+    else snprintf(right, sizeof(right), "%d chats", _count);
+    drawHeader(g, "Messages", right);
+    const int rowH = 44, visible = 4;
+    const int n = _count + 1;
+    if (_focus < _scroll) { _scroll = _focus; _dragAcc = 0; }
+    if (_focus >= _scroll + visible) { _scroll = _focus - visible + 1; _dragAcc = 0; }
+    if (_scroll <= 0 && _dragAcc > 0) _dragAcc = 0;
+    const int off = _dragAcc;
+    g.setClipRect(0, L::BODY_Y, L::W, L::H - L::BODY_Y);
+    for (int i = max(0, _scroll - (off > 0 ? 1 : 0)); i < n && i <= _scroll + visible; i++) {
+      const int y = L::BODY_Y + (i - _scroll) * rowH + off;
+      const bool on = i == _focus;
+      const uint16_t bg = on ? t.focus : t.bg;
+      if (on) { g.fillRect(0, y, L::W, rowH, bg); g.fillRect(0, y, 3, rowH, t.green); }
+      if (i == _count) {
+        g.setTextColor(on ? t.green : t.dim, bg);
+        g.drawString("+  new message / join channel", 16, y + 13);
+        continue;
+      }
+      const ChatEntry& e = _e[i];
+      drawAvatar(g, 26, y + rowH / 2, 16, e.name, e.kind);
+      char nm[44];
+      sanitize(e.name, nm, sizeof(nm) - 4);
+      richFit(g, nm, L::W - 130);
+      g.setTextColor(e.unread ? t.green : t.white, bg);
+      drawRich(g, nm, 52, y + 4);
+      if (e.lastTs && app::timeValid()) {
+        const char* tt = timeAgo(e.lastTs);
+        g.setTextColor(e.unread ? t.green : t.dim, bg);
+        g.drawString(tt, L::W - 12 - g.textWidth(tt), y + 4);
+      }
+      char pv[100];
+      sanitize(e.preview, pv, sizeof(pv) - 4);
+      richFit(g, pv, L::W - 110);
+      g.setTextColor(t.dim, bg);
+      drawRich(g, pv, 52, y + 23);
+      const uint8_t nm_ = notifyMode(e.key);
+      if (e.unread) {
+        char b[8];
+        snprintf(b, sizeof(b), "%u", min<uint16_t>(e.unread, 99));
+        const int bw = max(20, (int)g.textWidth(b) + 10);
+        // Muted chats still count unread, but quietly.
+        drawPill(g, L::W - 12 - bw, y + 23, bw, 17, nm_ == NM_MUTED ? t.line : e.mention ? t.amber : t.green,
+                 nm_ == NM_MUTED ? t.dim : t.bg, b);
+      } else if (nm_ == NM_MUTED || nm_ == NM_SILENT) {
+        g.setTextColor(t.dim, bg);
+        g.drawString(nm_ == NM_MUTED ? "muted" : "silent", L::W - 12 - g.textWidth(nm_ == NM_MUTED ? "muted" : "silent"), y + 23);
+      } else if (e.mention) {
+        g.setTextColor(t.amber, bg);
+        g.drawString("@", L::W - 24, y + 23);
+      }
+      g.drawFastHLine(52, y + rowH - 1, L::W - 60, t.line);
+    }
+    g.clearClipRect();
+    drawScrollbar(g, n, _scroll, visible, L::BODY_Y, L::H - L::BODY_Y);
+  }
+
+private:
+  void add(const ConvKey& k, int chanIdx, const char* name, uint8_t kind) {
+    if (_count >= MAX) return;
+    if (_filter.length() && !strcasestr(name, _filter.c_str())) return;
+    fillEntry(_e[_count++], k, chanIdx, name, kind);
+  }
+
+  void rebuild() {
+    _count = 0;
+    _hgen = history.gen;
+    _cgen = g_node ? g_node->contactsGen() : 0;
+    _built = millis();
+    if (!g_node) return;
+    // Every channel is a chat, whether or not it has traffic yet.
+    for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+      ChannelDetails ch;
+      if (!g_node->getChannel(i, ch) || !ch.name[0]) continue;
+      add(ConvKey::channel(ch.channel.secret), i, ch.name, 10);
+    }
+    ConvKey keys[64];
+    const uint16_t n = history.conversations(keys, 64);
+    for (uint16_t i = 0; i < n; i++) {
+      if (keys[i].type != CONV_CONTACT) continue;
+      char nm[32]; uint8_t kind;
+      convName(keys[i], nm, sizeof(nm), &kind);
+      add(keys[i], -1, nm, kind);
+    }
+    // Most recent activity first; channels with no traffic keep their slot order.
+    for (int i = 1; i < _count; i++) {
+      ChatEntry tmp = _e[i];
+      int j = i - 1;
+      while (j >= 0 && _e[j].lastId < tmp.lastId) { _e[j + 1] = _e[j]; j--; }
+      _e[j + 1] = tmp;
+    }
+    if (_focus > _count) _focus = _count;
+  }
+
+  void newChatMenu();
+
+  static constexpr int MAX = 104;
+  ChatEntry _e[MAX];
+  int _count = 0, _focus = 0, _scroll = 0, _dragAcc = 0;
+  uint32_t _hgen = 0, _cgen = 0, _built = 0;
+  String _filter;
+};
+
+// Hashtag channels derive their key from the name, exactly as the MeshCore app
+// does: the first 16 bytes of SHA-256("#name").
+static void hashtagSecret(const char* name, uint8_t* out16) {
+  uint8_t h[32];
+  mesh::Utils::sha256(h, 32, (const uint8_t*)name, strlen(name));
+  memcpy(out16, h, 16);
+}
+
+// Standard base64 (the MeshCore app shows channel keys this way).
+static int b64decode(const char* in, uint8_t* out, int cap) {
+  auto v = [](char c) -> int {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+' || c == '-') return 62;
+    if (c == '/' || c == '_') return 63;
+    return -1;
+  };
+  uint32_t acc = 0; int bits = 0, n = 0;
+  for (; *in && *in != '='; in++) {
+    const int x = v(*in);
+    if (x < 0) return 0;
+    acc = (acc << 6) | x; bits += 6;
+    if (bits >= 8) { bits -= 8; if (n < cap) out[n++] = (acc >> bits) & 0xFF; }
+  }
+  return n;
+}
+
+void joinChannelFlow();
+void ChatListView::newChatMenu() {
+  auto* m = new MenuView("New");
+  m->action("message a contact", [] { nav.pop(); app::openContacts(); });
+  m->action("join a #hashtag channel", [] { nav.pop(); joinChannelFlow(); });
+  m->action("add private channel (key)", [] {
+    nav.pop();
+    prompt("Private channel", "channel name", "", 30, [](const String& name) {
+      if (!name.length()) return;
+      prompt("Channel key", "32 hex chars, or base64 from the app", "", 44, [name](const String& key) {
+        uint8_t s[32] = {0};
+        bool ok = false;
+        if (key.length() == 32) ok = mesh::Utils::fromHex(s, 16, key.c_str());
+        else if (key.length() == 24 || key.length() == 44) {
+          ok = b64decode(key.c_str(), s, sizeof(s)) >= 16;
+        }
+        if (!ok) { nav.toast("that key is not valid"); return; }
+        nav.toast(g_node && g_node->addChannelNamed(name.c_str(), s) ? "channel added" : "no free channel slot");
+      });
+    });
+  });
+  nav.push(m);
+}
+
+void joinChannelFlow() {
+  prompt("Join channel", "hashtag channel name, e.g. inw or #geg-bot", "#", 30, [](const String& in) {
+    String name = in;
+    name.trim();
+    if (name.length() < 2) return;
+    if (name[0] != '#') name = "#" + name;
+    name.toLowerCase();
+    uint8_t s[16];
+    hashtagSecret(name.c_str(), s);
+    if (!g_node) return;
+    if (g_node->addChannelNamed(name.c_str(), s)) {
+      nav.toast("joined");
+      app::openThreadForChannel(g_node->findChannelBySecret(s));
+    } else if (g_node->findChannelBySecret(s) >= 0) {
+      app::openThreadForChannel(g_node->findChannelBySecret(s));
+    } else nav.toast("no free channel slot (40)");
+  });
+}
+
+void app::openChats() { nav.push(new ChatListView()); }
+
+void openThread(const ConvKey& k) { nav.push(new ThreadView(k)); }
+
+uint8_t recentChats(ChatEntry* out, uint8_t max) {
+  if (!g_node || !max) return 0;
+  uint8_t n = 0;
+  auto consider = [&](const ConvKey& k, int chanIdx, const char* name, uint8_t kind) {
+    HistMsg* m = history.last(k);
+    if (!m) return;                         // only conversations with something in them
+    ChatEntry e;
+    fillEntry(e, k, chanIdx, name, kind);
+    // insertion into the newest-first list, keeping at most `max`
+    int j;
+    if (n < max) j = n++;
+    else { if (out[max - 1].lastId >= e.lastId) return; j = max - 1; }
+    while (j > 0 && out[j - 1].lastId < e.lastId) { out[j] = out[j - 1]; j--; }
+    out[j] = e;
+  };
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (g_node->getChannel(i, ch) && ch.name[0]) consider(ConvKey::channel(ch.channel.secret), i, ch.name, 10);
+  }
+  ConvKey keys[64];
+  const uint16_t k = history.conversations(keys, 64);
+  for (uint16_t i = 0; i < k; i++) {
+    if (keys[i].type != CONV_CONTACT) continue;
+    char nm[32]; uint8_t kind;
+    convName(keys[i], nm, sizeof(nm), &kind);
+    consider(keys[i], -1, nm, kind);
+  }
+  return n;
+}
+
+void app::openThreadForContact(const uint8_t* pub) {
+  nav.push(new ThreadView(ConvKey::contact(pub)));
+}
+
+void app::openThreadForChannel(int idx) {
+  if (!g_node || idx < 0) return;
+  ChannelDetails ch;
+  if (!g_node->getChannel(idx, ch) || !ch.name[0]) return;
+  nav.push(new ThreadView(ConvKey::channel(ch.channel.secret)));
+}

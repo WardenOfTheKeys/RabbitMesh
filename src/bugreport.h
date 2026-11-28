@@ -1,0 +1,30 @@
+// Problem reports: when it crashes (or hits a real error), what happened goes back
+// to the developer by itself, over Wi-Fi. Also a once-a-day check-in (board,
+// version and a random id, nothing else) so we know how many are in use.
+//
+// What a report holds: the device's name on the mesh (so the developer knows whose
+// it is), the firmware version, why it restarted, where it crashed
+// (the task, the program counter and backtrace from ESP-IDF's core dump, which the
+// release's firmware.elf turns into file and line), memory, uptime, battery, and
+// the last log lines before it happened. What it never holds: messages, contact
+// or channel names, keys, positions, Wi-Fi names or addresses - log lines that
+// could carry one are cut down before they're kept. The check-in has no name.
+//
+// Reports wait in the flash store (/rpt, at most 4) until Wi-Fi is up and the
+// screen has been left alone a few seconds, then go to squatchmesh.com. On by
+// default; Settings > System turns it off (the check-in too), and Tools can send
+// the log on purpose ("send log to the developer").
+#pragma once
+#include <Arduino.h>
+
+namespace report {
+  void capture();              // setup(), BEFORE the first log line: keep the last run's log
+  void begin();                // setup(), once the flash store is mounted: file a crash report
+  void tick();                 // loop(): sends what's waiting
+  bool posting();              // a report is out on the network right now (it runs in a task)
+  bool enabled();
+  void setEnabled(bool on);
+  bool sendLog(const char* why, const String& note = String());  // queue the log now (Tools), with what the
+                                                                  // owner typed; false if the store is full
+  uint8_t waiting();
+}

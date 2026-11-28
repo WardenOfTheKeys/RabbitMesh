@@ -1,0 +1,1433 @@
+#include "ui.h"
+#include "fx.h"
+#include "app.h"
+#include "statusbar.h"
+#include "node.h"
+#include "gps.h"
+#include "logstore.h"
+#include "netwifi.h"
+#include "power.h"
+#include "eco_power.h"
+#include <time.h>
+#include "emoji_data.h"
+#include "regional.h"
+
+Nav nav;
+static std::vector<View*> s_graveyard;   // popped views die on the next tick, never mid-call
+
+// ---- status bar ----------------------------------------------------------------
+static uint16_t mix565(uint16_t a, uint16_t b, float f) {
+  const int r = ((a >> 11) & 31) + (int)((((b >> 11) & 31) - ((a >> 11) & 31)) * f);
+  const int g = ((a >> 5) & 63) + (int)((((b >> 5) & 63) - ((a >> 5) & 63)) * f);
+  const int bl = (a & 31) + (int)(((b & 31) - (a & 31)) * f);
+  return (uint16_t)((r << 11) | (g << 5) | bl);
+}
+
+static constexpr int BATT_W = 20, BATT_H = 10, BATT_Y = 4;
+
+// The battery glyph at (x, y), 22 x 10. While plugged in it shows a charge mark
+// in the theme's own shape; while actually charging the fill breathes.
+static void drawBatteryIcon(lgfx::LovyanGFX& d, const Theme& t, int x, int y) {
+  const uint8_t pct = app::batteryPct();
+  const bool plugged = app::pluggedIn(), charging = app::charging();
+  d.fillRect(x - 1, y - 2, BATT_W + 5, BATT_H + 4, t.panel);
+  d.drawRect(x, y, BATT_W, BATT_H, t.dim);
+  d.fillRect(x + BATT_W, y + 3, 2, 4, t.dim);
+  const float breath = charging ? 0.5f + 0.5f * sinf(millis() * (2.0f * PI / 1800.0f)) : 1.0f;
+  uint16_t bc = power::saver() ? t.amber : pct <= 15 ? t.red : pct <= 30 ? t.amber : t.txt;
+  if (plugged) {
+    switch (t.style) {
+      case STYLE_AURORA: {             // drift through the sky's colours
+        const float h = fmodf(millis() / 4000.0f, 1.0f);
+        const uint16_t a = t.green, b = t.greenDim, c = t.blue;
+        bc = h < 0.33f ? mix565(a, c, h * 3) : h < 0.66f ? mix565(c, b, (h - 0.33f) * 3) : mix565(b, a, (h - 0.66f) * 3);
+        break;
+      }
+      case STYLE_HERO:   bc = t.red; break;    // hearts refill red
+      default:           bc = t.green; break;
+    }
+    bc = mix565(t.panel, bc, 0.35f + 0.65f * breath);
+  }
+  const int fw = (BATT_W - 4) * min<uint8_t>(pct, 100) / 100;
+  d.fillRect(x + 2, y + 2, max(fw, plugged ? 2 : 0), BATT_H - 4, bc);
+  if (!plugged) return;
+  const int cx = x + BATT_W / 2, cy = y + BATT_H / 2;
+  const uint16_t mark = t.white, edge = t.panel;
+  switch (t.style) {
+    case STYLE_BLOCKS:                  // a stepped pixel bolt
+      d.fillRect(cx, cy - 4, 3, 3, edge); d.fillRect(cx - 2, cy - 1, 5, 2, edge); d.fillRect(cx - 3, cy + 1, 3, 3, edge);
+      d.fillRect(cx + 1, cy - 3, 1, 2, mark); d.fillRect(cx - 1, cy - 1, 3, 1, mark); d.fillRect(cx - 2, cy + 1, 1, 2, mark);
+      break;
+    case STYLE_HERO:                    // a little heart
+      d.fillCircle(cx - 2, cy - 1, 2, edge); d.fillCircle(cx + 2, cy - 1, 2, edge); d.fillTriangle(cx - 4, cy, cx + 4, cy, cx, cy + 4, edge);
+      d.fillCircle(cx - 2, cy - 1, 1, mark); d.fillCircle(cx + 2, cy - 1, 1, mark); d.fillTriangle(cx - 3, cy, cx + 3, cy, cx, cy + 3, mark);
+      break;
+    case STYLE_AURORA:                  // a four-point star
+      d.fillTriangle(cx, cy - 5, cx - 2, cy, cx + 2, cy, edge); d.fillTriangle(cx, cy + 5, cx - 2, cy, cx + 2, cy, edge);
+      d.fillTriangle(cx - 5, cy, cx, cy - 2, cx, cy + 2, edge); d.fillTriangle(cx + 5, cy, cx, cy - 2, cx, cy + 2, edge);
+      d.fillTriangle(cx, cy - 4, cx - 1, cy, cx + 1, cy, mark); d.fillTriangle(cx, cy + 4, cx - 1, cy, cx + 1, cy, mark);
+      d.fillTriangle(cx - 4, cy, cx, cy - 1, cx, cy + 1, mark); d.fillTriangle(cx + 4, cy, cx, cy - 1, cx, cy + 1, mark);
+      break;
+    default:                            // a lightning bolt
+      d.fillTriangle(cx + 2, cy - 5, cx - 3, cy + 1, cx + 1, cy + 1, edge);
+      d.fillTriangle(cx - 2, cy + 5, cx + 3, cy - 1, cx - 1, cy - 1, edge);
+      d.fillTriangle(cx + 1, cy - 4, cx - 2, cy + 1, cx + 1, cy + 1, mark);
+      d.fillTriangle(cx - 1, cy + 4, cx + 2, cy - 1, cx - 1, cy - 1, mark);
+      break;
+  }
+}
+
+static int battX() { return L::W - 4 - BATT_W - 2; }
+
+// Animates just the battery corner, straight to the panel, while plugged in.
+// A full status-bar repaint every frame would cost a whole-screen push.
+void animateBatteryIcon(lgfx::LovyanGFX* panel, const Theme& t) {
+  static uint32_t last = 0;
+  if (!panel || !app::pluggedIn() || millis() - last < 60) return;
+  last = millis();
+  static LGFX_Sprite s;
+  if (!s.getBuffer()) { s.setColorDepth(16); if (!s.createSprite(BATT_W + 5, BATT_H + 4)) return; }
+  // The sprite's (0, 0) sits at the panel's (battX() - 1, BATT_Y - 2).
+  drawBatteryIcon(s, t, 1, 2);
+  nav.waitPresented();
+  s.pushSprite(panel, battX() - 1, BATT_Y - 2);
+}
+
+static int s_sigX = -1;                 // where the status bar last drew the small bars; -1 = it didn't
+// Four bars, short to tall, standing on y = base. Unlit ones are filled in `off`, or
+// only outlined where there is a picture behind them (the lock face).
+static void signalIcon(lgfx::LovyanGFX& d, int x, int base, int w, int gap, int h0, int step, uint16_t lit, uint16_t off, bool outline) {
+  const uint8_t m = app::signalMask();
+  for (int i = 0; i < 4; i++) {
+    const int h = h0 + i * step, bx = x + i * (w + gap);
+    if ((m >> i) & 1) d.fillRect(bx, base - h, w, h, lit);
+    else if (outline) d.drawRect(bx, base - h, w, h, off);
+    else d.fillRect(bx, base - h, w, h, off);
+  }
+}
+// The status bar's: small is 15 px wide, large 19 and the full height of the bar.
+static int smallW() { return app::signalSize() == 2 ? 19 : 15; }
+static void smallSignal(lgfx::LovyanGFX& d, const Theme& t, int x, int base) {
+  if (app::signalSize() == 2) signalIcon(d, x, base, 4, 1, 6, 3, t.green, t.line, false);
+  else                        signalIcon(d, x, base, 3, 1, 4, 3, t.green, t.line, false);
+}
+void animateSignalIcon(lgfx::LovyanGFX* panel, const Theme& t) {
+  static uint32_t last = 0;
+  static bool was = false;
+  const bool on = app::signalSize() && app::signalAnimating();
+  if (!panel || s_sigX < 0 || (!on && !was) || millis() - last < 50) return;
+  last = millis();
+  was = on;                             // one more paint after it ends: the settled level
+  static LGFX_Sprite s;
+  if (!s.getBuffer()) { s.setColorDepth(16); if (!s.createSprite(20, 15)) return; }
+  s.fillSprite(t.panel);
+  smallSignal(s, t, 0, 15);
+  nav.waitPresented();
+  s.pushSprite(panel, s_sigX, 1);
+}
+
+static int s_badgeX0 = 0, s_badgeX1 = 0;   // the "N new" badge as last drawn; both 0 = not shown
+void drawStatusBar(lgfx::LovyanGFX& d, const Theme& t, bool withClock, bool withBars) {
+  s_sigX = -1;
+  d.setFont(&fonts::Font2);
+  d.fillRect(0, 0, L::W, 17, t.panel);
+  d.drawFastHLine(0, 17, L::W, t.line);
+  d.setTextColor(t.green, t.panel);
+  // The name the owner gave this pager; "SQUATCH" until they set one (a new
+  // node is named after its key, e.g. "a1b2c3d4"). Capped so the unread badge
+  // still clears the clock.
+  int x = 6;
+  // A narrow screen (the T-Deck's 320) can't fit the name, the badge, a centred
+  // clock and the icons: the clock takes the name's place, and the name stays on
+  // the home screen's footer. Where the screen shows the time already (the lock
+  // face's big clock), the name goes back there instead: the time once.
+  constexpr bool NARROW = L::W < 400;
+  if (NARROW && withClock && app::timeValid()) {
+    d.setTextColor(t.txt, t.panel);
+    x += d.drawString(clockText(app::now()), 6, 1);
+    d.setTextColor(t.green, t.panel);
+  } else {
+    const char* name = g_node ? g_node->prefs().node_name : "";
+    char keyName[10] = "";
+    if (g_node) mesh::Utils::toHex(keyName, g_node->self_id.pub_key, 4);
+    if (name[0] && strcmp(name, keyName) && strcmp(name, "NONAME")) x = drawUtf8(d, name, 6, 1, NARROW ? 110 : 140);
+    else x += d.drawString("SQUATCH", 6, 1);
+  }
+  x += 8;
+  const uint16_t un = app::unread();
+  s_badgeX0 = s_badgeX1 = 0;
+  if (un) {
+    char b[12];
+    snprintf(b, sizeof(b), "%u new", un);
+    s_badgeX0 = x; s_badgeX1 = x + d.textWidth(b) + 8;      // where a tap on it lands (Nav::touch)
+    d.fillRoundRect(x, 2, d.textWidth(b) + 8, 13, 6, t.amber);
+    d.setTextColor(t.bg, t.amber);
+    d.drawString(b, x + 4, 1);
+    x += d.textWidth(b) + 14;
+  }
+  if (withClock && !NARROW && app::timeValid()) {
+    const char* c = clockText(app::now());
+    d.setTextColor(t.txt, t.panel);
+    d.drawString(c, (L::W - d.textWidth(c)) / 2, 1);
+  }
+  // right side, laid out right to left
+  int rx = battX();
+  drawBatteryIcon(d, t, rx, BATT_Y);
+  const char* bt = app::batteryText();
+  rx -= d.textWidth(bt) + 4;
+  d.setTextColor(t.dim, t.panel);
+  d.drawString(bt, rx, 1);
+  if (app::signalSize() && withBars) { // four bars, short to tall; lit by the last packet's SNR (the lock face draws its own)
+    rx -= smallW() + 5;
+    s_sigX = rx;
+    smallSignal(d, t, rx, 16);
+  }
+  if (power::eco()) {                    // experimental ECO mode (Settings > Battery)
+    rx -= d.textWidth("ECO") + 6;
+    d.setTextColor(t.green, t.panel);
+    d.drawString("ECO", rx, 1);
+  }
+  if (power::saver()) {
+    rx -= 44;
+    d.setTextColor(t.amber, t.panel);
+    d.drawString("SAVER", rx, 1);
+  } else if (power::holding()) {
+    rx -= 30;
+    d.setTextColor(t.green, t.panel);
+    d.drawString("80%", rx, 1);
+  }
+  if (bleEnabled()) {
+    rx -= 22;
+    d.setTextColor(bleConnected() ? t.blue : t.dim, t.panel);
+    d.drawString("BT", rx, 1);
+  }
+  if (wifi::enabled()) {
+    rx -= 34;
+    d.setTextColor(wifi::connected() ? t.green : t.dim, t.panel);
+    d.drawString("WiFi", rx, 1);
+  }
+  if (ui_settings.gpsOn && !power::saver()) {
+    rx -= 30;
+    d.setTextColor(gps.hasFix() ? t.green : t.dim, t.panel);
+    d.drawString("GPS", rx, 1);
+  }
+  if (!app::radioOk()) {
+    rx -= 50;
+    d.setTextColor(t.red, t.panel);
+    d.drawString("NO RF", rx, 1);
+  }
+}
+
+void drawLockSignal(lgfx::LovyanGFX& d, const Theme& t) {
+  const uint8_t sz = app::lockSignalSize();
+  if (!sz) return;
+  const int w = sz == 2 ? 8 : 5, gap = sz == 2 ? 3 : 2, h0 = sz == 2 ? 10 : 6, step = sz == 2 ? 8 : 5;
+  const int wide = 4 * w + 3 * gap;
+  const int x = app::lockSignalLeft() ? 8 : L::W - 8 - wide;
+  signalIcon(d, x, 24 + h0 + 3 * step, w, gap, h0, step, t.green, t.greenDim, true);
+}
+
+// ---- helpers ----------------------------------------------------------------------
+char g_screenTitle[32] = "home";   // last header drawn: names the screen in the slow log
+void drawHeader(Canvas& g, const char* title, const char* right) {
+  strlcpy(g_screenTitle, title ? title : "", sizeof(g_screenTitle));
+  const Theme& t = nav.theme();
+  g.setFont(&fonts::Font2);
+  g.setTextColor(t.green, t.bg);
+  g.drawString("<", 6, L::HEAD_Y + 4);
+  int rw = 0;
+  char r[96] = "";
+  if (right && *right) { sanitize(right, r, sizeof(r)); rw = richWidth(g, r, -1); }
+  drawUtf8(g, title, 18, L::HEAD_Y + 4, L::W - 40 - rw);
+  if (rw) {
+    g.setTextColor(t.dim, t.bg);
+    drawRich(g, r, L::W - 8 - rw, L::HEAD_Y + 4);
+  }
+  g.drawFastHLine(0, L::BODY_Y - 1, L::W, t.line);
+}
+
+void drawScrollbar(Canvas& g, int total, int first, int visible, int y0, int h) {
+  if (total <= visible || total <= 0) return;
+  const Theme& t = nav.theme();
+  const int th = max(10, h * visible / total);
+  const int ty = y0 + (h - th) * first / max(1, total - visible);
+  g.fillRect(L::W - 3, y0, 2, h, t.line);
+  g.fillRect(L::W - 3, ty, 2, th, t.greenDim);
+}
+
+void drawPill(Canvas& g, int x, int y, int w, int h, uint16_t bg, uint16_t fg, const char* text) {
+  g.fillRoundRect(x, y, w, h, h / 2, bg);
+  g.setTextColor(fg, bg);
+  const int tw = min(w - 8, widthUtf8(g, text));
+  drawUtf8(g, text, x + (w - tw) / 2, y + (h - 16) / 2 + 1, w - 8);
+}
+
+void drawToggle(Canvas& g, int x, int y, bool on) {
+  const Theme& t = nav.theme();
+  g.fillRoundRect(x, y, 30, 14, 7, on ? t.greenDim : t.line);
+  g.fillCircle(on ? x + 23 : x + 7, y + 7, 5, on ? t.green : t.dim);
+}
+
+// ---- emoji -------------------------------------------------------------------------
+// In sanitized text an emoji we have a glyph for becomes a two-byte marker:
+// 0x01 n  -> glyph n-1   (glyphs 0..253)
+// 0x02 n  -> glyph n+253 (glyphs 254..)
+// Everything that draws or measures user text goes through the rich* helpers
+// below, which treat that pair as one 16 px image.
+static int emojiIndex(uint32_t cp) {
+  int lo = 0, hi = EMOJI_COUNT - 1;
+  while (lo <= hi) {
+    const int mid = (lo + hi) >> 1;
+    if (EMOJI_CP[mid] == cp) return mid;
+    if (EMOJI_CP[mid] < cp) lo = mid + 1; else hi = mid - 1;
+  }
+  return -1;
+}
+
+static inline bool isMarker(char c) { return c == 0x01 || c == 0x02; }
+static inline int markerGlyph(const char* p) { return (uint8_t)p[0] == 0x01 ? (uint8_t)p[1] - 1 : (uint8_t)p[1] + 253; }
+constexpr int EMOJI_W = 17;   // 16 px glyph + 1 px gap
+
+void sanitize(const char* in, char* out, size_t cap) {
+  size_t w = 0;
+  const uint8_t* s = (const uint8_t*)in;
+  auto put = [&](const char* r) { while (*r && w + 1 < cap) out[w++] = *r++; };
+  auto putEmoji = [&](int idx) {
+    if (w + 2 >= cap) return;
+    if (idx < 254) { out[w++] = 0x01; out[w++] = (char)(idx + 1); }
+    else { out[w++] = 0x02; out[w++] = (char)(idx - 253); }
+  };
+  while (*s && w + 1 < cap) {
+    const uint8_t c = *s;
+    uint32_t cp;
+    int len;
+    if (c < 0x80) { cp = c; len = 1; }
+    else if ((c & 0xE0) == 0xC0 && s[1]) { cp = ((c & 0x1F) << 6) | (s[1] & 0x3F); len = 2; }
+    else if ((c & 0xF0) == 0xE0 && s[1] && s[2]) { cp = ((c & 0x0F) << 12) | ((s[1] & 0x3F) << 6) | (s[2] & 0x3F); len = 3; }
+    else if ((c & 0xF8) == 0xF0 && s[1] && s[2] && s[3]) {
+      cp = ((uint32_t)(c & 0x07) << 18) | ((s[1] & 0x3F) << 12) | ((s[2] & 0x3F) << 6) | (s[3] & 0x3F); len = 4;
+    } else { s++; continue; }
+    s += len;
+    if (cp < 0x80) {
+      if (cp == '\n' || (cp >= 0x20 && cp < 0x7F)) out[w++] = (char)cp;
+      else if (cp == '\t') out[w++] = ' ';
+      continue;
+    }
+    // Invisible joiners and modifiers: a ZWJ sequence draws as its parts.
+    if (cp == 0x200D || (cp >= 0xFE00 && cp <= 0xFE0F) || (cp >= 0x1F3FB && cp <= 0x1F3FF) || cp == 0x20E3) continue;
+    const int ei = emojiIndex(cp);
+    if (ei >= 0) { putEmoji(ei); continue; }
+    if (cp >= 0xC0 && cp <= 0xFF) {
+      static const char* LAT = "AAAAAAACEEEEIIIIDNOOOOOxOUUUUYPsaaaaaaaceeeeiiiionooooo/ouuuuypy";
+      char r[2] = { LAT[cp - 0xC0], 0 }; put(r);
+    }
+    else if (cp == 0xB0) put("o");
+    else if (cp == 0xA0) put(" ");
+    else if (cp == 0x2018 || cp == 0x2019) put("'");
+    else if (cp == 0x201C || cp == 0x201D) put("\"");
+    else if (cp == 0x2013 || cp == 0x2014) put("-");
+    else if (cp == 0x2026) put("...");
+    else if (cp == 0x2022) put("*");
+    else if (cp >= 0x1F1E6 && cp <= 0x1F1FF) { char r[2] = { (char)('A' + (cp - 0x1F1E6)), 0 }; put(r); }
+    else put(cp >= 0x2000 ? "*" : "?");
+  }
+  out[w] = 0;
+}
+
+static void blitEmoji(lgfx::LovyanGFX& g, int idx, int x, int y) {
+  if (idx < 0 || idx >= EMOJI_COUNT) return;
+  const uint8_t* px = EMOJI_PIX[idx];
+  for (int j = 0; j < 16; j++) {
+    for (int i = 0; i < 16; i++, px += 3) {
+      const uint8_t a = px[2];
+      if (a < 8) continue;
+      const uint16_t fg = px[0] | (px[1] << 8);
+      if (a > 247) { g.drawPixel(x + i, y + j, fg); continue; }
+      const uint16_t bg = g.readPixel(x + i, y + j);
+      const uint32_t r = (((fg >> 11) & 31) * a + ((bg >> 11) & 31) * (255 - a)) / 255;
+      const uint32_t gg = (((fg >> 5) & 63) * a + ((bg >> 5) & 63) * (255 - a)) / 255;
+      const uint32_t b = ((fg & 31) * a + (bg & 31) * (255 - a)) / 255;
+      g.drawPixel(x + i, y + j, (uint16_t)((r << 11) | (gg << 5) | b));
+    }
+  }
+}
+
+void drawEmojiGlyph(lgfx::LovyanGFX& g, int idx, int x, int y, int scale) {
+  if (scale <= 1) { blitEmoji(g, idx, x, y); return; }
+  if (idx < 0 || idx >= EMOJI_COUNT) return;
+  const uint8_t* px = EMOJI_PIX[idx];
+  for (int j = 0; j < 16; j++)
+    for (int i = 0; i < 16; i++, px += 3)
+      if (px[2] >= 96) g.fillRect(x + i * scale, y + j * scale, scale, scale, (uint16_t)(px[0] | (px[1] << 8)));
+}
+
+uint16_t emojiCount() { return EMOJI_COUNT; }
+uint32_t emojiCodepoint(uint16_t i) { return i < EMOJI_COUNT ? EMOJI_CP[i] : 0; }
+int emojiFind(uint32_t cp) { return emojiIndex(cp); }
+
+// Width of the first n bytes (n < 0: the whole string) of sanitized text.
+int richWidth(lgfx::LovyanGFX& g, const char* s, int n) {
+  if (n < 0) n = strlen(s);
+  int w = 0, i = 0;
+  char run[200];
+  int rl = 0;
+  auto flush = [&]() { if (rl) { run[rl] = 0; w += g.textWidth(run); rl = 0; } };
+  while (i < n) {
+    if (isMarker(s[i]) && i + 1 < n) { flush(); w += EMOJI_W; i += 2; continue; }
+    if (rl < (int)sizeof(run) - 1) run[rl++] = s[i];
+    i++;
+  }
+  flush();
+  return w;
+}
+
+// Draw sanitized text; returns the x after the last glyph.
+static int s_emojiDrop = 0;
+void richEmojiDrop(int px) { s_emojiDrop = px; }
+
+int drawRich(lgfx::LovyanGFX& g, const char* s, int x, int y, int n) {
+  if (n < 0) n = strlen(s);
+  int i = 0;
+  char run[200];
+  int rl = 0;
+  auto flush = [&]() { if (rl) { run[rl] = 0; x += g.drawString(run, x, y); rl = 0; } };
+  while (i < n) {
+    if (isMarker(s[i]) && i + 1 < n) { flush(); blitEmoji(g, markerGlyph(s + i), x, y + s_emojiDrop); x += EMOJI_W; i += 2; continue; }
+    if (rl < (int)sizeof(run) - 1) run[rl++] = s[i];
+    i++;
+  }
+  flush();
+  return x;
+}
+
+// Truncate sanitized text in place to fit maxW, ending in "..." when cut.
+void richFit(lgfx::LovyanGFX& g, char* s, int maxW) {
+  if (richWidth(g, s, -1) <= maxW) return;
+  const int dots = g.textWidth("...");
+  int n = strlen(s);
+  while (n > 0 && richWidth(g, s, n) + dots > maxW) {
+    n--;
+    if (n > 0 && isMarker(s[n - 1])) n--;          // never split a marker pair
+  }
+  s[n] = 0;
+  strcat(s, "...");
+}
+
+int drawUtf8(lgfx::LovyanGFX& g, const char* utf8, int x, int y, int maxW) {
+  char buf[260];
+  sanitize(utf8, buf, sizeof(buf) - 4);
+  if (maxW > 0) richFit(g, buf, maxW);
+  return drawRich(g, buf, x, y);
+}
+
+int widthUtf8(lgfx::LovyanGFX& g, const char* utf8) {
+  char buf[256];
+  sanitize(utf8, buf, sizeof(buf));
+  return richWidth(g, buf, -1);
+}
+
+int wrapText(Canvas& g, const char* text, int w, uint16_t* starts, uint8_t* lens, int maxLines) {
+  int n = 0;
+  const int len = strlen(text);
+  int i = 0;
+  char one[2] = {0, 0};
+  while (i < len && n < maxLines) {
+    int lineW = 0, lastSpace = -1, j = i;
+    while (j < len && text[j] != '\n') {
+      const bool emo = isMarker(text[j]) && j + 1 < len;
+      int cw;
+      if (emo) cw = EMOJI_W;
+      else { one[0] = text[j]; cw = g.textWidth(one); }
+      if (lineW + cw > w) break;
+      lineW += cw;
+      if (text[j] == ' ') lastSpace = j;
+      j += emo ? 2 : 1;
+    }
+    int end = j;
+    if (j < len && text[j] != '\n' && lastSpace > i) end = lastSpace;
+    if (end == i) end = i + (isMarker(text[i]) && i + 1 < len ? 2 : 1);
+    starts[n] = i;
+    lens[n] = (uint8_t)min(end - i, 255);
+    n++;
+    i = end;
+    if (i < len && (text[i] == ' ' || text[i] == '\n')) i++;
+  }
+  return n;
+}
+
+const char* timeAgo(uint32_t epoch) {
+  static char b[12];
+  if (!epoch || !app::timeValid()) return "";
+  const int32_t d = (int32_t)(app::now() - epoch);
+  if (d < 60) return "now";
+  if (d < 3600) snprintf(b, sizeof(b), "%ldm", (long)(d / 60));
+  else if (d < 86400) snprintf(b, sizeof(b), "%ldh", (long)(d / 3600));
+  else if (d < 86400L * 365) snprintf(b, sizeof(b), "%ldd", (long)(d / 86400));
+  else return "long ago";
+  return b;
+}
+
+const char* clockText(uint32_t epoch, bool withDate) {
+  static char b[24];
+  const time_t t = (time_t)epoch + (time_t)regional::offsetMin(epoch) * 60;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  char hm[10];
+  if (ui_settings.clock24) snprintf(hm, sizeof(hm), "%02d:%02d", tm.tm_hour, tm.tm_min);
+  else {
+    int h = tm.tm_hour % 12; if (!h) h = 12;
+    snprintf(hm, sizeof(hm), "%d:%02d%s", h, tm.tm_min, tm.tm_hour < 12 ? "am" : "pm");
+  }
+  if (withDate) {
+    static const char* MON[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+    snprintf(b, sizeof(b), "%s %d %s", MON[tm.tm_mon % 12], tm.tm_mday, hm);
+  } else {
+    strlcpy(b, hm, sizeof(b));
+  }
+  return b;
+}
+
+// "Mon, Sep 28": the lock face's date line (its big clock has the time).
+const char* dateText(uint32_t epoch) {
+  static char b[20];
+  const time_t t = (time_t)epoch + (time_t)regional::offsetMin(epoch) * 60;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  static const char* DAY[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  static const char* MON[] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  snprintf(b, sizeof(b), "%s, %s %d", DAY[tm.tm_wday % 7], MON[tm.tm_mon % 12], tm.tm_mday);
+  return b;
+}
+
+uint16_t nameColor(const char* name) {
+  static const uint32_t PAL[] = { 0x6a4c93, 0x3a6b35, 0x8a5a2b, 0x2b5f8a, 0x8a2b4f, 0x2b8a7a, 0x6b6b2b, 0x4f4f8a };
+  uint32_t h = 5381;
+  for (const char* p = name; *p; p++) h = h * 33 + (uint8_t)*p;
+  const uint32_t c = PAL[h % 8];
+  return lgfx::color565((c >> 16) & 0xFF, (c >> 8) & 0xFF, c & 0xFF);
+}
+
+// A sender's name in a chat: their colour, lifted so it reads on a dark bubble. The
+// built-in themes are all dark. One of the owner's own may be light, so there the
+// lift is half way to the colour of the writing beside it: pale on a dark theme as
+// before, and dark with the rest of the words on a light one.
+uint16_t nameInk(const char* name, uint16_t ink) {
+  const uint16_t c = nameColor(name);
+  if (!nav.theme().own) return c | 0x8410;
+  const uint16_t r = (((c >> 11) & 31) + ((ink >> 11) & 31) + 1) >> 1;
+  const uint16_t g = (((c >> 5) & 63) + ((ink >> 5) & 63) + 1) >> 1;
+  const uint16_t b = ((c & 31) + (ink & 31) + 1) >> 1;
+  return (uint16_t)((r << 11) | (g << 5) | b);
+}
+
+void drawAvatar(Canvas& g, int cx, int cy, int r, const char* name, uint8_t kind) {
+  const Theme& t = nav.theme();
+  char ini[3] = {0, 0, 0};
+  const char* p = name;
+  while (*p && !isalnum((unsigned char)*p)) p++;
+  if (*p) {
+    ini[0] = toupper((unsigned char)*p);
+    const char* sp = strchr(p, ' ');
+    if (sp && isalnum((unsigned char)sp[1])) ini[1] = toupper((unsigned char)sp[1]);
+    else if (isalnum((unsigned char)p[1])) ini[1] = toupper((unsigned char)p[1]);
+  } else ini[0] = '?';
+  if (kind == 10) {                                  // channel
+    g.fillCircle(cx, cy, r, t.greenDim);
+    g.setTextColor(t.bg, t.greenDim);
+    g.drawString("#", cx - g.textWidth("#") / 2, cy - 8);
+    return;
+  }
+  const uint16_t c = nameColor(name);
+  if (kind == 2) {                                   // repeater: ring
+    g.fillCircle(cx, cy, r, t.line);
+    g.drawCircle(cx, cy, r, c);
+    g.drawCircle(cx, cy, r - 1, c);
+    g.setTextColor(t.txt, t.line);
+  } else if (kind == 3) {                            // room: square-ish
+    g.fillRoundRect(cx - r, cy - r, r * 2, r * 2, 4, c);
+    g.setTextColor(t.white, c);
+  } else {
+    g.fillCircle(cx, cy, r, c);
+    g.setTextColor(t.white, c);
+  }
+  g.drawString(ini, cx - g.textWidth(ini) / 2, cy - 8);
+}
+
+// ---- Nav ------------------------------------------------------------------------------
+void Nav::begin(LGFX* d, Theme* t) {
+  _d = d; _t = t;
+  _canvas.setPsram(true);
+  _canvas.setColorDepth(16);
+  _canvas.createSprite(L::W, L::H);
+#if BOARD_ASYNC_PUSH
+  _front.setPsram(true);
+  _front.setColorDepth(16);
+  if (_front.createSprite(L::W, L::H))
+    xTaskCreatePinnedToCore(pushTask, "frame", 4096, this, 2, (TaskHandle_t*)&_pusher, 0);
+#endif
+}
+
+#if BOARD_ASYNC_PUSH
+#include <SPI.h>
+extern SPIClass inw_spi;   // variants/<board>/target.cpp: the one SPI bus (panel, radio, SD)
+// A frame takes 34 ms to send on this board, and nothing else used to happen meanwhile:
+// the next one wasn't started until the last had gone. Now the finished picture is copied
+// aside and a task on the other core sends the copy while the loop draws the next, so a
+// frame costs the longer of the two, not their sum.
+// Whatever draws on the panel directly - a screen change, an icon's animation, the
+// panel's sleep command - goes through display() or waitPresented(), which hold it
+// until the copy has gone: the screen library is not made for two callers at once.
+// The catch that made this corrupt a frame before: the panel is driven by LovyanGFX,
+// the radio and card by inw_spi, and they are the SAME SPI peripheral (FSPI/SPI2). A
+// radio or card access on the loop's core landing in the middle of a send left a band
+// of garbage across the frame. The two draw stacks don't share a lock on their own, so
+// the send holds inw_spi's transaction for its length: any bus user on the other core
+// waits for the frame to finish, exactly as BootBusLock does at boot. (Safe from
+// deadlock because the send itself never calls back into inw_spi.)
+void Nav::pushTask(void* self) {
+  Nav* n = (Nav*)self;
+  for (;;) {
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+    inw_spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0));
+    n->_sentPtr->pushSprite(n->_d, 0, 0);
+    inw_spi.endTransaction();
+    n->_pushing = false;
+  }
+}
+
+void Nav::waitPresented() { while (_pushing) delay(1); }
+
+void Nav::present(int shakeX) {
+  waitPresented();
+  if (shakeX || !asyncPush || !_pusher || !_front.getBuffer()) {   // a shake, or no second picture: sent from here, as before
+    if (shakeX) _d->fillRect(shakeX > 0 ? 0 : L::W + shakeX, 0, abs(shakeX), L::H, _t->bg);
+    back().pushSprite(_d, shakeX, 0);
+    nSync++;
+    return;
+  }
+  nAsync++;
+  // The frame just drawn (back) is handed to the panel by swapping the two buffers:
+  // the pusher sends it while the loop draws the next into what was last sent. No copy,
+  // and the two never clash because waitPresented() above has let the last send finish.
+  Canvas* tmp = _backPtr; _backPtr = _sentPtr; _sentPtr = tmp;
+  _pushing = true;
+  xTaskNotifyGive((TaskHandle_t)_pusher);
+}
+#endif
+
+// Every change of screen is animated (fx::transition): save what's showing now, and
+// the next draw() animates from it to the new screen. Several changes in one frame
+// (popToHome, replaceTop) make one transition, from the first picture to the last.
+void Nav::beginTransition(uint8_t kind) {
+  if (_trans || !_d || !top() || !app::animationsOk()) return;
+  // Going forward and back can be set to change at once (Settings > Display); locking
+  // and unlocking keep their animation.
+  if ((kind == (uint8_t)fx::Trans::Forward || kind == (uint8_t)fx::Trans::Back) && !app::screenChangesAnimate()) return;
+  Canvas* old = fx::scratch();
+  if (!old) return;
+  compose();                               // exactly what's on the panel now
+  memcpy(old->getBuffer(), back().getBuffer(), (size_t)L::W * L::H * 2);
+  _trans = kind;
+}
+
+void Nav::push(View* v) {
+  if (_depth >= 12) { delete v; return; }
+  if (_depth) beginTransition((uint8_t)(v->isLock() ? fx::Trans::Lock : fx::Trans::Forward));
+  _stack[_depth++] = v;
+  v->dirty = true;
+  _statusDirty = true;
+}
+
+void Nav::pop() {
+  if (_depth <= 1) return;                 // the home view is never popped
+  if (top()->isLock() && _afterUnlock) _afterUnlockDue = true;   // run on the next tick
+  beginTransition((uint8_t)(top()->isLock() ? fx::Trans::Unlock : fx::Trans::Back));
+  s_graveyard.push_back(_stack[--_depth]);
+  _stack[_depth] = nullptr;
+  if (top()) top()->resume();
+  _statusDirty = true;
+}
+
+void Nav::popTo(View* v) { while (_depth > 1 && top() != v) pop(); }
+void Nav::popToHome() { while (_depth > 1) pop(); }
+
+void Nav::replaceTop(View* v) {
+  if (_depth > 1) {
+    beginTransition((uint8_t)fx::Trans::Forward);
+    s_graveyard.push_back(_stack[--_depth]);
+    _stack[_depth] = nullptr;
+  }
+  push(v);
+}
+
+bool Nav::touch(const TouchEvent& e) {
+  View* v = top();
+  if (!v) return false;
+  // A touch that starts on the banner is the banner's, all of it, so nothing under it
+  // gets a tap or a scroll (and the lock face no swipe): a tap opens what it's about,
+  // a swipe up puts it away. On the lock face a tap can't unlock - a pocket taps too -
+  // so the banner's conversation opens once the swipe up does.
+  if (e.type == TouchEvent::Down) _bannerTouch = onBanner(e.x, e.y);
+  if (_bannerTouch) {
+    if (e.type == TouchEvent::Tap) {
+      _bannerTouch = false;
+      if (_bannerTap) {
+        if (v->isLock()) {
+          _afterUnlock = _bannerTap;
+          _afterUnlockAt = millis();
+          toast("swipe up to open it");
+        } else {
+          std::function<void()> f = std::move(_bannerTap);
+          _bannerUntil = 0; _bannerAt = 0; _bannerTap = nullptr;
+          f();
+        }
+      } else { _bannerUntil = 0; _bannerAt = 0; }
+      invalidate();
+    } else if (e.type == TouchEvent::Swipe || e.type == TouchEvent::Up) {
+      _bannerTouch = false;
+      if (e.type == TouchEvent::Swipe && e.dir == 'U') { _bannerUntil = 0; _bannerAt = 0; _bannerTap = nullptr; invalidate(); }
+    }
+    return true;
+  }
+  // A touch that starts on the status bar is the bar's: pulled down (a flick or a slow
+  // drag) it opens the quick settings, and nothing under it scrolls meanwhile. A tap goes
+  // on to the checks below. Not on the lock face, which is swiped up to unlock.
+  if (e.type == TouchEvent::Down) { _barTouch = !v->isLock() && e.y < L::HEAD_Y + 6; _barEat = false; }
+  if (_barEat && e.type == TouchEvent::Swipe) { _barEat = false; return true; }
+  if (_barTouch && e.type != TouchEvent::Tap) {
+    if (e.type == TouchEvent::Up) {
+      _barTouch = false;
+      _barEat = true;                               // the Swipe that may follow this lift is spent
+      if (e.y - e.y0 >= 36 && abs(e.x - e.x0) < 80) app::openQuickSettings();
+    }
+    return true;
+  }
+  _barTouch = false;
+  // The "N new" badge in the status bar: a tap goes to the new messages. The bar is
+  // thin, so the tap may land a little around it. On the lock face it waits for the
+  // swipe up, as a tapped banner does.
+  if (e.type == TouchEvent::Tap && s_badgeX1 && e.y < L::HEAD_Y + 3 && e.x >= s_badgeX0 - 10 && e.x <= s_badgeX1 + 14) {
+    if (v->isLock()) {
+      _afterUnlock = [] { app::openUnread(); };
+      _afterUnlockAt = millis();
+      toast("swipe up to open it");
+    } else {
+      app::openUnread();
+    }
+    invalidate();
+    return true;
+  }
+  // The right half of the status bar (Wi-Fi, BT, GPS, signal, battery): a tap opens the
+  // quick settings. Not on the lock face, where a pocket taps too.
+  if (e.type == TouchEvent::Tap && e.y < L::HEAD_Y + 2 && e.x >= L::W / 2 && !v->isLock()) {
+    app::openQuickSettings();
+    return true;
+  }
+  if (_depth > 1 && !v->isLock() && !v->isHome()) {
+    const bool headerTap = e.type == TouchEvent::Tap && v->headerBack() && e.x < 64 &&
+                           e.y >= L::HEAD_Y && e.y < L::HEAD_Y + L::HEAD_H;
+    const bool edgeSwipe = e.type == TouchEvent::Swipe && e.dir == 'R' && e.x0 < 24 && v->swipeBack();
+    if (headerTap || edgeSwipe) { pop(); return true; }
+  }
+  const bool used = v->touch(e);
+  if (used) v->dirty = true;
+  return used;
+}
+
+void Nav::backspace() {
+  View* v = top();
+  if (!v) return;
+  if (!v->backspace()) pop();
+}
+
+void Nav::toast(const char* msg, uint16_t ms) {
+  strlcpy(_toast, msg, sizeof(_toast));
+  if (!_toastUntil) _toastAt = millis() | 1;         // slide in, unless one is already up
+  _toastUntil = millis() + ms;
+  invalidate();
+}
+
+void Nav::banner(const char* title, const char* text, uint16_t ms, std::function<void()> onTap) {
+  strlcpy(_bannerTitle, title, sizeof(_bannerTitle));
+  sanitize(text, _bannerText, sizeof(_bannerText) - 4);
+  if (!_bannerUntil) _bannerAt = millis() | 1;
+  _bannerUntil = millis() + ms;
+  _bannerTap = std::move(onTap);
+  invalidate();
+}
+
+// Toasts rise from the bottom and banners drop from the top, each with a little
+// overshoot, and leave the way they came.
+static constexpr uint32_t OVL_IN = 240, OVL_OUT = 200;
+static float overlayShow(uint32_t at, uint32_t until) {
+  const uint32_t now = millis();
+  float s = 1;
+  if (at && (int32_t)(now - at) < (int32_t)OVL_IN) {
+    // Signed: `at` is millis()|1, a millisecond ahead on an even one, and the unsigned
+    // difference threw that frame's overlay far off the screen.
+    const float t = (int32_t)(now - at) / (float)OVL_IN;   // ease out with a small overshoot
+    const float c = 1.9f;
+    s = 1 + (c + 1) * powf(t - 1, 3) + c * powf(t - 1, 2);
+  }
+  const int32_t left = (int32_t)(until - now);
+  if (left < (int32_t)OVL_OUT) s = min(s, max(0.0f, left / (float)OVL_OUT));
+  return s;
+}
+static bool overlayMoving(uint32_t at, uint32_t until) {
+  const uint32_t now = millis();
+  return until && ((at && (int32_t)(now - at) < (int32_t)OVL_IN + 40) || (int32_t)(until - now) < (int32_t)OVL_OUT + 40);
+}
+
+// Where the banner is right now (drawOverlays): full width, 42 px, dropping in from
+// the top. A finger that lands there is the banner's.
+bool Nav::onBanner(int x, int y) const {
+  if (!_bannerUntil) return false;
+  const int top = 20 - (int)((1 - overlayShow(_bannerAt, _bannerUntil)) * (42 + 26));
+  return x >= 6 && x < L::W - 6 && y >= top - 4 && y < top + 42 + 6;
+}
+
+void Nav::tick() {
+  for (View* v : s_graveyard) delete v;
+  s_graveyard.clear();
+  const uint32_t now = millis();
+  if (_toastUntil && (int32_t)(now - _toastUntil) >= 0) { _toastUntil = 0; _toastAt = 0; invalidate(); }
+  if (_bannerUntil && (int32_t)(now - _bannerUntil) >= 0) { _bannerUntil = 0; _bannerAt = 0; _bannerTap = nullptr; invalidate(); }
+  // A banner tapped on the lock face: what it opens, now that the face has gone -
+  // if the unlock came within a minute of the tap.
+  if (_afterUnlockDue) {
+    _afterUnlockDue = false;
+    std::function<void()> f = std::move(_afterUnlock);
+    _afterUnlock = nullptr;
+    if (f && now - _afterUnlockAt < 60000) {
+      _bannerUntil = 0; _bannerAt = 0; _bannerTap = nullptr;   // it's open now: the banner has done its job
+      invalidate();
+      f();
+    }
+  }
+  if (overlayMoving(_toastAt, _toastUntil) || overlayMoving(_bannerAt, _bannerUntil)) invalidate();
+  if (now - _lastStatus > 15000) { _lastStatus = now; _statusDirty = true; }
+  if (top()) top()->tick();
+  // An effect running: redraw every frame until it's done (and once more after).
+  static bool fxWas = false;
+  const bool fxNow = fx::active();
+  if (fxNow || fxWas) invalidate();
+  fxWas = fxNow;
+}
+
+void Nav::compose(bool overlays) {
+  View* v = top();
+  if (!v || !_d) return;
+  Canvas& g = back();
+  g.fillScreen(_t->bg);
+  if (!v->isLock()) drawStatusBar(g, *_t, !v->hasClock());
+  v->draw(g);
+  if (overlays) drawOverlays(g);
+}
+
+void Nav::drawOverlays(lgfx::LovyanGFX& g) {
+  const Theme& t = *_t;
+  g.setFont(&fonts::Font2);
+  // Corners and edges follow the theme: square for Blocks, a gold double edge for
+  // Hero, an aurora edge for Aurora.
+  const int rad = t.style == STYLE_BLOCKS ? 0 : 8;
+  auto edge = [&](int x, int y, int w, int h, int r) {
+    g.drawRoundRect(x, y, w, h, r, t.green);
+    if (t.style == STYLE_HERO) g.drawRoundRect(x + 2, y + 2, w - 4, h - 4, r > 2 ? r - 2 : 0, t.amber);
+    if (t.style == STYLE_AURORA) { g.drawRoundRect(x - 1, y - 1, w + 2, h + 2, r + 1, t.blue); g.drawRoundRect(x + 1, y + 1, w - 2, h - 2, r > 1 ? r - 1 : 0, t.greenDim); }
+  };
+  if (_bannerUntil) {
+    const int h = 42;
+    const int y = 20 - (int)((1 - overlayShow(_bannerAt, _bannerUntil)) * (h + 26));
+    g.fillRoundRect(6, y, L::W - 12, h, rad, t.panel);
+    edge(6, y, L::W - 12, h, rad);
+    g.setTextColor(t.green, t.panel);
+    drawUtf8(g, _bannerTitle, 16, y + 4, L::W - 36);
+    g.setTextColor(t.txt, t.panel);
+    char line[100];
+    strlcpy(line, _bannerText, sizeof(line) - 4);
+    richFit(g, line, L::W - 36);
+    drawRich(g, line, 16, y + 22);
+  }
+  if (_toastUntil) {
+    // One line if it fits; a toast too wide for the screen (the T-Deck's is 320 px)
+    // breaks at the space nearest its middle instead of running off both edges.
+    const int tw = g.textWidth(_toast);
+    char a[sizeof(_toast)], b[sizeof(_toast)] = "";
+    strlcpy(a, _toast, sizeof(a));
+    if (tw > L::W - 44) {
+      const int n = strlen(a);
+      int cut = -1;
+      for (int i = 0; i < n; i++)
+        if (a[i] == ' ' && (cut < 0 || abs(i - n / 2) < abs(cut - n / 2))) cut = i;
+      if (cut > 0) { strlcpy(b, a + cut + 1, sizeof(b)); a[cut] = 0; }
+    }
+    const int lines = b[0] ? 2 : 1, h = lines == 2 ? 40 : 22;
+    const int w = min(L::W - 20, max((int)g.textWidth(a), (int)g.textWidth(b)) + 24);
+    const int x = (L::W - w) / 2;
+    const int y = L::H - 6 - h + (int)((1 - overlayShow(_toastAt, _toastUntil)) * (h + 12));
+    const int r = t.style == STYLE_BLOCKS ? 0 : 11;
+    g.fillRoundRect(x, y, w, h, r, t.greenDim);
+    if (t.style != STYLE_INW) edge(x, y, w, h, r);
+    g.setTextColor(t.white, t.greenDim);
+    g.drawString(a, x + (w - g.textWidth(a)) / 2, y + 3);
+    if (lines == 2) g.drawString(b, x + (w - g.textWidth(b)) / 2, y + 21);
+  }
+}
+
+void Nav::draw() {
+  View* v = top();
+  if (!v || !_d) return;
+  if (_trans) {                            // a screen change: animate to it
+    const uint8_t k = _trans;
+    _trans = 0;
+    waitPresented();
+    nTrans++;
+    Canvas* old = fx::scratch();
+    // The screens without the toast or banner: a transition plays one still frame
+    // of where it's going, and a toast raised on the way would sit in it half slid
+    // in, cut off at the bottom edge, for the whole transition. It slides in after.
+    compose(false);
+    if (old && app::animationsOk()) fx::transition((fx::Trans)k, *old, back());
+    else back().pushSprite(_d, 0, 0);
+    if (_toastUntil) _toastAt = millis() | 1;
+    if (_bannerUntil) _bannerAt = millis() | 1;
+    v->dirty = !!(_toastUntil || _bannerUntil);
+    _statusDirty = false;
+    return;
+  }
+  if (!v->dirty && !_statusDirty) return;
+  if (v->customRender()) {
+    waitPresented();
+    nCustom++;
+    v->render(_statusDirty);
+    v->dirty = false;
+    _statusDirty = false;
+    return;
+  }
+  {
+    Canvas& g = back();
+    g.fillScreen(_t->bg);
+    if (!v->isLock()) drawStatusBar(g, *_t, !v->hasClock());
+    v->draw(g);
+    drawOverlays(g);
+    fx::draw(g);
+  }
+  const int sx = fx::shakeX();                        // a failed send shakes the screen
+#if BOARD_ASYNC_PUSH
+  present(sx);
+#else
+  if (sx) _d->fillRect(sx > 0 ? 0 : L::W + sx, 0, abs(sx), L::H, _t->bg);
+  back().pushSprite(_d, sx, 0);
+  nSync++;
+#endif
+  v->dirty = false;
+  _statusDirty = false;
+}
+
+// ---- MenuView ---------------------------------------------------------------------------
+MenuView& MenuView::header(const String& label) {
+  _rows.push_back({RowKind::Header, label, nullptr, nullptr, nullptr, nullptr});
+  return *this;
+}
+MenuView& MenuView::action(const String& label, std::function<void()> fn) {
+  _rows.push_back({RowKind::Action, label, nullptr, nullptr, fn, nullptr});
+  return *this;
+}
+MenuView& MenuView::submenu(const String& label, std::function<void()> fn, std::function<String()> value) {
+  _rows.push_back({RowKind::Submenu, label, value, nullptr, fn, nullptr});
+  return *this;
+}
+MenuView& MenuView::value(const String& label, std::function<String()> v, std::function<void()> fn) {
+  _rows.push_back({RowKind::Value, label, v, nullptr, fn, nullptr});
+  return *this;
+}
+MenuView& MenuView::toggle(const String& label, std::function<bool()> get, std::function<void()> flip) {
+  _rows.push_back({RowKind::Toggle, label, nullptr, get, flip, nullptr});
+  return *this;
+}
+MenuView& MenuView::adjust(const String& label, std::function<String()> v, std::function<void(int)> step) {
+  _rows.push_back({RowKind::Adjust, label, v, nullptr, nullptr, step});
+  return *this;
+}
+MenuView& MenuView::info(const String& label, std::function<String()> v) {
+  _rows.push_back({RowKind::Info, label, v, nullptr, nullptr, nullptr});
+  return *this;
+}
+
+void MenuView::resume() {
+  if (rebuild) {
+    const int f = _focus, s = _scroll;
+    _rows.clear();
+    rebuild(*this);
+    _focus = min(f, (int)_rows.size() - 1);
+    _scroll = s;
+  }
+  if (_focus < 0) _focus = 0;
+  if (!_rows.empty() && !focusable(_focus)) { moveFocus(1); if (!focusable(_focus)) moveFocus(-1); }
+  dirty = true;
+}
+
+void MenuView::moveFocus(int d) {
+  const int n = _rows.size();
+  if (!n) return;
+  // Stop at the ends instead of wrapping. A flick of the wheel arrives as several
+  // detents at once, and wrapping meant an upward flick stepped past the first row
+  // and reappeared at the bottom, so the top of a long menu was unreachable.
+  const int dir = d >= 0 ? 1 : -1;
+  for (int f = _focus + dir; f >= 0 && f < n; f += dir) {
+    if (focusable(f)) { _focus = f; return; }
+  }
+}
+
+void MenuView::rotate(int d) {
+  if (_rows.empty()) return;
+  _dragAcc = 0;                            // back on whole rows
+  if (!_wheel) {
+    // Show the focus where the finger left the page: the first row in view.
+    _wheel = true;
+    const int shown = (L::H - L::BODY_Y) / L::ROW_H;
+    if (!focusable(_focus) || _focus < _scroll || _focus >= _scroll + shown) {
+      _focus = _scroll;
+      if (!focusable(_focus)) moveFocus(1);
+    }
+    _drawnFocus = _focus;
+    dirty = true;
+    return;
+  }
+  if (_editing) {
+    MenuRow& r = _rows[_focus];
+    // Values go up when the wheel turns up, like a volume knob. (The wheel reports
+    // "down" as positive because that is the natural direction for lists.)
+    if (r.onAdjust) r.onAdjust(-d);
+    dirty = true;
+    return;
+  }
+  if (!focusable(_focus)) { moveFocus(1); if (!focusable(_focus)) moveFocus(-1); }
+  // Info rows below the last selectable one (a message's route, hops and signal)
+  // could never be reached: the wheel only moved the focus, and the page only
+  // scrolled to follow it. Once the focus can't go further, scroll the page.
+  const int visible = (L::H - L::BODY_Y) / L::ROW_H;
+  const int maxScroll = max(0, (int)_rows.size() - visible);
+  const int dir = d >= 0 ? 1 : -1;
+  for (int i = 0; i < abs(d); i++) {
+    // Scrolled down past the focus (it is above the page): come back up to it
+    // before moving it.
+    if (dir < 0 && _focus < _scroll) { _scroll--; continue; }
+    const int before = _focus;
+    moveFocus(dir);
+    if (_focus == before) _scroll = constrain(_scroll + dir, 0, maxScroll);
+  }
+  dirty = true;
+}
+
+// A trackball: up and down move through the rows; sideways on a row with a value
+// to step (brightness, a timeout) changes it there and then, no click first.
+bool MenuView::roll(int dx, int dy) {
+  if (_rows.empty() || !_wheel || _editing || !dx || dy) return false;
+  if (_focus < 0 || _focus >= (int)_rows.size()) return false;
+  MenuRow& r = _rows[_focus];
+  if (r.kind != RowKind::Adjust || !r.onAdjust) return false;
+  r.onAdjust(dx);
+  dirty = true;
+  return true;
+}
+
+void MenuView::press() {
+  if (_rows.empty()) return;
+  if (!_wheel) { rotate(0); return; }       // a click with nothing shown: show it first
+  // The focused row scrolled out of sight: bring it back rather than act on
+  // something the user can't see.
+  const int visible = (L::H - L::BODY_Y) / L::ROW_H;
+  if (_focus < _scroll || _focus >= _scroll + visible) { _drawnFocus = -1; dirty = true; return; }
+  MenuRow& r = _rows[_focus];
+  if (r.kind == RowKind::Adjust) { _editing = !_editing; dirty = true; return; }
+  dirty = true;
+  if (r.onPress) { auto fn = r.onPress; fn(); }   // copy: fn may rebuild _rows
+}
+
+bool MenuView::backspace() {
+  if (_editing) { _editing = false; dirty = true; return true; }
+  return false;
+}
+
+void MenuView::key(char c) {
+  if (c == '\n') { press(); return; }
+  if (_editing || _rows.empty()) return;
+  const char lc = tolower(c);
+  const int n = _rows.size();
+  for (int k = 1; k <= n; k++) {
+    const int i = (_focus + k) % n;
+    if (focusable(i) && _rows[i].label.length() && tolower(_rows[i].label[0]) == lc) {
+      _focus = i; _wheel = true; dirty = true; return;
+    }
+  }
+}
+
+void MenuView::tick() {
+  if (millis() - _lastRefresh > refreshMs) { _lastRefresh = millis(); dirty = true; }
+}
+
+void MenuView::draw(Canvas& g) {
+  const Theme& t = nav.theme();
+  char pos[24] = "";
+  const int visible = (L::H - L::BODY_Y) / L::ROW_H;
+  if ((int)_rows.size() > visible && _wheel) snprintf(pos, sizeof(pos), "%d/%d", _focus + 1, (int)_rows.size());
+  drawHeader(g, _title.c_str(), pos);
+  if (_rows.empty()) {
+    g.setTextColor(t.dim, t.bg);
+    g.drawString("nothing here", 18, L::BODY_Y + 10);
+    return;
+  }
+  // Follow the focus only when it has moved. Past the last selectable row the wheel
+  // scrolls the page on its own (rotate), and snapping back here would undo that.
+  if (_focus != _drawnFocus) {
+    _dragAcc = 0;                        // the wheel moves whole rows
+    if (_focus < _scroll) _scroll = _focus;
+    if (_focus >= _scroll + visible) _scroll = _focus - visible + 1;
+    // Pull headers and info rows above the focus into view: focus never lands on them,
+    // so without this the top of a list scrolls away and cannot be brought back.
+    while (_scroll > 0 && !focusable(_scroll - 1) && _focus < _scroll + visible - 1) _scroll--;
+    _drawnFocus = _focus;
+  }
+  _scroll = constrain(_scroll, 0, max(0, (int)_rows.size() - visible));
+  // Under a finger the page moves by the pixel: _dragAcc is how far it sits off a
+  // whole row, so the rows are drawn that much up or down, with the one coming in
+  // at the edge, and cut off at the header.
+  if (_scroll >= max(0, (int)_rows.size() - visible) && _dragAcc < 0) _dragAcc = 0;
+  if (_scroll <= 0 && _dragAcc > 0) _dragAcc = 0;
+  const int off = _dragAcc;
+  g.setClipRect(0, L::BODY_Y, L::W, L::H - L::BODY_Y);
+  for (int i = max(0, _scroll - (off > 0 ? 1 : 0)); i < (int)_rows.size() && i < _scroll + visible + (off < 0 ? 1 : 0); i++) {
+    const MenuRow& r = _rows[i];
+    const int y = L::BODY_Y + (i - _scroll) * L::ROW_H + off;
+    const bool on = i == _focus && _wheel;
+    const uint16_t bg = on ? t.focus : t.bg;
+    if (r.kind == RowKind::Header) {
+      g.setTextColor(t.greenDim, t.bg);
+      g.drawString(r.label, 10, y + (L::ROW_H - 14) / 2);
+      g.drawFastHLine(14 + g.textWidth(r.label), y + L::ROW_H / 2 + 1, L::W - 30 - g.textWidth(r.label), t.line);
+      continue;
+    }
+    if (on) { g.fillRect(0, y, L::W, L::ROW_H, bg); g.fillRect(0, y, 3, L::ROW_H, t.green); }
+    g.setTextColor(r.kind == RowKind::Info ? t.dim : (on ? t.green : t.txt), bg);
+    const int ty = y + (L::ROW_H - 16) / 2;   // text, centred in the row
+    const int rx = L::W - 12;
+    // The pager keeps a fixed column for values. A narrow screen (the T-Deck) can't
+    // spare one, so each label gets whatever its row leaves free.
+    int labelW = L::W - 170;
+    if (L::W < 400) {
+      String v = r.value && r.kind != RowKind::Toggle ? r.value() : String();
+      const int vw = v.length() ? widthUtf8(g, v.c_str()) : 0;
+      switch (r.kind) {
+        case RowKind::Toggle:  labelW = rx - 30 - 20; break;
+        case RowKind::Submenu: labelW = rx - 14 - (vw ? vw + 10 : 0) - 12; break;
+        case RowKind::Value: case RowKind::Adjust: case RowKind::Info:
+          labelW = rx - vw - (on && _editing ? 30 : 0) - 24; break;
+        default:               labelW = rx - 12; break;
+      }
+      labelW = max(labelW, 60);
+    }
+    drawUtf8(g, r.label.c_str(), 12, ty, labelW);
+    switch (r.kind) {
+      case RowKind::Toggle:
+        drawToggle(g, rx - 30, y + (L::ROW_H - 14) / 2, r.toggled && r.toggled());
+        break;
+      case RowKind::Submenu: {
+        String v = r.value ? r.value() : String();
+        g.setTextColor(t.dim, bg);
+        g.drawString(">", rx - 6, ty);
+        if (v.length()) drawUtf8(g, v.c_str(), rx - 14 - widthUtf8(g, v.c_str()), ty);
+        break;
+      }
+      case RowKind::Value: case RowKind::Adjust: case RowKind::Info: {
+        String v = r.value ? r.value() : String();
+        const int vw = g.textWidth(v);
+        if (on && _editing) {
+          g.fillRoundRect(rx - vw - 10, y + 1, vw + 14, L::ROW_H - 2, 4, t.green);
+          g.setTextColor(t.bg, t.green);
+          g.drawString(v, rx - vw - 3, ty);
+          g.setTextColor(t.green, bg);
+          g.drawString("<", rx - vw - 22, ty);
+        } else {
+          g.setTextColor(r.kind == RowKind::Info ? t.txt : t.dim, bg);
+          g.drawString(v, rx - vw, ty);
+        }
+        break;
+      }
+      default: break;
+    }
+  }
+  g.clearClipRect();
+  drawScrollbar(g, _rows.size(), _scroll, visible, L::BODY_Y, L::H - L::BODY_Y);
+}
+
+// Touch: tap a row to use it (a value's left or right half steps it down or up),
+// drag to scroll. The focus follows the finger, so the wheel and the trackball
+// carry on from wherever the last tap was.
+bool MenuView::touch(const TouchEvent& e) {
+  if (_rows.empty()) return false;
+  const int visible = (L::H - L::BODY_Y) / L::ROW_H;
+  const int maxScroll = max(0, (int)_rows.size() - visible);
+  switch (e.type) {
+    case TouchEvent::Down: return false;
+    case TouchEvent::Drag: {
+      const int was = _scroll, wasAcc = _dragAcc;
+      const bool shown = _wheel;
+      _wheel = false;                    // a finger took over: the highlight goes
+      _dragAcc += e.dy;
+      while (_dragAcc <= -L::ROW_H && _scroll < maxScroll) { _scroll++; _dragAcc += L::ROW_H; }
+      while (_dragAcc >= L::ROW_H && _scroll > 0) { _scroll--; _dragAcc -= L::ROW_H; }
+      if (_scroll >= maxScroll && _dragAcc < 0) _dragAcc = 0;   // at an end: nothing further to pull in
+      if (_scroll <= 0 && _dragAcc > 0) _dragAcc = 0;
+      _drawnFocus = _focus;              // don't snap back to the focus on the next draw
+      // The page follows the finger by the pixel (it used to jump a row at a time).
+      return _scroll != was || _dragAcc != wasAcc || shown;
+    }
+    case TouchEvent::Tap: {
+      if (e.y < L::BODY_Y) return false;
+      const int rel = e.y - L::BODY_Y - _dragAcc;       // the page may sit part of a row off
+      const int i = _scroll + (rel >= 0 ? rel / L::ROW_H : -1);
+      if (i < 0 || i >= (int)_rows.size() || !focusable(i)) return false;
+      _focus = _drawnFocus = i;
+      _editing = false;
+      _wheel = false;
+      MenuRow& r = _rows[i];
+      if (r.kind == RowKind::Adjust) { if (r.onAdjust && e.x > L::W / 2) r.onAdjust(e.x > L::W * 3 / 4 ? 1 : -1); return true; }
+      if (r.onPress) { auto fn = r.onPress; fn(); }   // copy: fn may rebuild _rows
+      return true;
+    }
+    default: return false;
+  }
+}
+
+// ---- PromptView -------------------------------------------------------------------------
+void PromptView::draw(Canvas& g) {
+  const Theme& t = nav.theme();
+  drawHeader(g, _title.c_str());
+  g.setTextColor(t.dim, t.bg);
+  g.drawString(_hint, 12, L::BODY_Y + 8);
+  const int fx = 10, fy = L::BODY_Y + 32, fw = L::W - 20, fh = 36;
+  g.fillRoundRect(fx, fy, fw, fh, 6, t.panel);
+  g.drawRoundRect(fx, fy, fw, fh, 6, t.green);
+  g.setFont(&fonts::Font4);
+  // A secret is starred unless it's being shown, but the character just typed stays
+  // readable for a moment, as on a phone, so a caps-lock slip shows up as it happens.
+  const bool hidden = _secret && !_show;
+  const bool peek = hidden && _buf.length() && millis() - _typedAt < 900;
+  String shown = hidden ? String() : _buf;
+  if (hidden) {
+    for (size_t i = 0; i + (peek ? 1 : 0) < _buf.length(); i++) shown += '*';
+    if (peek) shown += _buf[_buf.length() - 1];
+  }
+  char safe[200];
+  sanitize(shown.c_str(), safe, sizeof(safe));
+  // Keep the caret end in view (and clear of the eye).
+  const int room = fw - (_secret ? 56 : 26);
+  const char* p = safe;
+  while (*p && g.textWidth(p) > room) p++;
+  g.setTextColor(t.white, t.panel);
+  g.drawString(p, fx + 10, fy + 6);
+  if (_caret) g.fillRect(fx + 12 + g.textWidth(p), fy + 8, 3, 21, t.green);
+  g.setFont(&fonts::Font2);
+  char cnt[16];
+  snprintf(cnt, sizeof(cnt), "%u/%u", (unsigned)_buf.length(), (unsigned)_maxLen);
+  g.setTextColor(t.dim, t.bg);
+  g.drawString(cnt, L::W - 12 - g.textWidth(cnt), fy + fh + 6);
+  if (_secret) {
+    // The eye: open while it's shown, struck through while it's hidden.
+    const int ex = fx + fw - 24, ey = fy + fh / 2;
+    const uint16_t ec = _show ? t.green : t.dim;
+    g.drawEllipse(ex, ey, 11, 6, ec);
+    g.fillCircle(ex, ey, 3, ec);
+    if (!_show) { g.drawLine(ex - 11, ey + 7, ex + 11, ey - 7, ec); g.drawLine(ex - 11, ey + 8, ex + 11, ey - 6, t.panel); }
+    g.drawString(BOARD_HAS_TOUCH ? (_show ? "tap the eye to hide" : "tap the eye to show")
+                                 : (_show ? "turn the wheel to hide" : "turn the wheel to show"), 12, fy + fh + 6);
+  }
+#if BOARD_HAS_TOUCH
+  // Buttons a finger can find; enter and backspace still do the same.
+  g.setTextColor(t.dim, t.bg);
+  g.drawString("enter saves  -  sym, then a key, for 123", 12, fy + fh + 26);
+  const int by = L::H - BTN_H - 6, bw = (L::W - 36) / 2;
+  drawPill(g, 12, by, bw, BTN_H, t.panel, t.txt, "cancel");
+  drawPill(g, 24 + bw, by, bw, BTN_H, t.green, t.bg, "save");
+#else
+  g.drawString("enter saves  -  backspace on empty cancels  -  hold orange for 123", 12, L::H - 20);
+#endif
+}
+
+// Touch: the eye shows or hides a secret.
+bool PromptView::touch(const TouchEvent& e) {
+  if (e.type != TouchEvent::Tap) return false;
+  if (e.y >= L::H - BTN_H - 12) {               // the cancel and save buttons
+    if (e.x < L::W / 2) nav.pop(); else commit();
+    return true;
+  }
+  if (!_secret) return false;
+  const int fy = L::BODY_Y + 32, fh = 36;
+  if (e.x < L::W - 70 || e.y < fy - 6 || e.y > fy + fh + 6) return false;
+  _show = !_show;
+  return true;
+}
+
+void PromptView::rotate(int) {
+  if (!_secret) return;
+  _show = !_show;
+  dirty = true;
+}
+
+void PromptView::key(char c) {
+  if (c == '\n') { commit(); return; }
+  if ((uint8_t)c < 0x20 || (uint8_t)c > 0x7E || _buf.length() >= _maxLen) return;
+  _buf += c;
+  _caret = true;
+  _typedAt = millis();
+  dirty = true;
+}
+
+bool PromptView::backspace() {
+  if (!_buf.length()) return false;
+  _buf.remove(_buf.length() - 1);
+  dirty = true;
+  return true;
+}
+
+void PromptView::tick() {
+  if (millis() - _blink > 500) { _blink = millis(); _caret = !_caret; dirty = true; }
+  if (_typedAt && millis() - _typedAt >= 900) { _typedAt = 0; dirty = true; }   // the peek is over: star it
+}
+
+void PromptView::commit() {
+  auto fn = _done;
+  const String v = _buf;
+  nav.pop();
+  if (fn) fn(v);
+}
+
+// ---- ConfirmView ---------------------------------------------------------------------------
+void ConfirmView::draw(Canvas& g) {
+  const Theme& t = nav.theme();
+  // As tall as the text needs, and wider on a narrow screen. It used to hold three
+  // lines and 160 characters whatever was asked: an update's notes ran off the end of
+  // it, on the T-Deck after about a hundred characters.
+  const int x = L::W < 400 ? 10 : 30, w = L::W - 2 * x;
+  uint16_t st[8]; uint8_t ln[8];
+  char buf[360];
+  strlcpy(buf, _detail.c_str(), sizeof(buf));
+  const int n = wrapText(g, buf, w - 30, st, ln, min(8, (L::H - 4 - 44 - 50) / 18));
+  const int h = max(150, 44 + n * 18 + 50);
+  const int y = max(2, min(36, (L::H - h) / 2));
+  _x = x; _w = w; _by = y + h - 40;
+  g.fillRoundRect(x, y, w, h, 10, t.panel);
+  g.drawRoundRect(x, y, w, h, 10, t.amber);
+  g.setTextColor(t.amber, t.panel);
+  g.drawString(_q, x + (w - g.textWidth(_q)) / 2, y + 16);
+  g.setTextColor(t.txt, t.panel);
+  for (int i = 0; i < n; i++) {
+    char line[120];
+    snprintf(line, sizeof(line), "%.*s", ln[i], buf + st[i]);
+    g.drawString(line, x + (w - g.textWidth(line)) / 2, y + 44 + i * 18);
+  }
+  const int by = y + h - 40, bw = 110;
+  // No is red, Yes is green; the focused one is filled, the other keeps its colour in the text.
+  drawPill(g, x + w / 2 - bw - 10, by, bw, 26, !_sel ? t.red : t.line, !_sel ? t.white : t.red, "No");
+  drawPill(g, x + w / 2 + 10, by, bw, 26, _sel ? t.green : t.line, _sel ? t.bg : t.green, "Yes");
+}
+
+// Touch: the No and Yes buttons, where draw() puts them.
+bool ConfirmView::touch(const TouchEvent& e) {
+  if (e.type != TouchEvent::Tap) return false;
+  const int x = _x, w = _w ? _w : L::W - 60, by = _by, bw = 110;
+  if (e.y < by - 8 || e.y > by + 26 + 8) return false;
+  if (e.x >= x + w / 2 - bw - 10 && e.x < x + w / 2 - 10) { _sel = false; press(); return true; }
+  if (e.x >= x + w / 2 + 10 && e.x < x + w / 2 + 10 + bw) { _sel = true; press(); return true; }
+  return false;
+}
+
+void ConfirmView::press() {
+  auto fn = _sel ? _yes : _no;       // copied: pop() below deletes this view
+  nav.pop();
+  if (fn) fn();
+}
+
+// ---- TextPageView ----------------------------------------------------------------------------
+void TextPageView::tick() {
+  if (!_last || millis() - _last > _refresh) {
+    _last = millis();
+    const size_t before = _lines.size();
+    _lines.clear();
+    _fill(_lines);
+    // Pages are written as columns for the pager's 480 px. On a narrower screen a
+    // line that doesn't fit first loses its wide column gaps, then wraps, the rest
+    // indented under it.
+    if (L::W < 400) {
+      Canvas& g = nav.canvas();
+      g.setFont(&fonts::Font2);
+      const int maxW = L::W - 24;
+      std::vector<String> out;
+      for (String line : _lines) {
+        if (g.textWidth(line) > maxW) while (line.indexOf("   ") >= 0) line.replace("   ", "  ");
+        bool first = true;
+        while (g.textWidth(line) > maxW) {
+          int cut = -1;
+          for (int i = line.indexOf(' ', 1); i > 0; i = line.indexOf(' ', i + 1)) {
+            if (g.textWidth(line.substring(0, i)) > maxW) break;
+            cut = i;
+          }
+          if (cut <= 0) break;                      // one long word: let it run
+          out.push_back(line.substring(0, cut));
+          String rest = line.substring(cut);
+          rest.trim();
+          line = (line.startsWith("#") && first ? String("#    ") : String("    ")) + rest;
+          first = false;
+        }
+        out.push_back(line);
+      }
+      _lines.swap(out);
+    }
+    const int visible = (L::H - L::BODY_Y - 4) / 18;
+    if (_stickBottom && _lines.size() != before) _scroll = max(0, (int)_lines.size() - visible);
+    dirty = true;
+  }
+}
+
+void TextPageView::rotate(int d) {
+  const int visible = (L::H - L::BODY_Y - 4) / 18;
+  _dragAcc = 0;
+  _scroll = constrain(_scroll + d, 0, max(0, (int)_lines.size() - visible));
+  dirty = true;
+}
+
+bool TextPageView::touch(const TouchEvent& e) {
+  const int visible = (L::H - L::BODY_Y - 4) / 18;
+  if (e.type == TouchEvent::Down) return false;
+  if (e.type == TouchEvent::Tap && onPress) { onPress(); return true; }
+  if (e.type != TouchEvent::Drag) return false;
+  _dragAcc += e.dy;
+  const int maxScroll = max(0, (int)_lines.size() - visible);
+  while (_dragAcc <= -18 && _scroll < maxScroll) { _scroll++; _dragAcc += 18; }
+  while (_dragAcc >= 18 && _scroll > 0) { _scroll--; _dragAcc -= 18; }
+  if (_scroll >= maxScroll && _dragAcc < 0) _dragAcc = 0;
+  if (_scroll <= 0 && _dragAcc > 0) _dragAcc = 0;
+  return true;
+}
+
+void TextPageView::draw(Canvas& g) {
+  const Theme& t = nav.theme();
+  drawHeader(g, _title.c_str());
+  const int visible = (L::H - L::BODY_Y - 4) / 18;
+  g.setTextColor(t.txt, t.bg);
+  if (_lines.empty()) { g.setTextColor(t.dim, t.bg); g.drawString("nothing yet", 12, L::BODY_Y + 8); }
+  // By the pixel under a finger, like the menus: _dragAcc is the part of a line.
+  const int off = _dragAcc;
+  g.setClipRect(0, L::BODY_Y, L::W, L::H - L::BODY_Y);
+  for (int i = off > 0 ? -1 : 0; i < visible + (off < 0 ? 1 : 0) && _scroll + i < (int)_lines.size(); i++) {
+    if (_scroll + i < 0) continue;
+    char safe[160];
+    sanitize(_lines[_scroll + i].c_str(), safe, sizeof(safe));
+    const bool dimLine = safe[0] == '#';
+    g.setTextColor(dimLine ? t.greenDim : t.txt, t.bg);
+    drawRich(g, dimLine ? safe + 1 : safe, 12, L::BODY_Y + 4 + i * 18 + off);
+  }
+  g.clearClipRect();
+  drawScrollbar(g, _lines.size(), _scroll, visible, L::BODY_Y, L::H - L::BODY_Y);
+}

@@ -1,0 +1,337 @@
+// View stack over a single PSRAM canvas. The home carousel is the root; every
+// screen it opens is pushed on top and Backspace pops it. A view only redraws
+// when marked dirty, since the panel shares its bus with the radio and SD.
+
+#pragma once
+#include <Arduino.h>
+#include <functional>
+#include <vector>
+#include "display_config.h"
+#include "theme.h"
+#include "touch.h"
+#ifndef BOARD_ROW_H
+#define BOARD_ROW_H 20
+#endif
+
+// What every screen draws onto. A board with big pixels (the T-Deck) has its round
+// shapes and slanted lines drawn with soft edges (src/tdeck/smooth_canvas.h); the
+// calls are the same either way.
+#ifndef BOARD_SMOOTH_SHAPES
+#define BOARD_SMOOTH_SHAPES 0
+#endif
+#if BOARD_SMOOTH_SHAPES
+#include "smooth_canvas.h"
+using Canvas = SmoothCanvas;
+#else
+using Canvas = lgfx::LGFX_Sprite;
+#endif
+
+namespace fx { bool active(); }       // fx.h: effects running keep the screen redrawing
+
+// Layout constants shared by every screen.
+namespace L {
+  constexpr int W = SCREEN_W, H = SCREEN_H;   // the board's (board_pins.h): pager 480x222, T-Deck 320x240
+  constexpr int STATUS_H = 18;          // status bar
+  constexpr int HEAD_Y = 18, HEAD_H = 24;
+  constexpr int BODY_Y = 42;            // first content pixel under a header
+  constexpr int ROW_H = BOARD_ROW_H;   // 20 on the pager; taller on a touchscreen, for fingers
+}
+
+class View {
+public:
+  virtual ~View() {}
+  // Draw everything below the status bar. The canvas is cleared to bg first.
+  virtual void draw(Canvas& g) = 0;
+  virtual void rotate(int d) {}
+  // A trackball's roll, each way on its own (right and down positive). False: not a
+  // screen that tells them apart, and it gets rotate(dx + dy) as a wheel would give.
+  virtual bool roll(int dx, int dy) { return false; }
+  virtual void press() {}
+  // Backspace. Return true if handled (e.g. deleted a character); false pops.
+  virtual bool backspace() { return false; }
+  virtual void key(char c) {}
+  // Move the text cursor `steps` characters (negative: left). firstOfHold: the start of
+  // a hold-space-and-turn on the pager, whose space press typed a space to take back.
+  // False when this screen has no text cursor to move (the wheel then does its usual).
+  virtual bool moveCursor(int steps, bool firstOfHold) { return false; }
+  virtual void tick() {}                 // every loop, set dirty when needed
+  virtual void resume() { dirty = true; } // revealed again after a child popped
+  // Views that draw straight to the panel (the carousel) override this.
+  virtual bool customRender() { return false; }
+  virtual void render(bool full) {}
+  virtual bool isHome() { return false; }
+  virtual bool isLock() { return false; }
+  virtual bool hasClock() { return false; }   // shows the time itself: the status bar leaves it out
+  virtual bool wantsAllKeys() { return false; }  // don't treat letters as shortcuts
+  // Touch (boards with a touchscreen only). True if the view used the event.
+  virtual bool touch(const TouchEvent& e) { return false; }
+  // Has the usual header, whose "<" can be tapped to go back.
+  virtual bool headerBack() { return !isHome() && !isLock(); }
+  // A swipe in from the left edge goes back. A screen that must not be left that
+  // way (the SOS countdown: leaving isn't cancelling) says no.
+  virtual bool swipeBack() { return true; }
+  // A flicked list keeps gliding after the finger lifts. Screens that follow the
+  // finger itself (a map, the lock face, the touch test) say no.
+  virtual bool coasts() { return !isLock(); }
+  bool dirty = true;
+};
+
+class Nav {
+public:
+  void begin(LGFX* d, Theme* t);
+  void push(View* v);
+  void pop();                      // deletes the view
+  void popTo(View* v);             // pop until v is on top
+  void popToHome();
+  View* top() { return _depth ? _stack[_depth - 1] : nullptr; }
+  int depth() const { return _depth; }
+  void replaceTop(View* v);
+
+  void toast(const char* msg, uint16_t ms = 2500);
+  void dismissToast() { if (_toastUntil) { _toastUntil = 0; _toastAt = 0; invalidate(); } }
+  bool toastUp() const { return _toastUntil != 0; }
+  // Puts a notice on screen right away, before a slow blocking job starts.
+  // Shown at once (no slide-in): the caller is about to block.
+  void busy(const char* msg) { toast(msg, 60000); _toastAt = 0; draw(); }
+  // onTap: what tapping it opens (a message: its conversation). Touchscreens only;
+  // on the lock face it waits for the swipe that unlocks.
+  void banner(const char* title, const char* text, uint16_t ms = 4500, std::function<void()> onTap = nullptr);
+  void invalidate() { if (top()) top()->dirty = true; _statusDirty = true; }
+  void statusChanged() { _statusDirty = true; }
+
+  void rotate(int d)  { if (top()) top()->rotate(d); }
+  void roll(int dx, int dy) { if (top() && !top()->roll(dx, dy)) top()->rotate(dx + dy); }
+  void press()        { if (top()) top()->press(); }
+  void key(char c)    { if (top()) top()->key(c); }
+  // Touch: going back (the header's "<", or a swipe in from the left edge) is
+  // handled here for every screen; the rest goes to the screen on top.
+  bool touch(const TouchEvent& e);
+  void backspace();
+  void tick();
+  void draw();
+  // Draw the top view into the canvas without sending it to the panel, for a
+  // transition to reveal (or collapse) the real picture.
+  void compose(bool overlays = true);
+
+  Canvas& canvas() { return back(); }
+#if BOARD_ASYNC_PUSH
+  // The panel, to draw on directly (a screen change, an icon's animation): not before
+  // a frame that is on its way out has gone. See present() in ui.cpp.
+  LGFX* display() { waitPresented(); return _d; }
+  LGFX* displayNoWait() { return _d; }      // only to pass on to something that waits itself before drawing
+  void waitPresented();                      // returns once nothing is being sent to the panel
+  bool asyncPush = true;                     // false: every frame is sent from the loop, as it used to be
+  // Two full-screen buffers: the loop draws into one while the other is on its way to
+  // the panel. They trade places each frame (present), so a finished frame is handed
+  // over as a pointer, not copied.
+  Canvas& back() { return *_backPtr; }
+  uint32_t nAsync = 0, nSync = 0, nTrans = 0, nCustom = 0;   // how pictures have reached the panel (the USB "peek" prints them)
+  Canvas& lastFrame() { return asyncPush && _pusher && _front.getBuffer() ? *_sentPtr : back(); }   // what waslast sent
+#else
+  LGFX* display() { return _d; }
+  LGFX* displayNoWait() { return _d; }
+  void waitPresented() {}
+  bool asyncPush = false;
+  Canvas& back() { return _canvas; }
+  Canvas& lastFrame() { return _canvas; }
+  uint32_t nAsync = 0, nSync = 0, nTrans = 0, nCustom = 0;
+#endif
+  Theme& theme() { return *_t; }
+  // Overlays (toast, banner) painted on top of whatever the view drew.
+  void drawOverlays(lgfx::LovyanGFX& g);
+  bool overlayActive() const { return _toastUntil || _bannerUntil || fx::active(); }
+
+private:
+  LGFX* _d = nullptr;
+  Theme* _t = nullptr;
+  Canvas _canvas;
+#if BOARD_ASYNC_PUSH
+  void present(int shakeX);
+  static void pushTask(void* self);
+  Canvas _front;                             // the second full-screen buffer (see back())
+  Canvas* _backPtr = &_canvas;               // where the loop draws now
+  Canvas* _sentPtr = &_front;                // the frame last handed to the panel
+  void* _pusher = nullptr;                   // its task
+  volatile bool _pushing = false;
+#endif
+  View* _stack[12] = {nullptr};
+  int _depth = 0;
+  char _toast[64] = "";
+  uint32_t _toastUntil = 0, _toastAt = 0;
+  char _bannerTitle[48] = "", _bannerText[128] = "";
+  uint32_t _bannerUntil = 0, _bannerAt = 0;
+  std::function<void()> _bannerTap, _afterUnlock;   // the banner's tap; one to run once unlocked
+  uint32_t _afterUnlockAt = 0;
+  bool _bannerTouch = false, _afterUnlockDue = false;
+  bool _barTouch = false, _barEat = false;       // a touch that began on the status bar; the Swipe after its Up
+  bool onBanner(int x, int y) const;
+  bool _statusDirty = true;
+  uint32_t _lastStatus = 0;
+  // A push or pop since the last frame: the old picture is saved (fx::scratch) and
+  // the next draw() animates to the new one. Holds an fx::Trans.
+  uint8_t _trans = 0;
+  void beginTransition(uint8_t kind);
+public:
+  void cancelTransition() { _trans = 0; }   // e.g. the screen is about to go dark anyway
+};
+
+extern Nav nav;
+
+// ---- drawing helpers ----------------------------------------------------------
+void drawHeader(Canvas& g, const char* title, const char* right = nullptr);
+void drawScrollbar(Canvas& g, int total, int first, int visible, int y0, int h);
+void drawPill(Canvas& g, int x, int y, int w, int h, uint16_t bg, uint16_t fg, const char* text);
+void drawToggle(Canvas& g, int x, int y, bool on);
+// Make message text safe for the bitmap font: UTF-8 punctuation to ASCII,
+// emoji and anything unmappable to a single marker.
+void sanitize(const char* in, char* out, size_t cap);
+// Word-wrap `text` into lines no wider than `w` pixels in the current font.
+// Returns the number of lines; each line is a (start, len) pair into `text`.
+// Rich text: sanitized strings may hold 2-byte emoji markers; these draw and
+// measure them as 16 px colour glyphs. drawUtf8/widthUtf8 sanitize first.
+int  richWidth(lgfx::LovyanGFX& g, const char* s, int n = -1);
+int  drawRich(lgfx::LovyanGFX& g, const char* s, int x, int y, int n = -1);
+void richEmojiDrop(int px);   // emoji drawn this much lower (bigger chat text); 0 = as before
+void richFit(lgfx::LovyanGFX& g, char* s, int maxW);
+int  drawUtf8(lgfx::LovyanGFX& g, const char* utf8, int x, int y, int maxW = 0);
+int  widthUtf8(lgfx::LovyanGFX& g, const char* utf8);
+void drawEmojiGlyph(lgfx::LovyanGFX& g, int idx, int x, int y, int scale = 1);
+uint16_t emojiCount();
+uint32_t emojiCodepoint(uint16_t i);
+int emojiFind(uint32_t cp);
+int wrapText(Canvas& g, const char* text, int w, uint16_t* starts, uint8_t* lens, int maxLines);
+const char* timeAgo(uint32_t epoch);
+const char* clockText(uint32_t epoch, bool withDate = false);
+const char* dateText(uint32_t epoch);   // "Mon, Sep 28"
+uint16_t nameColor(const char* name);      // stable per-name avatar colour
+uint16_t nameInk(const char* name, uint16_t ink);   // that colour for writing the name, beside writing in `ink`
+void drawAvatar(Canvas& g, int cx, int cy, int r, const char* name, uint8_t kind);
+
+// ---- generic menu --------------------------------------------------------------
+enum class RowKind : uint8_t { Action, Value, Toggle, Submenu, Adjust, Info, Header };
+
+struct MenuRow {
+  RowKind kind;
+  String label;
+  std::function<String()> value;          // Value/Adjust/Info right column
+  std::function<bool()> toggled;          // Toggle state
+  std::function<void()> onPress;
+  std::function<void(int)> onAdjust;      // Adjust: rotate while editing
+};
+
+class MenuView : public View {
+public:
+  explicit MenuView(const String& title) : _title(title) {}
+  MenuView& header(const String& label);
+  MenuView& action(const String& label, std::function<void()> fn);
+  MenuView& submenu(const String& label, std::function<void()> fn, std::function<String()> value = nullptr);
+  MenuView& value(const String& label, std::function<String()> v, std::function<void()> fn = nullptr);
+  MenuView& toggle(const String& label, std::function<bool()> get, std::function<void()> flip);
+  MenuView& adjust(const String& label, std::function<String()> v, std::function<void(int)> step);
+  MenuView& info(const String& label, std::function<String()> v);
+  void clear() { _rows.clear(); _focus = 0; _scroll = 0; }
+
+  void draw(Canvas& g) override;
+  void rotate(int d) override;
+  bool roll(int dx, int dy) override;
+  void press() override;
+  bool backspace() override;
+  void key(char c) override;
+  void tick() override;
+  bool touch(const TouchEvent& e) override;
+  String title() const { return _title; }
+  void setTitle(const String& t) { _title = t; dirty = true; }
+  // Rebuild hook: called on resume so rows reflect state changed by children.
+  std::function<void(MenuView&)> rebuild;
+  void resume() override;
+  uint32_t refreshMs = 1000;              // live values refresh this often
+
+protected:
+  bool focusable(int i) const { return _rows[i].kind != RowKind::Header && _rows[i].kind != RowKind::Info; }
+  void moveFocus(int d);
+  String _title;
+  std::vector<MenuRow> _rows;
+  int _focus = 0, _scroll = 0;
+  int _drawnFocus = -1;                   // the view follows the focus only when it moves
+  bool _editing = false;
+  uint32_t _lastRefresh = 0;
+  int _dragAcc = 0;                       // touch: pixels dragged, not yet a whole row
+  // The highlight (and the "3/12" count) belong to the wheel, trackball and keys.
+  // On a touchscreen board they stay hidden until one of those is used: the first
+  // roll or click only shows where the focus is.
+  bool _wheel = !BOARD_HAS_TOUCH;
+};
+
+// ---- text prompt ------------------------------------------------------------------
+class PromptView : public View {
+public:
+  PromptView(const String& title, const String& hint, const String& initial, size_t maxLen,
+             std::function<void(const String&)> done, bool secret = false)
+    : _title(title), _hint(hint), _buf(initial), _maxLen(maxLen), _done(done), _secret(secret) {}
+  void draw(Canvas& g) override;
+  void key(char c) override;
+  bool backspace() override;
+  void press() override { commit(); }
+  void rotate(int) override;
+  void tick() override;
+  bool touch(const TouchEvent& e) override;
+  bool wantsAllKeys() override { return true; }
+private:
+  void commit();
+  static constexpr int BTN_H = 28;         // touchscreen boards: cancel and save
+  String _title, _hint, _buf;
+  size_t _maxLen;
+  std::function<void(const String&)> _done;
+  bool _secret, _caret = true;
+  bool _show = false;              // a secret shown in the clear (the wheel toggles it)
+  uint32_t _blink = 0, _typedAt = 0;
+};
+
+// ---- confirm ------------------------------------------------------------------------
+class ConfirmView : public View {
+public:
+  ConfirmView(const String& q, const String& detail, std::function<void()> yes, std::function<void()> no = nullptr)
+    : _q(q), _detail(detail), _yes(yes), _no(no) {}
+  void draw(Canvas& g) override;
+  void rotate(int d) override { _sel = !_sel; dirty = true; }
+  void press() override;
+  void key(char c) override { if (c == 'y') { _sel = true; press(); } else if (c == 'n') { _sel = false; press(); } }
+  bool touch(const TouchEvent& e) override;
+  bool headerBack() override { return false; }   // no header: a dialog
+private:
+  String _q, _detail;
+  std::function<void()> _yes, _no;  // _no: told when the answer was no (most askers don't need to know)
+  bool _sel = false;               // cursor starts on "no"
+  int _x = 30, _w = 0, _by = 146;  // where draw() put the box and its buttons
+};
+
+// ---- a scrollable page of text lines (logs, info, telemetry) -----------------------
+class TextPageView : public View {
+public:
+  TextPageView(const String& title, std::function<void(std::vector<String>&)> fill, uint32_t refreshMs = 1000)
+    : _title(title), _fill(fill), _refresh(refreshMs) {}
+  void draw(Canvas& g) override;
+  void rotate(int d) override;
+  void tick() override;
+  bool touch(const TouchEvent& e) override;
+  std::function<void()> onPress;
+  void press() override { if (onPress) onPress(); }
+private:
+  String _title;
+  std::function<void(std::vector<String>&)> _fill;
+  std::vector<String> _lines;
+  uint32_t _refresh, _last = 0;
+  int _scroll = 0, _dragAcc = 0;
+  bool _stickBottom = false;
+public:
+  void stickToBottom() { _stickBottom = true; }
+};
+
+// Convenience
+inline void confirm(const String& q, const String& detail, std::function<void()> yes, std::function<void()> no = nullptr) {
+  nav.push(new ConfirmView(q, detail, yes, no));
+}
+inline void prompt(const String& title, const String& hint, const String& initial, size_t maxLen,
+                   std::function<void(const String&)> done, bool secret = false) {
+  nav.push(new PromptView(title, hint, initial, maxLen, done, secret));
+}

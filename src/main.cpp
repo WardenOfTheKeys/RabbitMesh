@@ -1,0 +1,3299 @@
+// Boot, the main loop, and turning mesh events into alerts.
+
+#include <Arduino.h>
+#include <Wire.h>
+#include <SPIFFS.h>
+#include <esp_system.h>
+#include <esp_sleep.h>
+#include <esp_partition.h>
+#include <esp_rom_gpio.h>
+#include <driver/gpio.h>
+#include <nvs_flash.h>
+#include <Preferences.h>
+#include <soc/rtc_cntl_reg.h>
+#include "power.h"
+#include "eco_power.h"
+#include "cpu_sleep.h"
+#include "sleep_deadline.h"
+#include "notify.h"
+#include "statusbar.h"
+#include "ota.h"
+#include "chats.h"
+#include <SD.h>
+#include <time.h>
+#include "board_pins.h"
+#if BOARD_HAS_REPORTS
+#include "bugreport.h"
+#endif
+#include "display_config.h"
+#include "io_expander.h"
+#if INW_DEV
+#include <soc/gdma_struct.h>
+#endif
+#include "bringup.h"
+#include "backlight.h"
+#include "rotary.h"
+#include "keyboard.h"
+#if BOARD_HAS_TOUCH
+#include "touch.h"
+#include "touch_gt911.h"   // src/tdeck: the board's touchscreen
+TouchPanel touchPanel;
+static Gestures   gestures;
+#endif
+#include "gps.h"
+#include "battery.h"
+#include "rtc.h"
+#include "haptic.h"
+#include "es8311_codec.h"
+#include "audio_jingle.h"
+#include "logstore.h"
+#include "theme.h"
+#include "themestore.h"
+#include "mascot.h"
+#include "app.h"
+#include "regions.h"
+#include "archive.h"
+#include "node.h"
+#include "history.h"
+#include "dataio.h"
+#include "fieldtools.h"
+#include "netwifi.h"
+#include "fx.h"
+#include "regional.h"
+#include "bootscreen.h"
+#include "fsmigrate.h"
+#include "extport.h"
+#include "qrview.h"
+#if INW_DEV
+#include <CayenneLPP.h>
+namespace ext { void drawPage(Canvas& g, int down); void fake(); }
+#endif
+
+// Mesh callbacks (decrypt, verify, then our history write) run on the loop task;
+// give it room rather than finding the edge of the default 8 KB in the field.
+SET_LOOP_TASK_STACK_SIZE(16 * 1024);
+
+// The backlight pin (GPIO42) is the chip's JTAG MTMS pin, pulled up at reset, so
+// the AW9364 lit the panel before any of our code ran and showed the random noise
+// in its memory: the "TV static" at power on. A global constructor runs before
+// Arduino starts (well before PSRAM and NVS init and setup()), so hold it low from
+// there; setup() turns the light on once the boot logo is drawn.
+__attribute__((constructor(101))) static void backlightOffEarly() {
+  esp_rom_gpio_pad_select_gpio(PIN_TFT_BL);
+  gpio_set_level((gpio_num_t)PIN_TFT_BL, 0);
+  gpio_set_direction((gpio_num_t)PIN_TFT_BL, GPIO_MODE_OUTPUT);
+}
+
+// ---- hardware ---------------------------------------------------------------------
+LGFX          display;
+Theme         theme;
+static IoExpander expander;
+static Backlight  backlight;
+IdleDimmer    dimmer;
+static Rotary rotary;
+Keyboard      keyboard;
+Haptic        haptic;
+Gps           gps;
+Es8311        codec;
+JinglePlayer  jingle;
+Battery       battery;
+// The battery count (battery.h) has to outlive a restart and a power off. RTC
+// memory survives restarts and crashes but not a power off; flash covers that.
+RTC_NOINIT_ATTR static uint32_t s_battMagic;
+RTC_NOINIT_ATTR static float    s_battMah;
+static constexpr uint32_t BATT_MAGIC = 0xB477C0DEu;
+static void battSave(bool toFlash) {
+  const float mah = battery.remainingMah();
+  if (mah < 0) return;
+  s_battMah = mah;
+  s_battMagic = BATT_MAGIC;
+  if (toFlash) { Preferences p; if (p.begin("inw-batt", false)) { p.putFloat("mah", mah); p.end(); } }
+}
+static void battRestore() {
+  if (s_battMagic == BATT_MAGIC) { battery.restoreMah(s_battMah, true); return; }
+  Preferences p;
+  if (p.begin("inw-batt", true)) { const float mah = p.getFloat("mah", -1); p.end(); battery.restoreMah(mah, false); }
+}
+Rtc           rtc;
+LogStore      logs;
+
+extern ConvKey g_openConv;
+View* makeHomeView();
+View* makeLockView();
+void startSetup();                     // settings_ui.cpp
+
+uint32_t g_shotAt = 0;
+extern char g_screenTitle[32];   // ui.cpp: the last header drawn
+static uint32_t s_prefsDirtyAt = 0, s_uiDirtyAt = 0;
+static uint32_t s_kbFlashUntil = 0;
+static bool s_radioOk = false;
+bool inwStoreBeginSleep();          // MeshCore DataStore helper (tools/patch_meshcore.py): ECO
+void inwStoreEndSleep();
+static uint16_t s_radioKicks = 0;   // radioIrqWatch(): missed radio interrupts picked up since start
+static uint16_t s_radioRxKicks = 0; // radioDeafWatch(): chip found in standby while "listening"
+static uint16_t s_radioSetups = 0;  // radioDeafWatch(): radio set up again from scratch
+static char s_radioSetupWhy[48] = "";   // ... and why, the last time
+bool inwRadioFlagPending();         // MeshCore RadioLibWrappers.cpp (tools/patch_meshcore.py)
+void inwRadioKick();
+void inwRadioSetIdle();
+unsigned char inwRadioState();
+extern RADIO_CLASS radio;           // variants/*/target.cpp
+static void radioChipState(char* out, size_t n);   // below: what the radio chip says it is doing
+static void radioSetupAgain(const char* why);
+static uint16_t radioSyncWord();
+#if BOARD_HAS_TOUCH
+static bool s_touchWake = false;   // touchscreen: a double tap on the dark screen (tapWake)
+static uint32_t s_darkTouchAt = 0; // the last touch on the dark screen (ECO: no nap right after)
+#endif
+#if INW_DEV
+static regions::Scan s_usbScan;    // USB "regions scan"
+#endif
+static char s_radioFault[64] = "radio not responding";
+
+void markPrefsDirty() { s_prefsDirtyAt = millis() | 1; }
+void markUiDirty()    { s_uiDirtyAt = millis() | 1; }
+
+// ---- clock ----------------------------------------------------------------------------
+static uint32_t epochFrom(uint16_t y, uint8_t mo, uint8_t d, uint8_t h, uint8_t mi, uint8_t s) {
+  struct tm tm = {};
+  tm.tm_year = y - 1900; tm.tm_mon = mo - 1; tm.tm_mday = d;
+  tm.tm_hour = h; tm.tm_min = mi; tm.tm_sec = s;
+  return (uint32_t)mktime(&tm);        // no TZ set on this device: this is UTC
+}
+
+static void writeHardwareRtc(uint32_t epoch) {
+  const time_t t = epoch;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  RtcTime r;
+  r.year = tm.tm_year + 1900; r.month = tm.tm_mon + 1; r.day = tm.tm_mday;
+  r.hour = tm.tm_hour; r.minute = tm.tm_min; r.second = tm.tm_sec;
+  rtc.set(r);
+}
+
+uint32_t app::now() { return rtc_clock.getCurrentTime(); }
+bool app::timeValid() { return app::now() > 1735689600UL; }     // after 2025-01-01
+void app::setTime(uint32_t epoch) { rtc_clock.setCurrentTime(epoch); nav.statusChanged(); }
+
+// ---- app helpers ----------------------------------------------------------------------------
+const char* app::batteryText() {
+  static char b[12];
+  if (!battery.present() || !battery.hasReading()) return "--";
+  snprintf(b, sizeof(b), "%u%%", battery.percent());
+  return b;
+}
+uint8_t app::batteryPct() { return battery.present() ? battery.percent() : 0; }
+bool app::charging() { return battery.present() && battery.charging(); }
+bool app::pluggedIn() { return battery.present() && battery.pluggedIn(); }
+uint16_t app::batteryMv() { return battery.present() ? battery.millivolts() : 0; }
+bool app::radioOk() { return s_radioOk; }
+const char* app::radioFault() { return s_radioFault; }
+
+static bool channelJoined(const ConvKey& k) {
+  if (!g_node) return false;
+  for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+    ChannelDetails ch;
+    if (g_node->getChannel(i, ch) && ch.name[0] && ConvKey::channel(ch.channel.secret) == k) return true;
+  }
+  return false;
+}
+
+// The badge counts only what the Messages list can show. History keeps a channel's
+// messages after you leave it, and those used to count too, so the badge could say
+// 2 with nothing there to open. Rechecked every few seconds as well, because
+// leaving a channel changes what counts without adding a message.
+// What one conversation adds to it: what would have notified. A muted one adds
+// nothing; one set to @mentions only (itself, or a channel under Settings >
+// Notifications > "only when @mentioned" or with channel notifications off) adds only
+// the messages that mention this node. The Messages list still shows every unread one.
+static uint16_t countedUnread(const ConvKey& k) {
+  if (k.type == CONV_CHANNEL && !channelJoined(k)) return 0;
+  const uint8_t mode = notifyMode(k);
+  if (mode == NM_MUTED) return 0;
+  const bool mentionsOnly = mode == NM_MENTIONS ||
+      (mode == NM_DEFAULT && k.type == CONV_CHANNEL && (!ui_settings.notifyChannel || ui_settings.channelMentionsOnly));
+  return mentionsOnly ? history.unreadMentions(k) : history.unread(k);
+}
+
+uint16_t app::unread() {
+  static uint32_t gen = 0, at = 0;
+  static uint16_t cached = 0;
+  if (gen == history.gen && at && millis() - at < 5000) return cached;
+  gen = history.gen;
+  at = millis() | 1;
+  ConvKey keys[64];
+  const uint16_t n = history.conversations(keys, 64);
+  uint16_t total = 0;
+  for (uint16_t i = 0; i < n; i++) total += countedUnread(keys[i]);
+  cached = total;
+  return cached;
+}
+
+// A tap on the status bar's "N new" badge: straight to what is new. One conversation
+// with unread messages opens; several open the Messages list, which shows which.
+void app::openUnread() {
+  ConvKey keys[64], one;
+  const uint16_t n = history.conversations(keys, 64);
+  int with = 0;
+  for (uint16_t i = 0; i < n; i++) {
+    if (countedUnread(keys[i])) { one = keys[i]; with++; }
+  }
+  if (!with || (with == 1 && g_openConv == one)) return;     // nothing new, or already looking at it
+  nav.popToHome();
+  if (with == 1) openThread(one);
+  else app::openChats();
+}
+
+#if BOARD_HAS_TOUCH
+// Settings > Display on a touchscreen board: the screen the right way up, and touch
+// and the trackball agreeing with it. Turning the screen over reverses both.
+static void applyOrientation() {
+  const bool flip = ui_settings.orient & 1;
+  nav.waitPresented();
+  display.setRotation(TFT_ROTATION ^ (flip ? 2 : 0));
+  touchPanel.setMirror(flip != (bool)(ui_settings.orient & 2), flip != (bool)(ui_settings.orient & 4));
+  rotary.setReversed(flip != (bool)(ui_settings.orient & 8));
+#if BOARD_HAS_TRACKBALL
+  rotary.setSpeed(app::trackballSpeed());
+#endif
+  display.invertDisplay(ui_settings.orient & 16);   // relative to the panel's own setting
+  nav.invalidate();
+}
+#endif
+
+// How exactly this node's position is told to others (adverts and telemetry replies):
+// 0 exact, else to the middle of a grid square ~100 m / 500 m / 1 km across (GitHub
+// issue #9). A fixed grid, not random jitter: every advert from the same spot gives the
+// same point, so many of them cannot be averaged back to the real one. The position
+// kept on the device, and shown in Settings, stays exact. In its own NVS key.
+static int8_t s_locPrec = -1;
+uint8_t app::locPrecision() {
+  if (s_locPrec < 0) {
+    s_locPrec = 0;
+    Preferences p;
+    if (p.begin("inw-fx", true)) { s_locPrec = min<int>(p.getUChar("locp", 0), 3); p.end(); }
+  }
+  return (uint8_t)s_locPrec;
+}
+void app::setLocPrecision(uint8_t v) {
+  s_locPrec = min<int>(v, 3);
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putUChar("locp", (uint8_t)s_locPrec); p.end(); }
+}
+void inwLocShare(double& lat, double& lon) {
+  static const uint16_t STEP_M[] = {0, 100, 500, 1000};
+  const uint16_t m = STEP_M[app::locPrecision()];
+  if (!m || (lat == 0 && lon == 0)) return;
+  const double dLat = m / 111320.0;
+  lat = (floor(lat / dLat) + 0.5) * dLat;
+  double c = cos(lat * M_PI / 180.0);
+  if (c < 0.01) c = 0.01;
+  const double dLon = m / (111320.0 * c);
+  lon = (floor(lon / dLon) + 0.5) * dLon;
+}
+double inwLocLat() { double la = sensors.node_lat, lo = sensors.node_lon; inwLocShare(la, lo); return la; }
+double inwLocLon() { double la = sensors.node_lat, lo = sensors.node_lon; inwLocShare(la, lo); return lo; }
+
+#if BOARD_HAS_TRACKBALL
+// How far the ball has to roll for one step on the screen: 0 slow, 1 medium, 2 fast.
+// In its own NVS key, the settings blob untouched.
+static int8_t s_ballSpeed = -1;             // -1: not read yet
+uint8_t app::trackballSpeed() {
+  if (s_ballSpeed < 0) {
+    s_ballSpeed = 1;
+    Preferences p;
+    if (p.begin("inw-fx", true)) { s_ballSpeed = min<int>(p.getUChar("tbs", 1), 2); p.end(); }
+  }
+  return (uint8_t)s_ballSpeed;
+}
+void app::setTrackballSpeed(uint8_t s) {
+  s_ballSpeed = min<int>(s, 2);
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putUChar("tbs", (uint8_t)s_ballSpeed); p.end(); }
+  rotary.setSpeed((uint8_t)s_ballSpeed);
+}
+#else
+uint8_t app::trackballSpeed() { return 1; }
+void app::setTrackballSpeed(uint8_t) {}
+#endif
+
+// Night brightness: between two hours of the local clock the screen uses its own, lower
+// level, and goes back by itself in the morning. Off unless a level is set. Kept in its
+// own NVS keys, the settings blob untouched.
+static int16_t s_nightLvl = -1, s_nightFromH = 21, s_nightToH = 7;      // -1: not read yet
+static void nightRead() {
+  if (s_nightLvl >= 0) return;
+  s_nightLvl = 0;
+  Preferences p;
+  if (!p.begin("inw-fx", true)) return;
+  s_nightLvl = min<int>(p.getUChar("nbri", 0), 16);
+  s_nightFromH = p.getUChar("nfrom", 21) % 24;
+  s_nightToH = p.getUChar("nto", 7) % 24;
+  p.end();
+}
+static void nightPut(const char* key, uint8_t v) {
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putUChar(key, v); p.end(); }
+}
+uint8_t app::nightBrightness() { nightRead(); return (uint8_t)s_nightLvl; }
+uint8_t app::nightFrom()       { nightRead(); return (uint8_t)s_nightFromH; }
+uint8_t app::nightUntil()      { nightRead(); return (uint8_t)s_nightToH; }
+void app::setNightBrightness(uint8_t level) {
+  nightRead();
+  s_nightLvl = min<int>(level, 16);
+  nightPut("nbri", (uint8_t)s_nightLvl);
+  app::applyDisplay();
+}
+void app::setNightHours(uint8_t from, uint8_t until) {
+  nightRead();
+  s_nightFromH = from % 24; s_nightToH = until % 24;
+  nightPut("nfrom", (uint8_t)s_nightFromH); nightPut("nto", (uint8_t)s_nightToH);
+  app::applyDisplay();
+}
+bool app::nightNow() {
+  nightRead();
+  if (!s_nightLvl || !app::timeValid() || s_nightFromH == s_nightToH) return false;
+  const time_t t = (time_t)app::now() + regional::offsetMin(app::now()) * 60;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  const int h = tm.tm_hour, a = s_nightFromH, b = s_nightToH;
+  return a < b ? (h >= a && h < b) : (h >= a || h < b);
+}
+uint8_t app::brightnessNow() { return app::nightNow() ? (uint8_t)s_nightLvl : ui_settings.brightness; }
+void app::setBrightnessNow(uint8_t level) {
+  level = constrain((int)level, 1, 16);
+  if (app::nightNow()) { app::setNightBrightness(level); return; }
+  ui_settings.brightness = level;
+  markUiDirty();
+  app::applyDisplay();
+}
+
+void app::applyDisplay() {
+#if BOARD_HAS_TOUCH
+  applyOrientation();
+#endif
+  const uint8_t bright = app::brightnessNow();
+  if (power::saver()) {             // dimmer, and asleep sooner; the saved settings are untouched
+    dimmer.setFull(min<uint8_t>(bright, 4));
+    dimmer.setTimes(min<uint16_t>(ui_settings.dimSecs, 10) * 1000UL, min<uint16_t>(ui_settings.sleepSecs, 30) * 1000UL);
+    return;
+  }
+  dimmer.setFull(bright);
+  dimmer.setTimes(ui_settings.dimSecs * 1000UL, ui_settings.sleepSecs * 1000UL);
+}
+void app::applySound() { jingle.setVolume(ui_settings.sound ? ui_settings.volume : 0); }
+void app::applyHaptics() { haptic.setMode(ui_settings.vibeMode); }
+
+const ThemeSpec& app::themeSpec() { return themes::spec(ui_settings.themeId); }
+
+void app::applyTheme() {
+  const ThemeSpec& th = themeSpec();
+  theme.apply(display, th.palette, th.style);
+  theme.own = themes::isCustom(ui_settings.themeId) && themes::valid(ui_settings.themeId);
+  theme.scene = th.scene;
+  haptic.setPattern(th.vibeMsg.seq, th.vibeMsg.n);
+  haptic.setTick(th.tickEffect, th.tickClamp);
+  nav.invalidate();
+}
+// Contact/channel saves are written by a background task (tools/patch_meshcore.py);
+// these wait for it, and report what it finished.
+bool inwStoreFlush(uint32_t ms);
+void inwStoreTick();
+void inwSetUserBusy(bool busy);
+void inwSetScreenOn(bool on);
+
+static uint32_t s_hizUntil = 0;   // "batt hiz" test running until then
+
+void app::reboot() {
+  battSave(true);
+  if (g_node) {
+    if (g_node->hasPendingWork()) g_node->saveContactsNow();   // contact saves are batched; don't drop one
+    g_node->savePrefsNow();
+  }
+  inwStoreFlush(10000);
+  ui_settings.save(); delay(200); ESP.restart();
+}
+// For after contacts were deleted on purpose: saving the ones still in memory
+// would write straight back what was just forgotten.
+void app::rebootDiscard() {
+  inwStoreFlush(10000);
+  ui_settings.save(); delay(200); ESP.restart();
+}
+
+// ---- power off -----------------------------------------------------------------
+// The PWR button can't be read (it's the charger's QON pin, not a GPIO) and only
+// turns the pager on, so turning it off is ours: hold the side button, confirm
+// with the wheel. PWR held a second, or plugging in, turns it back on.
+static void powerOffShow();                   // the goodbye animation, further down
+static void goodbyeFrame(Canvas& g, uint32_t ms, int32_t brk) { boot::drawGoodbye(g, ms, brk); }
+
+#if BOARD_BATTERY_FROM_VOLTAGE
+static void flatSleep();                      // the flat-battery wait, further down
+#endif
+bool app::powerOff(const char* why) {
+  if (battery.pluggedIn()) return false;      // the charger can't cut the battery with USB in
+  logs.add(LOG_INFO, "powering off (%s)", why);
+  // A flat battery can turn it off in a pocket with the screen dark: no show then.
+  const bool show = !dimmer.asleep();
+  if (g_node) {
+    if (g_node->hasPendingWork()) g_node->saveContactsNow();
+    g_node->savePrefsNow();
+  }
+  ui_settings.save();
+  if (show) powerOffShow();                   // runs the storage flush while it animates
+  else inwStoreFlush(45000);
+  battSave(true);                            // the battery count, for when it comes back on
+  Serial.println("[power] off");
+  Serial.flush();
+  backlight.setLevel(0);
+  battery.shipMode();
+  delay(3000);
+  // Still running: USB went in at the last moment, or the charger didn't take
+  // it. Sleep instead; the side button wakes it with a fresh boot.
+  Serial.println("[power] battery not cut, sleeping instead");
+#if BOARD_BATTERY_FROM_VOLTAGE
+  // Turned off for a flat battery: sleep the way a flat start does, so it looks for a
+  // charge every few minutes and comes back on by itself.
+  if (!strcmp(why, "battery empty")) flatSleep();
+#endif
+  esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, 0);
+  esp_deep_sleep_start();
+  return true;
+}
+
+class PowerOffView : public View {
+public:
+  PowerOffView() : _at(millis()), _plugged(battery.pluggedIn()) { haptic.buzz(1); }
+  void tick() override {
+    if (millis() - _at > 10000) { if (nav.top() == this) nav.pop(); return; }   // left alone: cancel
+    if (battery.pluggedIn() != _plugged) { _plugged = !_plugged; dirty = true; }
+  }
+  void draw(Canvas& g) override {
+    const Theme& t = nav.theme();
+    g.fillRect(0, L::HEAD_Y, L::W, L::H - L::HEAD_Y, t.bg);
+    g.setTextDatum(textdatum_t::middle_center);
+    g.setFont(&fonts::Font4);
+    g.setTextColor(t.txt, t.bg);
+    g.drawString("Power off?", L::W / 2, 80);
+    g.setFont(&fonts::Font2);
+    g.setTextColor(_plugged ? t.red : t.dim, t.bg);
+    g.drawString(_plugged ? "unplug USB first - it can't turn off while plugged in"
+                          : "press Enter (or the wheel) to turn off", L::W / 2, 120);
+    g.setTextColor(t.dim, t.bg);
+    g.drawString("backspace or any other key cancels. PWR turns it back on.", L::W / 2, 146);
+    g.setTextDatum(textdatum_t::top_left);
+  }
+  void press() override { confirm(); }
+  void key(char c) override { if (c == '\n') confirm(); else nav.pop(); }
+  // Turning the wheel does nothing: it's easy to nudge while pressing it, and a
+  // nudge shouldn't cancel (or confirm) anything.
+  void rotate(int) override {}
+  bool backspace() override { nav.pop(); return true; }
+  bool wantsAllKeys() override { return true; }
+private:
+  void confirm() {
+    if (battery.pluggedIn()) { nav.pop(); nav.toast("unplug USB to power off", 3000); return; }
+    app::powerOff("user");
+  }
+  uint32_t _at;
+  bool _plugged;
+};
+
+void app::powerOffPrompt() {
+  dimmer.wake();
+  nav.push(new PowerOffView());
+  nav.invalidate();
+}
+
+// Full-screen progress for slow storage jobs (contact saves, backups). Called from
+// inside them, so it draws straight to the panel rather than through the view stack.
+// done == total == 0 means finished.
+void inwProgress(const char* what, uint32_t done, uint32_t total) {
+  static uint32_t last = 0;
+  static bool shown = false;
+  if (!total) {
+    if (shown) { shown = false; nav.invalidate(); }
+    return;
+  }
+  if (dimmer.asleep()) return;
+  if (shown && done < total && millis() - last < 80) return;
+  last = millis();
+  shown = true;
+  Canvas& g = nav.canvas();
+  const Theme& t = theme;
+  g.fillScreen(t.bg);
+  g.setTextDatum(textdatum_t::top_center);
+  g.setFont(&fonts::Font4);
+  g.setTextColor(t.green, t.bg);
+  g.drawString(what, L::W / 2, 40);
+  g.setFont(&fonts::Font2);
+  g.setTextColor(t.dim, t.bg);
+  g.drawString("please wait, don't power off", L::W / 2, 76);
+  const int x = 30, y = 112, w = L::W - 60, h = 34;
+  const int fill = (int)((uint64_t)(w - 8) * min(done, total) / total);
+  g.drawRoundRect(x, y, w, h, 8, t.green);
+  g.fillRoundRect(x + 4, y + 4, max(fill, 8), h - 8, 5, t.green);
+  char pct[40];
+  snprintf(pct, sizeof(pct), "%u%%  (%lu / %lu kB)", (unsigned)(100ULL * min(done, total) / total),
+           (unsigned long)(done / 1024), (unsigned long)((total + 1023) / 1024));
+  g.setTextColor(t.txt, t.bg);
+  g.drawString(pct, L::W / 2, y + h + 14);
+  g.setTextDatum(textdatum_t::top_left);
+  g.pushSprite(nav.display(), 0, 0);
+}
+void app::lock() { if (!nav.top() || !nav.top()->isLock()) nav.push(makeLockView()); }
+
+// The panel gets its own sleep command a moment after the backlight goes dark.
+static bool s_panelOff = false;
+static uint32_t s_panelAt = 0;   // millis of the last Sleep In or Sleep Out sent to the panel
+// The panel's own rules (its datasheet; LovyanGFX's wakeup() keeps none of them): after
+// Sleep In, 120 ms before Sleep Out; after Sleep Out, a wait before anything else, and
+// it doesn't show its memory properly for a while (its init waits 130 ms). The light
+// only comes up after this returns. Lit while the panel was still asleep or just woken,
+// it showed rainbow static, mostly when a message woke the screen: the light came on
+// first and the panel was told to wake after.
+// The main chip idles at 80 MHz while the screen is dark (the end of loop()). Whatever
+// lights the screen or plays a sound puts it back to 240 first. It used to go back at
+// the end of the pass that woke it: the first picture was drawn, and the alert sound
+// worked out, at a third of the speed - a message's sound came out broken and the
+// screen followed seconds later.
+#if BOARD_SLOW_CPU_WHEN_DARK
+static bool s_cpuSlow = false;
+static void cpuFull() { if (s_cpuSlow) { setCpuFrequencyMhz(240); s_cpuSlow = false; } }
+#else
+static inline void cpuFull() {}
+#endif
+
+static void panelWake() {
+  cpuFull();
+  if (!s_panelOff) return;
+  // The screen is coming on: background saves stop at their next pause from now, not
+  // from the end of this pass of the loop - which, with the wake animation in it, was
+  // most of a second of flash writing under the first pictures.
+  inwSetUserBusy(true);
+  const uint32_t since = millis() - s_panelAt;
+  if (since < 120) delay(120 - since);
+  nav.waitPresented();
+  display.wakeup();
+  delay(120);
+  s_panelAt = millis();
+  s_panelOff = false;
+  nav.invalidate();
+}
+static void panelSleep() {
+  if (s_panelOff || millis() - s_panelAt < 120) return;
+  nav.waitPresented();
+  display.sleep();
+  s_panelAt = millis();
+  s_panelOff = true;
+}
+static bool s_uiReady = false;   // set once setup() is done: no animations while booting
+static bool s_sharedStore = false;   // run from a launcher on its shared "spiffs" (setup)
+static uint32_t s_readyAt = 0;   // when that was
+// Screen-change animations can be turned off (Settings > Display): each one holds the
+// screen for about half a second, and keys typed during it are not seen. Kept in its
+// own NVS key, like the other late additions, so the settings blob's layout is untouched.
+static int8_t s_fxOff = -1;                 // -1: not read yet
+bool app::screenChangesAnimate() {
+  if (s_fxOff < 0) {
+    Preferences p;
+    s_fxOff = 0;
+    if (p.begin("inw-fx", true)) { s_fxOff = p.getBool("off", false) ? 1 : 0; p.end(); }
+  }
+  return s_fxOff == 0;
+}
+void app::setScreenChangesAnimate(bool on) {
+  s_fxOff = on ? 0 : 1;
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putBool("off", !on); p.end(); }
+}
+// Signal bars in the status bar, as Wadamesh has them: how well the last packet was
+// heard. On unless turned off in Settings > Display.
+static int8_t s_sigSz = -1, s_lockSz = -1, s_lockLeft = -1;   // -1: not read yet
+static void sigRead() {
+  if (s_sigSz >= 0) return;
+  s_sigSz = 1; s_lockSz = 1; s_lockLeft = 0;
+  Preferences p;
+  if (!p.begin("inw-fx", true)) return;
+  s_sigSz = min<int>(p.getUChar("sigsz", 1), 2);
+  s_lockSz = min<int>(p.getUChar("locksz", 1), 2);
+  s_lockLeft = p.getBool("lockleft", false) ? 1 : 0;
+  p.end();
+}
+static void sigPut(const char* key, uint8_t v) {
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putUChar(key, v); p.end(); }
+  nav.statusChanged();
+}
+uint8_t app::signalSize()     { sigRead(); return s_sigSz; }
+uint8_t app::lockSignalSize() { sigRead(); return s_lockSz; }
+bool    app::lockSignalLeft() { sigRead(); return s_lockLeft == 1; }
+void app::setSignalSize(uint8_t n)     { sigRead(); s_sigSz = n; sigPut("sigsz", n); }
+void app::setLockSignalSize(uint8_t n) { sigRead(); s_lockSz = n; sigPut("locksz", n); }
+void app::setLockSignalLeft(bool left) {
+  sigRead(); s_lockLeft = left ? 1 : 0;
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putBool("lockleft", left); p.end(); }
+}
+// With nothing heard for the chosen time, and only while the screen is lit, the pager
+// asks the repeaters in direct range to answer (a zero-hop discover: never repeated).
+static int16_t s_sigMins = -1;              // -1: not read yet
+uint8_t app::signalCheckMins() {
+  if (s_sigMins < 0) {
+    Preferences p;
+    s_sigMins = 5;
+    if (p.begin("inw-fx", true)) { s_sigMins = p.getUChar("sigmin", 5); p.end(); }
+  }
+  return (uint8_t)s_sigMins;
+}
+void app::setSignalCheckMins(uint8_t mins) {
+  s_sigMins = mins;
+  Preferences p;
+  if (p.begin("inw-fx", false)) { p.putUChar("sigmin", mins); p.end(); }
+}
+// The bars go dim once the last packet is older than two checks (5 min with checks off).
+int app::signalLevel() {
+  const uint32_t stale = app::signalCheckMins() ? max(300000UL, app::signalCheckMins() * 120000UL) : 300000UL;
+  if (!g_node || !g_node->heardAt || millis() - g_node->heardAt > stale) return 0;
+  int snr = g_node->heardSnr;
+  g_node->bestSnrSince(120000UL, snr);       // the best of the last two minutes, if any
+  return snr >= 5 ? 4 : snr >= 0 ? 3 : snr >= -7 ? 2 : 1;
+}
+// The bars' two animations. While a check is out and unanswered, one bar runs up and
+// back like a ping; when the answer comes, or the level changes, they fill one by one.
+static uint32_t s_sigAsked = 0, s_sigRise = 0;      // millis | 1; 0 = not running
+bool app::signalAnimating() {
+  const uint32_t now = millis();
+  return (s_sigAsked && now - s_sigAsked < 3000) || (s_sigRise && now - s_sigRise < 600);
+}
+uint8_t app::signalMask() {
+  const uint32_t now = millis();
+  if (s_sigAsked && now - s_sigAsked < 3000) {
+    static const uint8_t ping[6] = {1, 2, 4, 8, 4, 2};
+    return ping[((now - s_sigAsked) / 110) % 6];
+  }
+  int n = signalLevel();
+  if (s_sigRise && now - s_sigRise < 600) n = min(n, (int)((now - s_sigRise) / 130));
+  return (uint8_t)((1 << n) - 1);
+}
+// Keys read while the loop is held up (a screen-change animation runs for half a
+// second) wait here, in order, until the loop takes them. Without this the T-Deck's
+// keyboard, which remembers only the last key pressed, lost what was typed meanwhile.
+static KeyEvent s_keyq[24];
+static uint8_t s_keyHead = 0, s_keyTail = 0;
+void app::keysPump() {
+  KeyEvent ev;
+  while (keyboard.read(ev)) {
+    const uint8_t next = (uint8_t)((s_keyHead + 1) % 24);
+    if (next == s_keyTail) break;                 // full: the rest stay with the keyboard
+    s_keyq[s_keyHead] = ev;
+    s_keyHead = next;
+  }
+}
+static bool nextKey(KeyEvent& ev) {
+  if (s_keyTail != s_keyHead) { ev = s_keyq[s_keyTail]; s_keyTail = (uint8_t)((s_keyTail + 1) % 24); return true; }
+  return keyboard.read(ev);
+}
+
+bool app::animationsOk() { return s_uiReady && !dimmer.asleep() && !s_panelOff; }
+
+// The side button waking the screen: the theme's turn-on animation, revealing
+// whatever is on top (usually the lock screen), then back to normal drawing.
+static void screenWakeAnimated() {
+  panelWake();
+  nav.cancelTransition();                        // the wake animation is the transition
+  nav.tick();                                    // let the top view catch up (the clock, say)
+  nav.compose();
+  nav.waitPresented();
+  display.fillScreen(TFT_BLACK);
+  dimmer.wakeInstant();
+  fx::screenOn(nav.canvas());
+  nav.invalidate();
+}
+
+static bool quietHours();
+// Plugged in: the theme's charge chime and one tap, like a phone. Quiet hours
+// keep it silent; the screen still shows the charge mark.
+void app::pluggedInFeedback() {
+  cpuFull();
+  nav.statusChanged();
+  if (!dimmer.asleep()) fx::charge(app::batteryPct());   // the theme's charging splash
+  if (quietHours()) return;
+  // Full already: no chime and no tap. A charger tops a full cell up again and again,
+  // and each top-up looked like plugging in.
+  if (app::batteryPct() >= 95) return;
+  if (ui_settings.vibrate) { static const uint8_t TAP[] = {47}; haptic.pattern(TAP, 1); }
+  if (ui_settings.sound) jingle.play(themeSpec().charge);
+}
+
+void app::testNotify() {
+  haptic.pattern(app::themeSpec().vibeDm.seq, app::themeSpec().vibeDm.n);
+  if (ui_settings.sound) jingle.play(app::themeSpec().dm);
+  nav.banner("Test", "this is what a new message looks like");
+}
+
+bool app::myPosition(double& lat, double& lon) {
+  if (gps.hasFix()) { lat = gps.fix().lat; lon = gps.fix().lon; return true; }
+  if (g_node && (g_node->prefs().node_lat != 0 || g_node->prefs().node_lon != 0)) {
+    lat = g_node->prefs().node_lat; lon = g_node->prefs().node_lon; return true;
+  }
+  return false;
+}
+
+double app::distanceKm(double lat1, double lon1, double lat2, double lon2) {
+  const double r = 6371.0, p = M_PI / 180.0;
+  const double a = 0.5 - cos((lat2 - lat1) * p) / 2 + cos(lat1 * p) * cos(lat2 * p) * (1 - cos((lon2 - lon1) * p)) / 2;
+  return 2 * r * asin(sqrt(a));
+}
+
+const char* app::fmtDistance(double km) {
+  static char b[16];
+  if (ui_settings.miles) {
+    const double mi = km * 0.621371;
+    if (mi < 0.1) snprintf(b, sizeof(b), "%d ft", (int)(mi * 5280));
+    else if (mi < 10) snprintf(b, sizeof(b), "%.1f mi", mi);
+    else snprintf(b, sizeof(b), "%d mi", (int)lround(mi));
+  } else {
+    if (km < 1) snprintf(b, sizeof(b), "%d m", (int)(km * 1000));
+    else if (km < 10) snprintf(b, sizeof(b), "%.1f km", km);
+    else snprintf(b, sizeof(b), "%d km", (int)lround(km));
+  }
+  return b;
+}
+
+// Background contact saves and the daily backup stall the pager for seconds behind
+// a progress screen. Hold them until the screen is off so they never land while
+// someone is using it. If the screen has somehow been on for a whole day, go ahead
+// rather than sit on a day of changes.
+static uint32_t s_lastDarkAt = 0;
+bool inwCanSaveNow() {
+  return dimmer.asleep() || millis() - s_lastDarkAt > 24UL * 3600UL * 1000UL;
+}
+
+static bool s_gpsRail = true;   // bringup powers every rail
+void gpsPower(bool on) {
+  if (on == s_gpsRail) return;
+  s_gpsRail = on;
+#if BOARD_GPS_SLEEP_BY_COMMAND
+  // No switch for the GPS on this board: ask the module itself to sleep (gps.h).
+  // Before this the "off" below did nothing here and the GPS ran around the clock.
+  if (on) gps.wakeByCommand(); else gps.sleepByCommand();
+#else
+  if (on) { expander.enableRail(EXP_GPS_EN, 20); gps.begin(); }
+  else expander.digitalWrite(EXP_GPS_EN, LOW);
+#endif
+}
+
+// GPS draws ~25 mA, more than the rest of the pager put together once the screen
+// is off, and it used to stay on around the clock. Keep it on while the screen is
+// on; with the screen off, give it a two-minute window every half hour so the
+// clock and the advert position stay fresh.
+static void gpsSchedule() {
+  // Range test, SOS and the trail need a live position whatever the settings say.
+  // When the last of them stops, hand the rail back to the normal rules.
+  static bool fieldHad = false;
+  if (field::wantsGps()) { fieldHad = true; gpsPower(true); return; }
+  if (fieldHad) { fieldHad = false; if (!ui_settings.gpsOn || power::saver()) gpsPower(false); }
+  if (!ui_settings.gpsOn || power::saver()) return;   // those paths switch it themselves
+#if BOARD_RADIO_ONLY_WHEN_DARK
+  // Dark means dark, with one exception. A GPS with no fix yet has to listen for a minute
+  // or more without a break, and the screen is rarely on that long (the lock face goes
+  // dark in ten seconds): put to sleep at every dark, it said "searching" all day. So a
+  // module that is heard but has had no fix in the last two hours is left running in the
+  // dark until it has one, for three minutes in all. If those run out without a fix
+  // (indoors), it rests half an hour before the next three, then one hour, two, four:
+  // a T-Deck kept indoors pays next to nothing for this.
+  static uint32_t tickAt = 0, restUntil = 0, settleUntil = 0;
+  static int32_t allowance = 180000;    // ms of running in the dark still to be had
+  static uint8_t misses = 0;
+  static bool window = false;
+  const uint32_t now = millis();
+  if (now - tickAt >= 1000) {
+    const uint32_t dt = tickAt ? now - tickAt : 0;
+    tickAt = now;
+    const bool recent = gps.fix().updatedAt && now - gps.fix().updatedAt < 2UL * 3600UL * 1000UL;
+    if (gps.fresh()) { misses = 0; restUntil = 0; allowance = 180000; }
+    if (restUntil && (int32_t)(now - restUntil) >= 0) { restUntil = 0; allowance = 180000; }
+    bool want = false;
+    if (dimmer.asleep() && gps.goodSentences) {
+      if (!recent) want = !restUntil && allowance > 0;
+      else if (window) {                // just found: fifteen seconds more, for a steadier position
+        if (!settleUntil) settleUntil = (now + 15000UL) | 1;
+        want = (int32_t)(now - settleUntil) < 0;
+      }
+    }
+    if (!want) settleUntil = 0;
+    if (want && !window) logs.add(LOG_INFO, "gps: no fix yet, left on in the dark");
+    if (!want && window && dimmer.asleep())
+      logs.add(LOG_INFO, recent ? "gps: fix found in the dark, asleep" : "gps: no fix in the dark, resting");
+    window = want;
+    if (window && !recent) {
+      allowance -= (int32_t)dt;
+      if (allowance <= 0) {             // used up without a fix: rest, longer each time
+        restUntil = (now + (1800000UL << misses)) | 1;
+        if (misses < 3) misses++;
+      }
+    }
+  }
+#else
+  const bool window = millis() % 1800000UL < 120000UL;
+#endif
+  gpsPower(!dimmer.asleep() || window);
+}
+
+// ---- alerts ------------------------------------------------------------------------------------
+static bool quietHours() {
+  if (ui_settings.dnd) return true;
+  if (!ui_settings.dndSchedule || !app::timeValid()) return false;
+  const time_t t = (time_t)app::now() + regional::offsetMin(app::now()) * 60;
+  struct tm tm;
+  gmtime_r(&t, &tm);
+  const uint8_t h = tm.tm_hour, a = ui_settings.dndStart, b = ui_settings.dndEnd;
+  return a <= b ? (h >= a && h < b) : (h >= a || h < b);
+}
+
+enum class AlertKind : uint8_t { Msg, Dm, Mention };
+
+// open: what tapping its banner opens (touchscreens), usually its conversation.
+static void alert(const char* title, const char* text, AlertKind kind, bool silent = false,
+                  std::function<void()> open = nullptr) {
+  const ThemeSpec& th = app::themeSpec();
+  const Jingle* sound = kind == AlertKind::Dm ? th.dm : kind == AlertKind::Mention ? th.mention : th.msg;
+  const VibePattern& vibe = kind == AlertKind::Dm ? th.vibeDm : kind == AlertKind::Mention ? th.vibeMention : th.vibeMsg;
+  cpuFull();
+  if (ui_settings.wakeOnMessage && !silent) dimmer.wake();
+  nav.banner(title, text, 4500, std::move(open));
+  if (silent || quietHours()) return;
+  if (ui_settings.vibrate) haptic.pattern(vibe.seq, vibe.n);
+  if (ui_settings.sound) jingle.play(sound);
+  if (ui_settings.kbFlash) { keyboard.setBacklight(255); s_kbFlashUntil = millis() + 2500; }
+  ext::alert();
+}
+
+static void onNodeEvent(NodeEvent e, const void* arg) {
+  switch (e) {
+    case NodeEvent::DirectMsg:
+    case NodeEvent::RoomMsg: {
+      const ContactInfo* c = (const ContactInfo*)arg;
+      const ConvKey k = ConvKey::contact(c->id.pub_key);
+      HistMsg* m = history.last(k);
+      if (!m) return;
+      const bool open = g_openConv == k && !dimmer.asleep();
+      if (open) { history.markRead(k); if (ui_settings.keyHaptics) haptic.tick(); return; }
+      const bool room = e == NodeEvent::RoomMsg;
+      const uint8_t mode = notifyMode(k);
+      if (mode == NM_MUTED) return;
+      if (mode == NM_MENTIONS && !(m->flags & HF_MENTION)) return;
+      if (mode == NM_DEFAULT && (room ? !ui_settings.notifyRoom : !ui_settings.notifyDM)) return;
+      char text[200];
+      if (room) snprintf(text, sizeof(text), "%s: %s", m->sender, m->text);
+      else strlcpy(text, m->text, sizeof(text));
+      uint8_t pub[PUB_KEY_SIZE];
+      memcpy(pub, c->id.pub_key, sizeof(pub));
+      alert(c->name, text, room ? AlertKind::Msg : AlertKind::Dm, mode == NM_SILENT,
+            [pub] { app::openThreadForContact(pub); });
+      break;
+    }
+    case NodeEvent::ChannelMsg: {
+      const int idx = *(const int*)arg;
+      ChannelDetails ch;
+      if (!g_node || idx < 0 || !g_node->getChannel(idx, ch)) return;
+      const ConvKey k = ConvKey::channel(ch.channel.secret);
+      HistMsg* m = history.last(k);
+      if (!m) return;
+      if (ui_settings.ignoreOneChar && strlen(m->text) <= 1) { if (g_openConv == k) history.markRead(k); return; }
+      if (g_openConv == k && !dimmer.asleep()) { history.markRead(k); return; }
+      const bool mention = m->flags & HF_MENTION;
+      const uint8_t mode = notifyMode(k);
+      if (mode == NM_MUTED) return;
+      if (mode == NM_MENTIONS && !mention) return;
+      if (mode == NM_DEFAULT) {                     // the global channel settings
+        if (!ui_settings.notifyChannel && !mention) return;
+        if (ui_settings.channelMentionsOnly && !mention) return;
+      }
+      char title[48], text[200];
+      snprintf(title, sizeof(title), "%s%s", ch.name, mention ? "  @you" : "");
+      snprintf(text, sizeof(text), "%s: %s", m->sender, m->text);
+      alert(title, text, mention ? AlertKind::Mention : AlertKind::Msg, mode == NM_SILENT,
+            [idx] { app::openThreadForChannel(idx); });
+      break;
+    }
+    case NodeEvent::NewContact:
+      if (ui_settings.notifyNewContact) nav.banner("New contact", ((const ContactInfo*)arg)->name, 3000, [] { app::openContacts(); });
+      break;
+    case NodeEvent::Failed: {
+      HistMsg* m = history.find(*(const uint32_t*)arg);
+      if (m && !(g_openConv == m->conv)) nav.toast("a message was not delivered");
+      break;
+    }
+    case NodeEvent::LoginOk:   nav.toast(g_node->loginIsAdmin() ? "logged in as admin" : "logged in"); break;
+    case NodeEvent::LoginFail: nav.toast("login failed or timed out"); break;
+#if INW_DEV
+    case NodeEvent::Regions:   // the scan screen reads it; the developer build prints it
+      Serial.printf("[regions] %s: %s\n", ((const ContactInfo*)arg)->name, g_node->regionsReply.names);
+      break;
+#endif
+    default: break;
+  }
+  nav.statusChanged();
+}
+
+// ---- screenshot -----------------------------------------------------------------------------------
+static void takeScreenshot() {
+  if (!sdMount()) { nav.toast("no sd card"); return; }
+  if (!SD.exists("/screenshots")) SD.mkdir("/screenshots");
+  char path[48];
+  snprintf(path, sizeof(path), "/screenshots/inw_%lu.bmp", (unsigned long)(app::timeValid() ? app::now() : millis()));
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) { nav.toast("sd write failed"); return; }
+  const int W = L::W, H = L::H;
+  const uint32_t rowBytes = W * 3, dataSize = rowBytes * H, fileSize = 54 + dataSize;
+  uint8_t hdr[54] = { 'B', 'M' };
+  auto put32 = [&](int o, uint32_t v) { hdr[o] = v; hdr[o + 1] = v >> 8; hdr[o + 2] = v >> 16; hdr[o + 3] = v >> 24; };
+  put32(2, fileSize); put32(10, 54); put32(14, 40); put32(18, W); put32(22, H);
+  hdr[26] = 1; hdr[28] = 24; put32(34, dataSize);
+  f.write(hdr, 54);
+  static uint8_t row[L::W * 3];
+  lgfx::rgb888_t px[L::W];
+  nav.waitPresented();
+  for (int y = H - 1; y >= 0; y--) {
+    display.readRect(0, y, W, 1, px);
+    for (int x = 0; x < W; x++) { row[x * 3] = px[x].b; row[x * 3 + 1] = px[x].g; row[x * 3 + 2] = px[x].r; }
+    f.write(row, rowBytes);
+  }
+  f.close();
+  nav.toast("screenshot saved to sd");
+}
+
+// ---- USB commands ------------------------------------------------------------------------------------
+// A few line commands on the USB serial port, for capturing documentation
+// screenshots from a computer (tools/capture_screens.py):
+//   shot        stream the screen: "SHOT565 480 222\n" then W*H big-endian RGB565 words
+//   theme N     switch theme
+//   key C       press a key (\n for enter)
+//   home, lock, wheel +N / -N, press
+//   ext         what is plugged into the top header, and what IO9 is doing
+//   dfu         restart into the ROM's USB download mode, ready for esptool or
+//               the web installer (flash with --before no_reset)
+
+// The flag that sends the chip into download mode sits in the RTC domain, which
+// the battery keeps alive, so clear it as soon as we're running: one trip into
+// flash mode can never turn into a device that always boots there.
+static void clearForceDownloadBoot() { REG_WRITE(RTC_CNTL_OPTION1_REG, 0); }
+
+// Restarts into the chip's own download mode: no BOOT/RESET buttons needed.
+void app::rebootToFlashMode() {
+  if (g_node) {
+    if (g_node->hasPendingWork()) g_node->saveContactsNow();
+    g_node->savePrefsNow();
+  }
+  inwStoreFlush(10000);
+  ui_settings.save();
+  Serial.println("[INW] restarting into usb flash mode");
+  Serial.flush();
+  delay(200);
+  REG_WRITE(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+  esp_restart();
+}
+
+// The owner's own themes, from squatchmesh.com/theme-maker (themestore.h). The page
+// asks what is here, sends one, takes one away, or picks which is showing:
+//   themes               -> "[themes] v=1 max=4 active=ID count=N", a "[theme] id=ID <line>"
+//                           for each of the owner's, then "[themes] end"
+//   theme-set <line>     -> "[theme-set] ok id=ID name=NAME", and it is the theme showing
+//   theme-del ID         -> "[theme-del] ok id=ID active=ID"
+//   theme-use ID         -> "[theme-use] ok id=ID" (a built-in one, or one of the owner's)
+// <line> is theme_custom.h's. Only colours and a name come in, and nothing goes out
+// but the same back, so these answer in every build and with the screen locked.
+static bool themeCommand(const char* line) {
+  char out[themeline::LINE_LEN + 4];
+  if (!strcmp(line, "themes")) {
+    Serial.printf("[themes] v=1 max=%u active=%u count=%u\n", (unsigned)themes::CUSTOM_MAX,
+                  (unsigned)ui_settings.themeId, (unsigned)(themes::count() - THEME_COUNT));
+    for (uint8_t n = THEME_COUNT; n < themes::count(); n++) {
+      const uint8_t id = themes::idAt(n);
+      themeline::format(*themes::custom(id), out, sizeof(out));
+      Serial.printf("[theme] id=%u %s\n", (unsigned)id, out);
+    }
+    Serial.println("[themes] end");
+    return true;
+  }
+  auto show = [](uint8_t id) {
+    ui_settings.themeId = id;
+    app::applyTheme();
+    markUiDirty();
+  };
+  auto relist = [] { if (View* v = nav.top()) v->resume(); };     // the Theme menu, if it is the one open
+  if (!strncmp(line, "theme-set ", 10)) {
+    CustomTheme t;
+    const char* why = "";
+    if (!themeline::parse(line + 10, t, &why)) { Serial.printf("[theme-set] failed: %s\n", why); return true; }
+    const int id = themes::put(t);
+    if (id < 0) {
+      Serial.printf("[theme-set] failed: %s\n", id == -1 ? "full: it already has four of your own, take one off first" : "couldn't be saved");
+      return true;
+    }
+    show((uint8_t)id);
+    relist();
+    const ThemeSpec& sp = themes::spec((uint8_t)id);
+    snprintf(out, sizeof(out), "theme \"%s\" added", sp.name);
+    nav.toast(out, 3500);
+    logs.add(LOG_INFO, "theme added over usb (slot %d)", id - themes::CUSTOM_BASE);
+    Serial.printf("[theme-set] ok id=%d name=%s\n", id, sp.name);
+    return true;
+  }
+  if (!strncmp(line, "theme-del ", 10) || !strncmp(line, "theme-use ", 10)) {
+    const bool del = line[6] == 'd';
+    const char* tag = del ? "theme-del" : "theme-use";
+    char* end = nullptr;
+    const long id = strtol(line + 10, &end, 10);
+    if (end == line + 10 || *end || id < 0 || id > 255 || !themes::valid((uint8_t)id) || (del && !themes::isCustom((uint8_t)id))) {
+      Serial.printf("[%s] failed: no such theme\n", tag);
+      return true;
+    }
+    if (!del) { show((uint8_t)id); Serial.printf("[theme-use] ok id=%ld\n", id); return true; }
+    // Taking away the one showing: back to the built-in look it wore.
+    const uint8_t look = themes::custom((uint8_t)id)->look;
+    themes::remove((uint8_t)id);
+    if (ui_settings.themeId == id) show(look < THEME_COUNT ? look : 0);
+    relist();
+    nav.invalidate();
+    Serial.printf("[theme-del] ok id=%ld active=%u\n", id, (unsigned)ui_settings.themeId);
+    return true;
+  }
+  return false;
+}
+
+#if INW_DEV
+static uint32_t s_devNotifyAt = 0, s_devNotifyT0 = 0;   // "notify N": when it fires, and when it fired
+static uint32_t s_fcLeft = 0, s_fcFrames = 0, s_fcBadFrames = 0, s_fcWorst = 0;   // "framecheck N"
+static bool s_fcDrawn = false;
+#endif
+
+static void usbCommands() {
+  static char line[themeline::LINE_LEN + 12];      // the longest thing sent: "theme-set " and a theme
+  static uint8_t n = 0;
+#if INW_DEV && INW_TDECK
+  // "framecheck N": N frames through the real path, one every other pass of the loop
+  // (so the radio and everything else run while each is on its way), each read back
+  // off the panel afterwards and compared with what was sent.
+  if (s_fcLeft && !dimmer.asleep()) {
+    if (!s_fcDrawn) { nav.invalidate(); s_fcDrawn = true; }      // the next pass draws and sends it
+    else if (!nav.top() || !nav.top()->dirty) {                  // it has been drawn: look at what arrived
+      s_fcDrawn = false;
+      nav.waitPresented();
+      Canvas& f = nav.lastFrame();
+      static lgfx::rgb888_t px[L::W];
+      uint32_t bad = 0;
+      int firstRow = -1, rows = 0;
+      for (int y = 0; y < L::H; y++) {
+        display.readRect(0, y, L::W, 1, px);
+        bool rowBad = false;
+        for (int x = 0; x < L::W; x++) {
+          const auto want = f.readPixelRGB(x, y);
+          if (((px[x].r ^ want.r) | (px[x].g ^ want.g) | (px[x].b ^ want.b)) & 0xF0) { bad++; rowBad = true; }
+        }
+        if (rowBad) { rows++; if (firstRow < 0) firstRow = y; }
+      }
+      s_fcFrames++;
+      if (bad) {
+        s_fcBadFrames++;
+        if (bad > s_fcWorst) s_fcWorst = bad;
+        if (s_fcBadFrames <= 6) Serial.printf("[framecheck] frame %lu: %lu pixels wrong in %d rows from row %d\n", (unsigned long)s_fcFrames, (unsigned long)bad, rows, firstRow);
+      }
+      if (!--s_fcLeft) {
+        Serial.printf("[framecheck] '%s' %s, %lu MHz: %lu of %lu frames arrived wrong (worst %lu pixels)\n", g_screenTitle,
+                      nav.asyncPush ? "sent from the other core" : "sent from the loop", (unsigned long)(display.writeFreq() / 1000000UL),
+                      (unsigned long)s_fcBadFrames, (unsigned long)s_fcFrames, (unsigned long)s_fcWorst);
+        nav.invalidate();
+      }
+    }
+  }
+#endif
+#if INW_DEV
+  if (s_devNotifyAt && (int32_t)(millis() - s_devNotifyAt) >= 0) {
+    s_devNotifyAt = 0;
+    s_devNotifyT0 = millis() | 1;
+    Serial.printf("[notify] alert now (screen %s, cpu %lu MHz)\n", dimmer.asleep() ? "dark" : "on", (unsigned long)getCpuFrequencyMhz());
+    alert("Test", "wake timing test", AlertKind::Dm);
+  }
+  if (s_devNotifyT0 && !dimmer.asleep() && !backlight.fading()) {
+    Serial.printf("[notify] screen lit %lu ms after the alert (cpu %lu MHz, light %u of 16)\n", (unsigned long)(millis() - s_devNotifyT0),
+                  (unsigned long)getCpuFrequencyMhz(), backlight.level());
+    s_devNotifyT0 = 0;
+  }
+#endif
+  while (Serial.available()) {
+    const char c = Serial.read();
+    if (c != '\n' && c != '\r') { if (n < sizeof(line) - 1) line[n++] = c; continue; }
+    line[n] = 0;
+    n = 0;
+    if (!line[0]) continue;
+    // Every build answers the web installer's two questions: "status" (what is on
+    // it) and "save" (put everything on flash before it is reset).
+    if (!strcmp(line, "status")) {
+      // board= lets the web installer refuse to put one board's firmware on another.
+      // The pager has always left it out, so no board means a pager.
+#ifdef OTA_BOARD
+      Serial.printf("[status] fw=%s radio=%s radio_ok=%d contacts=%d board=" OTA_BOARD "\n",
+#else
+      Serial.printf("[status] fw=%s radio=%s radio_ok=%d contacts=%d\n",
+#endif
+                    FW_VERSION, radio_chip, s_radioOk ? 1 : 0,
+                    g_node ? g_node->getNumContacts() : -1);
+      continue;
+    }
+    // The browser installer sends this before it resets the pager, so nothing
+    // learned since the last lazy write is lost to the flash. Cheap enough to
+    // run on demand: contacts are only written if there is something pending.
+    if (!strcmp(line, "save")) {
+      if (g_node) {
+        if (g_node->hasPendingWork()) g_node->saveContactsNow();
+        g_node->savePrefsNow();
+      }
+      ui_settings.save();
+      // Someone is about to flash (the web installer, or a developer). Writes that wait
+      // for the screen to go dark (inwSetUserBusy) go now: a dropped frame doesn't
+      // matter here, and with the screen on they waited past the 10 s, answered
+      // "slow", and the last minutes' changes could miss the update.
+      inwSetUserBusy(false);
+      const bool landed = inwStoreFlush(10000);      // "ok" means on flash, not just queued
+      Serial.printf("[save] %s contacts=%d\n", landed ? "ok" : "slow", g_node ? g_node->getNumContacts() : -1);
+      continue;
+    }
+    // The installer's two tick boxes, sent once the firmware it wrote is up: "start
+    // fresh" (contacts, channels and messages go; keys, name and Wi-Fi stay) and
+    // "reset everything". Only a mark is left here: the wipe is done on the restart,
+    // before anything is running (dataio.h).
+    if (!strcmp(line, "wipe-keep-keys") || !strcmp(line, "wipe-everything")) {
+      const bool all = !strcmp(line, "wipe-everything");
+      const bool ok = wipeRequest(all);
+      Serial.printf("[wipe] %s %s\n", ok ? "ok" : "failed", all ? "everything" : "keep-keys");
+      Serial.flush();
+      if (ok) { delay(500); ESP.restart(); }
+      continue;
+    }
+    if (themeCommand(line)) continue;
+#if INW_DEV   // the rest is for the developer build (pio run -e t-lora-pager-dev), never a release:
+              // diagnostics, remote control for screenshots, test commands
+    // "eco on" / "eco off": the Settings switch, for testing.
+    if (!strcmp(line, "eco on") || !strcmp(line, "eco off")) {
+      const bool ok = power::setEco(line[5] == 'n');
+      Serial.printf("[cpu] eco %s%s\n", power::eco() ? "on" : "off", ok ? "" : " (could not save)");
+      continue;
+    }
+    // "cpu": ECO's state and why the last dark minutes did or didn't sleep.
+    if (!strcmp(line, "cpu") || !strcmp(line, "cpu reset")) {
+      if (line[3]) { power::resetSleepDiagnostics(dimmer.asleep()); Serial.println("[cpu] diagnostics reset"); continue; }
+      Serial.printf("[cpu] eco=%d clock=%lu MHz sleep=%s count=%lu last=%lu ms max=%lu ms total=%llu ms wake=%lu fails=%lu\n",
+                    power::eco() ? 1 : 0, (unsigned long)power::cpuClockMhz(), power::lightSleepStatus(),
+                    (unsigned long)power::lightSleepCount(), (unsigned long)power::lightSleepLastMs(),
+                    (unsigned long)power::lightSleepMaxMs(), (unsigned long long)(power::lightSleepMicros() / 1000ULL),
+                    (unsigned long)power::lightSleepWakeCause(), (unsigned long)power::sleepFailureCount());
+      power::printSleepDiagnostics();
+      continue;
+    }
+    // Radio repair tests (from the pager, 2026-11-19): knock the chip out of its settings
+    // the way it was found and watch radioDeafWatch() put it right. "radio" alone: state.
+    if ((!strcmp(line, "radio") || !strncmp(line, "radio ", 6)) && !strcmp(radio_chip, "SX1262")) {
+      const char* what = line[5] ? line + 6 : "";
+      uint8_t v;
+      if (!*what) {
+        Serial.printf("[radio] dio1=%d flag=%d missed_irq_picked_up=%u standby_restarts=%u set_up_again=%u (%s) meshcore_state=%u sync=%04X\n",
+                      digitalRead(PIN_LORA_DIO1), inwRadioFlagPending() ? 1 : 0, (unsigned)s_radioKicks,
+                      (unsigned)s_radioRxKicks, (unsigned)s_radioSetups, s_radioSetupWhy[0] ? s_radioSetupWhy : "-",
+                      (unsigned)inwRadioState(), (unsigned)radioSyncWord());
+      }
+      else if (!strcmp(what, "setup")) radioSetupAgain("usb command");
+      else if (!strcmp(what, "break stby")) { radio.standby(); }
+      else if (!strcmp(what, "break gfsk")) {
+        radio.standby(); v = RADIOLIB_SX126X_PACKET_TYPE_GFSK;
+        radio.getMod()->SPIwriteStream(RADIOLIB_SX126X_CMD_SET_PACKET_TYPE, &v, 1);
+      } else if (!strcmp(what, "break 16")) {
+        radio.standby(); v = 0x10;
+        radio.getMod()->SPIwriteStream(RADIOLIB_SX126X_CMD_SET_PACKET_TYPE, &v, 1, true, false);
+        inwRadioSetIdle();
+      } else if (!strcmp(what, "break sync")) {
+        const uint8_t sw[2] = {0x34, 0x44};             // the public LoRaWAN sync word
+        radio.writeRegister(RADIOLIB_SX126X_REG_LORA_SYNC_WORD_MSB, (uint8_t*)sw, 2);
+      } else { Serial.println("[radio] radio | radio setup | radio break stby|gfsk|16|sync"); continue; }
+      char st[160]; radioChipState(st, sizeof(st));
+      Serial.printf("[radio] %s -> chip %s sync=%04X\n", *what ? what : "state", st, (unsigned)radioSyncWord());
+      continue;
+    }
+    // Anyone with a USB cable could send "press" or "key" to get past the lock
+    // screen, or "shot" to read what's on it. While locked (or dark, which locks)
+    // only commands that don't reveal or unlock anything are accepted.
+#if INW_LAYOUT_PREVIEW
+    const bool locked = false;   // the tdeck-preview build: screenshots of every screen from a script
+#else
+    const bool locked = dimmer.asleep() || (nav.top() && nav.top()->isLock());
+#endif
+    if (locked && (!strcmp(line, "shot") || !strcmp(line, "home") || !strcmp(line, "press") || !strcmp(line, "extpage") ||
+                   !strncmp(line, "key ", 4) || !strncmp(line, "wheel ", 6) || !strncmp(line, "theme ", 6))) {
+      Serial.println("[usb] pager is locked: unlock it on the device first");
+      continue;
+    }
+    // What the installer's two wipes would remove and keep, without doing either.
+    if (!strcmp(line, "wipe-dry") || !strcmp(line, "wipe-dry-all")) { wipeDryRun(line[8] == '-'); continue; }
+    // Diagnostic for the "a website update wipes my settings" report: how full
+    // NVS is, what it holds, and the settings most likely to be noticed missing.
+    if (!strcmp(line, "nvs")) {
+      nvs_stats_t st;
+      if (nvs_get_stats(nullptr, &st) == ESP_OK)
+        Serial.printf("[nvs] used %d / %d entries (%d free, %d namespaces)\n",
+                      st.used_entries, st.total_entries, st.free_entries, st.namespace_count);
+      else
+        Serial.println("[nvs] stats unavailable");
+      Preferences p;
+      if (p.begin("inw-ui", true)) {
+        Serial.printf("[nvs] inw-ui ver=%u blob=%u free=%u\n", p.getUChar("ver", 0),
+                      (unsigned)p.getBytesLength("blob"), (unsigned)p.freeEntries());
+        p.end();
+      } else Serial.println("[nvs] inw-ui missing");
+      if (p.begin("inw-keep", true)) {
+        Serial.printf("[nvs] inw-keep id=%u ch=%u pr=%u\n", (unsigned)p.getBytesLength("id"),
+                      (unsigned)p.getBytesLength("ch"), (unsigned)p.getBytesLength("pr"));
+        p.end();
+      } else Serial.println("[nvs] inw-keep missing");
+      Serial.printf("[ui] theme=%u bright=%u wifi=%d beta=%d lockOnSleep=%d wheelUnlock=%d vol=%u tz=%d zone=%u setup=%u\n",
+                    ui_settings.themeId, ui_settings.brightness, ui_settings.wifiOn,
+                    ui_settings.betaUpdates, ui_settings.lockOnSleep, ui_settings.wheelUnlock,
+                    ui_settings.volume, ui_settings.tzMinutes, ui_settings.tzZone, ui_settings.setupDone);
+      Serial.printf("[files] channels2=%d prefs=%d identity=%d contacts3=%d\n",
+                    (int)(SPIFFS.exists("/channels2") ? SPIFFS.open("/channels2").size() : -1),
+                    (int)(SPIFFS.exists("/prefs.json") ? SPIFFS.open("/prefs.json").size() : -1),
+                    (int)(SPIFFS.exists("/identity/_main.id") ? SPIFFS.open("/identity/_main.id").size() : -1),
+                    (int)(SPIFFS.exists("/contacts3") ? SPIFFS.open("/contacts3").size() : -1));
+      continue;
+    }
+    // "set <name> <value>" for the handful of settings worth putting back over
+    // USB after NVS has been wiped. Refused while locked, like "theme": a cable
+    // must not be able to turn the lock screen off.
+    if (!strncmp(line, "set ", 4)) {
+      if (locked) { Serial.println("[usb] pager is locked: unlock it on the device first"); continue; }
+      char name[24] = "";
+      long v = 0;
+      if (sscanf(line + 4, "%23s %ld", name, &v) != 2) { Serial.println("[set] usage: set <name> <value>"); continue; }
+      UiSettings& u = ui_settings;
+      bool known = true;
+      if (!strcmp(name, "theme") && v >= 0 && v < THEME_COUNT) u.themeId = v;
+      else if (!strcmp(name, "bright") && v >= 1 && v <= 16) u.brightness = v;
+      else if (!strcmp(name, "vol") && v >= 0 && v <= 100) u.volume = v;
+      else if (!strcmp(name, "wifi")) u.wifiOn = v != 0;
+      else if (!strcmp(name, "beta")) u.betaUpdates = v != 0;
+      else if (!strcmp(name, "lock")) u.lockOnSleep = v != 0;
+      else if (!strcmp(name, "wheel")) u.wheelUnlock = v != 0;
+      else if (!strcmp(name, "tz")) { u.tzMinutes = v; u.tzZone = 0; }
+      else if (!strcmp(name, "zone") && v >= 0 && v <= regional::ZONE_COUNT) u.tzZone = v;
+      else known = false;
+      if (!known) { Serial.printf("[set] unknown setting '%s'\n", name); continue; }
+      u.save();
+      app::applyTheme(); app::applyDisplay(); app::applySound();
+      markUiDirty(); nav.invalidate();
+      Serial.printf("[set] %s = %ld\n", name, v);
+      continue;
+    }
+    // How much SPIFFS is in use and how many files are in it: MeshCore keeps one
+    // advert blob per contact, and SPIFFS gets slow when a directory grows.
+    if (!strcmp(line, "fs")) {
+      Serial.printf("[fs] spiffs %u / %u bytes used\n",
+                    (unsigned)SPIFFS.usedBytes(), (unsigned)SPIFFS.totalBytes());
+      File root = SPIFFS.open("/");
+      int files = 0; size_t bytes = 0;
+      for (File f = root.openNextFile(); f; f = root.openNextFile()) { files++; bytes += f.size(); }
+      Serial.printf("[fs] %d files, %u bytes\n", files, (unsigned)bytes);
+      continue;
+    }
+    if (!strncmp(line, "sd ", 3)) {         // the card: info | ls | keep | gpt | back | format (dataio.cpp)
+      Serial.printf("[sd] %s: %s\n", line + 3, sdTest(line + 3));
+      continue;
+    }
+    if (!strcmp(line, "backup")) {          // same job as Settings -> back up to sd now
+      Serial.printf("[backup] %s\n", sdBackupNow(true));
+      continue;
+    }
+#if INW_DEV
+    // Test of putting lost messages back (history_rescue.cpp): "histloss" leaves the
+    // message log as a full store's tidy-up used to - empty - and restarts; the start
+    // should put them back from the card. "histcount": how many history holds.
+    if (!strcmp(line, "histcount")) { Serial.printf("[hist] %u messages, %u put back at this start\n", (unsigned)history.size(), (unsigned)history.rescued()); continue; }
+    if (!strcmp(line, "histloss")) {
+      extern void inwDropPath(const char* path);
+      inwDropPath("/hist.log");
+      inwStoreFlush(10000);
+      File f = SPIFFS.open("/hist.log", FILE_WRITE);
+      if (f) f.close();
+      Serial.println("[hist] message log emptied; restarting");
+      Serial.flush();
+      delay(300);
+      ESP.restart();
+    }
+#endif
+    if (!strcmp(line, "log")) {             // the on-device log, including "slow" stalls
+      for (uint8_t i = 0; i < logs.count(); i++) Serial.printf("[log] %s\n", logs.line(i));
+      Serial.println("[log] end");
+      continue;
+    }
+    if (!strcmp(line, "batt")) { battery.report(); continue; }
+    if (!strcmp(line, "gauge")) { battery.configReport(); continue; }   // read-only gauge settings
+#if INW_DEV   // developer build only (pio run -e t-lora-pager-dev); never in a release
+    // Animations, for checking them with the cable in. One frame as a screenshot:
+    //   gbframe -1 / gbframe N   the goodbye screen saving / N ms into the teardown
+    //   fx on P / fx off P / fx down P   a transition at P% over the current screen
+    // or played live: fx play on|off|down|ping|burst|check|fail|charge
+    auto streamShot = [](lgfx::LovyanGFX& src, Canvas& buf) {
+      (void)src;
+      Serial.flush();
+      Serial.printf("SHOT565 %d %d\n", L::W, L::H);
+      Serial.write((const uint8_t*)buf.getBuffer(), L::W * L::H * 2);
+      Serial.flush();
+    };
+    // Wi-Fi: "wifijoin SSID|PASS" tries once without saving anything, "wifiscan"
+    // scans, "wifi" prints the state the screens show.
+    if (!strncmp(line, "wifijoin ", 9)) {
+      char* bar = strchr(line + 9, '|');
+      if (bar) { *bar = 0; wifi::testJoin(line + 9, bar + 1); Serial.println("[wifi] joining"); }
+      continue;
+    }
+    if (!strcmp(line, "wifiscan")) { wifi::startScan(); Serial.println("[wifi] scan started"); continue; }
+    if (!strcmp(line, "wifi")) {
+      Serial.printf("[wifi] status: %s | tile: %s\n", wifi::statusText(), wifi::shortStatus());
+      for (uint8_t i = 0; i < wifi::savedCount(); i++)
+        Serial.printf("[wifi] saved %u: %s | %s\n", i, wifi::savedSsid(i), wifi::savedState(i));
+      Serial.printf("[wifi] scan %s, %d found\n", wifi::scanDone() ? "done" : "not done", wifi::scanCount());
+      continue;
+    }
+    // "io9 N": the IO9 mode for now (not saved), then an alert, for checking the pin.
+    if (!strncmp(line, "io9 ", 4)) {
+      ui_settings.io9Mode = atoi(line + 4) % 3;
+      ext::applyPin();
+      ext::alert();
+      Serial.printf("[ext] io9 mode %u\n", ui_settings.io9Mode);
+      continue;
+    }
+#if BOARD_HAS_EXT_HEADER   // the pager's top socket: nothing to fake or draw on a board without one
+    // "extfake": made-up sensor readings, and the telemetry they would send.
+    if (!strcmp(line, "extfake")) {
+      ext::fake();
+      CayenneLPP lpp(64);
+      ext::telemetry(lpp);
+      Serial.print("[ext] lpp");
+      for (uint8_t i = 0; i < lpp.getSize(); i++) Serial.printf(" %02X", lpp.getBuffer()[i]);
+      Serial.println();
+      continue;
+    }
+    // "extshot N": the Top header page (Tools), N rows down, as a screenshot.
+    if (!strncmp(line, "extshot", 7)) {
+      Canvas& g = nav.canvas();
+      g.fillScreen(theme.bg);
+      drawStatusBar(g, theme);
+      ext::drawPage(g, atoi(line + 7));
+      streamShot(display, g);
+      nav.invalidate();
+      continue;
+    }
+#endif
+    if (!strncmp(line, "gbframe ", 8)) {
+      Canvas& g = nav.canvas();
+      goodbyeFrame(g, 1234, atoi(line + 8));
+      streamShot(g, g);
+      nav.invalidate();
+      continue;
+    }
+    // "fx on 40 t2": optional tN renders in theme N just for this frame; the
+    // setting itself is put back untouched.
+    if (!strncmp(line, "fx on ", 6) || !strncmp(line, "fx off ", 7) || !strncmp(line, "fx down ", 8)) {
+      const uint8_t kind = line[3] == 'o' && line[4] == 'n' ? 0 : line[3] == 'o' ? 1 : 2;
+      const float p = atoi(line + (kind == 0 ? 6 : kind == 1 ? 7 : 8)) / 100.0f;
+      const char* tp = strstr(line, " t");
+      const uint8_t saved = ui_settings.themeId;
+      if (tp && atoi(tp + 2) < THEME_COUNT) { ui_settings.themeId = atoi(tp + 2); app::applyTheme(); }
+      Canvas* o = fx::scratch();
+      if (o) {
+        nav.compose();
+        fx::render(kind, nav.canvas(), *o, p);
+        streamShot(*o, *o);
+      } else Serial.println("[fx] no memory for the scratch frame");
+      if (ui_settings.themeId != saved) { ui_settings.themeId = saved; app::applyTheme(); }
+      nav.invalidate();
+      continue;
+    }
+    // "fx fx NAME tN": an overlay effect frozen partway, as a screenshot:
+    // NAME is ping, burst, check or charge, drawn over the current screen.
+    if (!strncmp(line, "fx fx ", 6)) {
+      const char* w = line + 6;
+      const char* tp = strstr(line, " t");
+      const uint8_t saved = ui_settings.themeId;
+      if (tp && atoi(tp + 2) < THEME_COUNT) { ui_settings.themeId = atoi(tp + 2); app::applyTheme(); }
+      if (!strncmp(w, "ping", 4))   { fx::ping(L::W / 2 - 60, L::H / 2); fx::ping(L::W / 2 + 60, L::H / 2); }
+      if (!strncmp(w, "burst", 5))  fx::burst(L::W / 2, L::H / 2);
+      if (!strncmp(w, "check", 5))  fx::check(L::W / 2, L::H / 2);
+      if (!strncmp(w, "charge", 6)) fx::charge(73);
+      delay(!strncmp(w, "charge", 6) ? 900 : !strncmp(w, "check", 5) ? 350 : 220);
+      nav.compose();
+      if (!strncmp(w, "radar", 5)) {                 // the Discover scope, mid-sweep, with blips
+        Canvas& g = nav.canvas();
+        g.fillRect(0, L::BODY_Y, L::W, L::H - L::BODY_Y, theme.bg);
+        fx::radar(g, 92, 132, 82, 0.9f);
+        fx::blip(g, 120, 100, 0, false);
+        fx::blip(g, 60, 160, 0, true);
+        fx::blip(g, 140, 170, 1, false);
+      }
+      fx::draw(nav.canvas());
+      streamShot(nav.canvas(), nav.canvas());
+      if (ui_settings.themeId != saved) { ui_settings.themeId = saved; app::applyTheme(); }
+      nav.invalidate();
+      continue;
+    }
+    if (!strncmp(line, "fx play ", 8)) {
+      const char* w = line + 8;
+      if (!strcmp(w, "on"))        { nav.compose(); nav.waitPresented(); display.fillScreen(TFT_BLACK); fx::screenOn(nav.canvas()); }
+      else if (!strcmp(w, "off"))  { nav.compose(); fx::screenOff(nav.canvas()); delay(400); }
+      else if (!strcmp(w, "down")) { nav.compose(); fx::powerDown(nav.canvas()); delay(400); }
+      else if (!strcmp(w, "ping"))   { fx::ping(L::W / 2, L::H / 2); fx::ping(120, 120); }
+      else if (!strcmp(w, "burst"))  fx::burst(L::W / 2, L::H / 2);
+      else if (!strcmp(w, "check"))  fx::check(L::W / 2, L::H / 2);
+      else if (!strcmp(w, "fail"))   fx::fail();
+      else if (!strcmp(w, "charge")) fx::charge(app::batteryPct());
+      Serial.printf("[fx] played %s\n", w);
+      nav.invalidate();
+      continue;
+    }
+    // "tr fwd|back|unlock|lock|wake|sleep MS tN": a screen change MS ms in, as a
+    // screenshot, in theme N: from the current screen to a stand-in "new screen"
+    // (unlock starts from the lock screen, lock ends on it).
+    // "trlive KIND tN": the same played on the panel, printing its frame rate.
+    const bool trLive = !strncmp(line, "trlive ", 7);
+    if (!strncmp(line, "tr ", 3) || trLive) {
+      char kindName[12] = "";
+      int ms = 100;
+      sscanf(line + (trLive ? 7 : 3), "%11s %d", kindName, &ms);
+      const fx::Trans kind = !strcmp(kindName, "back") ? fx::Trans::Back : !strcmp(kindName, "unlock") ? fx::Trans::Unlock
+                           : !strcmp(kindName, "lock") ? fx::Trans::Lock : !strcmp(kindName, "wake") ? fx::Trans::Wake
+                           : !strcmp(kindName, "sleep") ? fx::Trans::Sleep : fx::Trans::Forward;
+      const char* tp = strstr(line, " t");
+      const uint8_t saved = ui_settings.themeId;
+      if (tp && atoi(tp + 2) < THEME_COUNT) { ui_settings.themeId = atoi(tp + 2); app::applyTheme(); }
+      Canvas to;
+      to.setColorDepth(16);
+      to.setPsram(true);
+      Canvas* out = fx::scratch();
+      if (out && to.createSprite(L::W, L::H)) {
+        View* lockView = (kind == fx::Trans::Unlock || kind == fx::Trans::Lock) ? makeLockView() : nullptr;
+        nav.compose();                               // "from": whatever is showing
+        if (kind == fx::Trans::Unlock) lockView->draw(nav.canvas());
+        if (kind == fx::Trans::Lock) lockView->draw(to);
+        else {
+          to.fillScreen(theme.bg);
+          drawStatusBar(to, theme);
+          drawHeader(to, "New screen", "demo");
+          to.setFont(&fonts::Font4);
+          to.setTextColor(theme.green, theme.bg);
+          to.drawString("Squatch Mesh", 24, 60);
+          to.setFont(&fonts::Font2);
+          for (int i = 0; i < 5; i++) {
+            const int y = 100 + i * 22;
+            if (i == 1) to.fillRect(0, y - 2, L::W, 22, theme.focus);
+            to.setTextColor(i == 1 ? theme.green : theme.txt, i == 1 ? theme.focus : theme.bg);
+            to.drawString(i == 0 ? "messages" : i == 1 ? "contacts" : i == 2 ? "map" : i == 3 ? "tools" : "settings", 24, y);
+          }
+        }
+        delete lockView;
+        if (trLive) {
+          nav.waitPresented();
+          nav.canvas().pushSprite(&display, 0, 0);
+          const uint32_t f0 = fx::framesDrawn(), t0 = millis();
+          fx::transition(kind, nav.canvas(), to);
+          const uint32_t el = millis() - t0, n = fx::framesDrawn() - f0;
+          Serial.printf("[tr] %s theme %u: %lu frames in %lu ms, %.1f fps\n", kindName, ui_settings.themeId,
+                        (unsigned long)n, (unsigned long)el, n * 1000.0f / (el ? el : 1));
+#if INW_TDECK
+          // What the screen change left on the panel, against the picture it was going to
+          // (it is drawn in strips, not as one frame: nothing else checks those).
+          if (kind != fx::Trans::Sleep) {
+            static lgfx::rgb888_t px[L::W];
+            uint32_t bad = 0;
+            int rows = 0, firstRow = -1;
+            for (int y = 0; y < L::H; y++) {
+              display.readRect(0, y, L::W, 1, px);
+              bool rowBad = false;
+              for (int x = 0; x < L::W; x++) {
+                const auto want = to.readPixelRGB(x, y);
+                if (((px[x].r ^ want.r) | (px[x].g ^ want.g) | (px[x].b ^ want.b)) & 0xF0) { bad++; rowBad = true; }
+              }
+              if (rowBad) { rows++; if (firstRow < 0) firstRow = y; }
+            }
+            Serial.printf("[trcheck] %s at %lu MHz: %lu pixels left wrong in %d rows (first row %d)\n", kindName,
+                          (unsigned long)(display.writeFreq() / 1000000UL), (unsigned long)bad, rows, firstRow);
+          }
+#endif
+          delay(700);
+        } else {
+          fx::transitionFrame(kind, nav.canvas(), to, *out, ms);
+          Serial.printf("[trframe] %s %d t%u\n", kindName, ms, ui_settings.themeId);   // says which picture follows
+          streamShot(*out, *out);
+        }
+        to.deleteSprite();
+      } else Serial.println("[fx] no memory");
+      if (ui_settings.themeId != saved) { ui_settings.themeId = saved; app::applyTheme(); }
+      nav.invalidate();
+      continue;
+    }
+    // "drawtime tN": how long the current screen takes to draw into the canvas and
+    // to send to the panel, averaged over 5, in theme N (the setting is put back).
+    // Speed work. "prof": where one frame of the current screen goes (clearing, the
+    // status bar, the screen itself, the overlays, sending it). "unlock" / "dark": off
+    // the lock face / screen off, without touching it. "notify N": a test message
+    // alert N seconds from now (so the screen can be dark first), timed until the
+    // screen is lit. "tb": pulses counted on each trackball line.
+    if (!strcmp(line, "prof")) {
+      View* v = nav.top();
+      Canvas& g = nav.canvas();
+      if (!v) continue;
+      nav.waitPresented();
+      auto timed = [](const std::function<void()>& f) { f(); const uint32_t t0 = micros(); for (int i = 0; i < 5; i++) f(); return (unsigned long)((micros() - t0) / 5); };
+      const unsigned long clr = timed([&] { g.fillScreen(theme.bg); });
+      const unsigned long bar = timed([&] { drawStatusBar(g, theme, !v->hasClock()); });
+      const unsigned long scr = timed([&] { v->draw(g); });
+      const unsigned long ovl = timed([&] { nav.drawOverlays(g); });
+      const unsigned long snd = timed([&] { g.pushSprite(&display, 0, 0); });
+      Serial.printf("[prof] '%s' lock=%d theme %u: clear %lu us, bar %lu, screen %lu, overlays %lu, send %lu = %lu us a frame (%.1f fps)\n",
+                    g_screenTitle, v->isLock() ? 1 : 0, ui_settings.themeId, clr, bar, scr, ovl, snd, clr + bar + scr + ovl + snd,
+                    1e6f / (float)(clr + bar + scr + ovl + snd));
+#if BOARD_HAS_TOUCH
+      {
+        extern uint32_t g_dashUs[4];
+        if (v->isHome())
+          Serial.printf("[prof] home: lists %lu us, clock %lu, messages card %lu, dock %lu\n", (unsigned long)g_dashUs[0],
+                        (unsigned long)g_dashUs[1], (unsigned long)g_dashUs[2], (unsigned long)g_dashUs[3]);
+      }
+      Serial.printf("[prof] internal RAM %u kB free, largest block %u kB\n", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+                    (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+#endif
+      nav.invalidate();
+      continue;
+    }
+    // "fps N": N frames of the current screen through the real path (draw, then send),
+    // back to back. "scrcheck": send the current screen, read the panel back and count
+    // the pixels that came back different - a link too fast for the panel shows here.
+    if (!strncmp(line, "fps", 3)) {
+      const int n = max(5, atoi(line + 3));
+      nav.waitPresented();
+      const uint32_t t0 = micros();
+      for (int i = 0; i < n; i++) { nav.invalidate(); nav.draw(); }
+      nav.waitPresented();
+      const uint32_t us = micros() - t0;
+      Serial.printf("[fps] '%s': %d frames in %lu ms = %.1f fps\n", g_screenTitle, n, (unsigned long)(us / 1000), n * 1e6f / (float)us);
+      continue;
+    }
+    // "cadence N": N real frames, timing each one, to see how even the frame rate is
+    // (uneven frame times make time-based motion look like it speeds up and slows down).
+    if (!strncmp(line, "cadence", 7)) {
+      const int n = max(5, atoi(line + 7));
+      nav.waitPresented();
+      uint32_t lo = 0xFFFFFFFF, hi = 0, sum = 0;
+      for (int i = 0; i < n; i++) {
+        const uint32_t a = micros();
+        nav.invalidate(); nav.draw();          // present() inside waits for the prior push, then kicks this one
+        const uint32_t d = micros() - a;
+        if (d < lo) lo = d; if (d > hi) hi = d; sum += d;
+      }
+      nav.waitPresented();
+      const uint32_t avg = sum / n;
+      Serial.printf("[cadence] '%s': per frame min %lu us (%.0f fps), avg %lu us (%.0f fps), max %lu us (%.0f fps); spread %lu us\n",
+                    g_screenTitle, (unsigned long)lo, 1e6f / lo, (unsigned long)avg, 1e6f / avg,
+                    (unsigned long)hi, 1e6f / hi, (unsigned long)(hi - lo));
+      continue;
+    }
+#if BOARD_SCENE_STEP_MS
+    // "scenestep N": the lock scene's ms per step (the sasquatch's walking pace), live.
+    if (!strncmp(line, "scenestep", 9)) {
+      extern uint32_t g_sceneStepMs;
+      if (line[9]) g_sceneStepMs = max(10, atoi(line + 9));
+      Serial.printf("[scenestep] %lu ms a step\n", (unsigned long)g_sceneStepMs);
+      continue;
+    }
+#endif
+    // "loopcad": how even the real loop's drawn frames have been since the last call
+    // (this reflects the frame pacing; "cadence" above measures raw cost without it).
+    if (!strcmp(line, "loopcad")) {
+      extern uint32_t inwLoopCad(uint32_t*, uint32_t*, uint32_t*);
+      uint32_t mn = 0, mx = 0, av = 0;
+      const uint32_t c = inwLoopCad(&mn, &mx, &av);
+      if (c) Serial.printf("[loopcad] %lu frames: interval min %lu ms (%.0f fps), avg %lu ms (%.0f fps), max %lu ms (%.0f fps); spread %lu ms\n",
+                           (unsigned long)c, (unsigned long)mn, 1000.0f / (mn ? mn : 1), (unsigned long)av, 1000.0f / (av ? av : 1),
+                           (unsigned long)mx, 1000.0f / (mx ? mx : 1), (unsigned long)(mx - mn));
+      else Serial.println("[loopcad] no frames recorded");
+      continue;
+    }
+#if BOARD_FRAME_MS
+    if (!strncmp(line, "pace", 4)) {
+      extern uint32_t g_paceMs;
+      if (line[4]) g_paceMs = max(10, atoi(line + 4));
+      Serial.printf("[pace] frame interval %lu ms (%.0f fps)\n", (unsigned long)g_paceMs, 1000.0f / g_paceMs);
+      continue;
+    }
+#endif
+#if INW_TDECK
+    // "framecheck N" (above). "async 0|1": frames sent from the loop / from the other
+    // core. "spi 40|80": the speed they are sent at, in MHz.
+    // "panel": what the panel itself says it is doing (awake, showing, inverted, colour
+    // mode) and the backlight's level - a picture can be right in its memory and still
+    // look wrong if the panel was left in the wrong mode. "wake": as a click of the
+    // trackball wakes it.
+    if (!strcmp(line, "panel")) {
+      nav.waitPresented();
+      auto* pn = display.getPanel();
+      const uint32_t st = pn->readCommand(0x09, 0, 4), pm = pn->readCommand(0x0A, 0, 1) & 0xFF, mad = pn->readCommand(0x0B, 0, 1) & 0xFF,
+                     col = pn->readCommand(0x0C, 0, 1) & 0xFF, im = pn->readCommand(0x0D, 0, 1) & 0xFF;
+      Serial.printf("[panel] status %08lx power %02lx (sleep-out %lu, display-on %lu, normal %lu, idle %lu, partial %lu) madctl %02lx colmod %02lx image %02lx (inverted %lu) | light %u of 16, dimmer %s, panelOff %d, cpu %lu MHz\n",
+                    (unsigned long)st, (unsigned long)pm, (unsigned long)((pm >> 4) & 1), (unsigned long)((pm >> 2) & 1), (unsigned long)((pm >> 3) & 1),
+                    (unsigned long)((pm >> 6) & 1), (unsigned long)((pm >> 5) & 1), (unsigned long)mad, (unsigned long)col, (unsigned long)im,
+                    (unsigned long)((im >> 5) & 1), backlight.level(), dimmer.asleep() ? "asleep" : dimmer.dimmed() ? "dim" : "full", s_panelOff ? 1 : 0,
+                    (unsigned long)getCpuFrequencyMhz());
+      continue;
+    }
+    // "wifibounce": Wi-Fi off, then on again in the background, as a wake on battery does it.
+    if (!strcmp(line, "wifibounce")) { wifi::setEnabled(false); delay(300); wifi::setEnabled(true, true); Serial.println("[wifi] bounced"); continue; }
+    // "wifiglitch": does a picture sent while the Wi-Fi radio starts arrive whole? Wi-Fi
+    // off, then started in the background, and at once 40 pictures are sent one after
+    // another, each followed by a look at every 8th row of what the panel took.
+    if (!strcmp(line, "wifiglitch")) {
+      nav.waitPresented();
+      nav.compose();
+      Canvas& g = nav.canvas();
+      static lgfx::rgb888_t px[L::W];
+      wifi::setEnabled(false);
+      delay(600);
+      const uint32_t t0 = millis();
+      wifi::setEnabled(true, true);
+      uint32_t badFrames = 0, worst = 0;
+      String when;
+      for (int i = 0; i < 40; i++) {
+        const uint32_t at = millis() - t0;
+        g.pushSprite(&display, 0, 0);
+        uint32_t bad = 0;
+        for (int y = 4; y < L::H; y += 8) {
+          display.readRect(0, y, L::W, 1, px);
+          for (int x = 0; x < L::W; x++) {
+            const auto want = g.readPixelRGB(x, y);
+            if (((px[x].r ^ want.r) | (px[x].g ^ want.g) | (px[x].b ^ want.b)) & 0xF0) bad++;
+          }
+        }
+        if (bad) { badFrames++; if (bad > worst) worst = bad; if (when.length() < 80) when += String(at) + "ms:" + String(bad) + " "; }
+      }
+      Serial.printf("[wifiglitch] %lu MHz: %lu of 40 pictures sent during a Wi-Fi start arrived wrong (worst %lu of 9600 pixels looked at) %s| took %lu ms\n",
+                    (unsigned long)(display.writeFreq() / 1000000UL), (unsigned long)badFrames, (unsigned long)worst, when.c_str(), (unsigned long)(millis() - t0));
+      nav.invalidate();
+      continue;
+    }
+    // "peek": what is on the panel right now against the last picture sent, nothing
+    // drawn or sent first. "pshot": the panel's own picture, read back and sent as
+    // "shot" sends the canvas - what the eye sees, not what was meant.
+    if (!strcmp(line, "peek") || !strcmp(line, "pshot")) {
+      nav.waitPresented();
+      Canvas& f = nav.lastFrame();
+      static lgfx::rgb888_t px[L::W];
+      static uint16_t out[L::W];
+      const bool send = line[1] == 's';
+      uint32_t bad = 0, badCanvas = 0;
+      Canvas& cv = nav.canvas();
+      int rows = 0, firstRow = -1, lastRow = -1;
+      if (send) { Serial.flush(); Serial.printf("SHOT565 %d %d\n", L::W, L::H); }
+      for (int y = 0; y < L::H; y++) {
+        display.readRect(0, y, L::W, 1, px);
+        bool rowBad = false;
+        for (int x = 0; x < L::W; x++) {
+          const auto want = f.readPixelRGB(x, y);
+          if (((px[x].r ^ want.r) | (px[x].g ^ want.g) | (px[x].b ^ want.b)) & 0xF0) { bad++; rowBad = true; }
+          const auto wc = cv.readPixelRGB(x, y);
+          if (((px[x].r ^ wc.r) | (px[x].g ^ wc.g) | (px[x].b ^ wc.b)) & 0xF0) badCanvas++;
+          const uint16_t c = ((px[x].r & 0xF8) << 8) | ((px[x].g & 0xFC) << 3) | (px[x].b >> 3);
+          out[x] = (uint16_t)((c << 8) | (c >> 8));
+        }
+        if (rowBad) { rows++; if (firstRow < 0) firstRow = y; lastRow = y; }
+        if (send) Serial.write((const uint8_t*)out, sizeof(out));
+      }
+      if (send) Serial.flush();
+      Serial.printf("\n[peek] '%s' lock=%d: %lu pixels on the panel differ from the last picture sent, in %d rows (%d to %d)\n", g_screenTitle,
+                    nav.top() && nav.top()->isLock() ? 1 : 0, (unsigned long)bad, rows, firstRow, lastRow);
+      Serial.printf("[peek2] against the drawing buffer: %lu differ | sent so far: %lu from the other core, %lu from the loop, %lu screen changes, %lu custom\n",
+                    (unsigned long)badCanvas, (unsigned long)nav.nAsync, (unsigned long)nav.nSync, (unsigned long)nav.nTrans, (unsigned long)nav.nCustom);
+      continue;
+    }
+    if (!strcmp(line, "wake")) { if (dimmer.asleep()) { if (ui_settings.lockOnSleep) app::lock(); screenWakeAnimated(); } continue; }
+    if (!strncmp(line, "framecheck", 10)) { s_fcLeft = max(1, atoi(line + 10)); s_fcFrames = s_fcBadFrames = s_fcWorst = 0; s_fcDrawn = false; dimmer.note(); continue; }
+    if (!strncmp(line, "async ", 6)) { nav.waitPresented(); nav.asyncPush = line[6] == '1'; Serial.printf("[async] %d\n", nav.asyncPush); continue; }
+    if (!strncmp(line, "spi ", 4)) { nav.waitPresented(); display.writeFreq((uint32_t)atoi(line + 4) * 1000000UL); Serial.printf("[spi] %lu MHz\n", (unsigned long)(display.writeFreq() / 1000000UL)); nav.invalidate(); continue; }
+    if (!strncmp(line, "framebench", 10)) {
+      const int n = max(10, atoi(line + 10));
+      nav.waitPresented();
+      Canvas& g = nav.canvas();
+      uint32_t t0 = micros();
+      for (int i = 0; i < n; i++) nav.compose();           // redraw: fillScreen + status bar + the view
+      const uint32_t drawUs = (micros() - t0) / n;
+      t0 = micros();
+      for (int i = 0; i < n; i++) g.pushSprite(&display, 0, 0);  // the whole 320x240 to the panel
+      const uint32_t pushUs = (micros() - t0) / n;
+      // The same push, but only the list body (below the status bar): what a partial
+      // push during a scroll would send. SPI time is linear in rows, so scale it.
+      const uint32_t bodyUs = (uint32_t)((uint64_t)pushUs * (L::H - L::STATUS_H) / L::H);
+      const uint32_t frameUs = drawUs + pushUs, bodyFrameUs = drawUs + bodyUs;
+      Serial.printf("[framebench] '%s' at %lu MHz, %d each: redraw %lu us, full push %lu us -> %lu us/frame (%lu fps). "
+                    "body-only push %lu us -> %lu us/frame (%lu fps).\n",
+                    g_screenTitle, (unsigned long)(display.writeFreq() / 1000000UL), n,
+                    (unsigned long)drawUs, (unsigned long)pushUs, (unsigned long)frameUs,
+                    (unsigned long)(frameUs ? 1000000UL / frameUs : 0),
+                    (unsigned long)bodyUs, (unsigned long)bodyFrameUs,
+                    (unsigned long)(bodyFrameUs ? 1000000UL / bodyFrameUs : 0));
+      nav.invalidate();
+      continue;
+    }
+#endif
+    if (!strcmp(line, "scrcheck")) {
+      nav.waitPresented();
+      nav.compose();
+      Canvas& g = nav.canvas();
+      g.pushSprite(&display, 0, 0);
+      static lgfx::rgb888_t px[L::W];
+      uint32_t bad = 0, black = 0, white = 0;
+      for (int y = 0; y < L::H; y++) {
+        display.readRect(0, y, L::W, 1, px);
+        for (int x = 0; x < L::W; x++) {
+          const auto want = g.readPixelRGB(x, y);
+          // The panel keeps 6 bits a colour of the 5-6-5 sent: the top four must match.
+          if (((px[x].r ^ want.r) | (px[x].g ^ want.g) | (px[x].b ^ want.b)) & 0xF0) bad++;
+          if (!px[x].r && !px[x].g && !px[x].b) black++;
+          if (px[x].r > 250 && px[x].g > 250 && px[x].b > 250) white++;
+        }
+      }
+      Serial.printf("[scrcheck] '%s': %lu of %d pixels read back different (read back: %lu black, %lu white)\n", g_screenTitle,
+                    (unsigned long)bad, L::W * L::H, (unsigned long)black, (unsigned long)white);
+      nav.invalidate();
+      continue;
+    }
+    if (!strcmp(line, "unlock")) { if (nav.top() && nav.top()->isLock()) nav.pop(); dimmer.note(); nav.invalidate(); Serial.println("[usb] unlocked"); continue; }
+    if (!strcmp(line, "dark")) { dimmer.sleepNow(); Serial.println("[usb] screen off"); continue; }
+    if (!strncmp(line, "notify", 6)) { s_devNotifyAt = (millis() + (uint32_t)atoi(line + 6) * 1000UL) | 1; Serial.println("[notify] armed"); continue; }
+    // "roll DX DY": the trackball rolled that far. "ask": the update question with a
+    // long set of notes, to see that all of it shows.
+    if (!strncmp(line, "roll ", 5)) { int dx = 0, dy = 0; sscanf(line + 5, "%d %d", &dx, &dy); nav.roll(dx, dy); nav.invalidate(); continue; }
+#if BOARD_HAS_TOUCH
+    // "drag DY": a finger in the middle of the screen moved DY pixels (down is positive).
+    // "tap X Y": a tap there.
+    if (!strncmp(line, "drag ", 5) || !strncmp(line, "tap ", 4)) {
+      TouchEvent te = {};
+      int a = 0, b = 0;
+      sscanf(line + (line[0] == 'd' ? 5 : 4), "%d %d", &a, &b);
+      if (line[0] == 'd') { te.type = TouchEvent::Drag; te.x = te.x0 = L::W / 2; te.y0 = L::H / 2; te.y = L::H / 2 + a; te.dy = a; }
+      else { te.type = TouchEvent::Tap; te.x = te.x0 = a; te.y = te.y0 = b; }
+      nav.touch(te);
+      nav.invalidate();
+      continue;
+    }
+    // "pinch S [X Y]": two fingers at their spread S times what it was, about (X, Y) (the
+    // middle of the screen if left out); "pinchend": they lift. "map": open the map.
+    if (!strncmp(line, "pinch ", 6) || !strcmp(line, "pinchend")) {
+      TouchEvent te = {};
+      float sc = 1; int x = L::W / 2, y = L::H / 2;
+      if (line[5] == ' ') sscanf(line + 6, "%f %d %d", &sc, &x, &y);
+      te.type = line[5] == ' ' ? TouchEvent::Pinch : TouchEvent::PinchEnd;
+      te.x = te.x0 = x; te.y = te.y0 = y; te.scale = sc;
+      nav.touch(te);
+      nav.invalidate();
+      continue;
+    }
+    if (!strcmp(line, "map")) { app::openMap(0, 0, nullptr); continue; }
+#endif
+    if (!strcmp(line, "qr")) { qr::showMine(); nav.invalidate(); continue; }   // the "show my QR code" screen
+    if (!strcmp(line, "ask")) {
+      confirm("Update to 1.2.12?", "1.2.12 beta: the automatic backup's interval can be set, and a failed update check says so in words. takes about a minute; messages pause while it downloads.", [] {});
+      continue;
+    }
+    // "touch": what the touch chip is set to report, and the fingers on it right now.
+    if (!strcmp(line, "touch")) {
+      bool d; int16_t x, y, x2 = -1, y2 = -1;
+      touchPanel.poll(d, x, y);
+      const bool two = touchPanel.second(x2, y2);
+      Serial.printf("[touch] reports up to %u fingers; now: %s (%d,%d)%s", touchPanel.maxTouches(),
+                    d ? "down" : "up", x, y, two ? " and a second" : "\n");
+      if (two) Serial.printf(" (%d,%d)\n", x2, y2);
+      continue;
+    }
+    if (!strcmp(line, "tb")) {
+      uint32_t n[4];
+      tdeck_tb::counts(n);
+      Serial.printf("[tb] up %lu down %lu left %lu right %lu\n", (unsigned long)n[0], (unsigned long)n[1], (unsigned long)n[2], (unsigned long)n[3]);
+      continue;
+    }
+    if (!strncmp(line, "drawtime", 8)) {
+      const char* tp = strstr(line, " t");
+      const uint8_t saved = ui_settings.themeId;
+      if (tp && atoi(tp + 2) < THEME_COUNT) { ui_settings.themeId = atoi(tp + 2); app::applyTheme(); }
+      nav.compose();                                // warm up (first draw builds caches)
+      uint32_t t0 = millis();
+      for (int i = 0; i < 5; i++) nav.compose();
+      const uint32_t c = (millis() - t0) / 5;
+      t0 = millis();
+      nav.waitPresented();
+      for (int i = 0; i < 5; i++) nav.canvas().pushSprite(&display, 0, 0);
+      const uint32_t p = (millis() - t0) / 5;
+      Serial.printf("[draw] theme %u, top '%s' lock=%d: draw %lums, send %lums\n", ui_settings.themeId,
+                    g_screenTitle, nav.top() && nav.top()->isLock() ? 1 : 0, (unsigned long)c, (unsigned long)p);
+      if (ui_settings.themeId != saved) { ui_settings.themeId = saved; app::applyTheme(); }
+      nav.invalidate();
+      continue;
+    }
+    // "snd": a 1 s test tone, reporting each stage of the audio path.
+    if (!strcmp(line, "snd")) {
+      uint8_t o[2] = {0, 0}, c[2] = {0, 0};
+      const bool er = expander.regs(o, c);
+      Serial.printf("[snd] codec ok=%d sound=%d vol=%u busy=%d; expander read=%d out %02X %02X cfg %02X %02X\n", codec.ok(),
+                    ui_settings.sound, ui_settings.volume, jingle.playing(), er, o[0], o[1], c[0], c[1]);
+      expander.digitalWrite(EXP_AMP_EN, HIGH);
+      expander.regs(o, c);
+      Serial.printf("[snd] amp on: out %02X cfg %02X (pin 1 must be out=1, cfg=0)\n", o[0], c[0]);
+      delay(60);
+      if (!codec.start()) Serial.println("[snd] codec start FAILED");
+      else {
+        codec.setVolumePercent(90);
+        codec.setMute(false);
+        Serial.print("[snd] regs");
+        const uint8_t rs[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x10,
+                              0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x1B, 0x1C, 0x31, 0x32, 0x37, 0x44, 0x45};
+        for (uint8_t r : rs) Serial.printf(" %02X=%02X", r, codec.reg(r));
+        Serial.println();
+        Serial.print("[snd] gdma out peri_sel");
+        for (int ch = 0; ch < 5; ch++) Serial.printf(" ch%d=%u", ch, (unsigned)GDMA.channel[ch].out.peri_sel.sel);
+        Serial.println("  (0 SPI2, 3 I2S0, 63 none)");
+        static int16_t buf[256];
+        size_t total = 0;
+        const uint32_t t0 = millis();
+        for (int blk = 0; blk < 62; blk++) {                 // ~1 s of 1 kHz
+          for (int i = 0; i < 256; i++) buf[i] = (int16_t)(12000 * sinf((blk * 256 + i) * 6.2832f * 1000 / 16000));
+          size_t bw = 0;
+          i2s_write(I2S_NUM_0, buf, sizeof(buf), &bw, pdMS_TO_TICKS(200));
+          total += bw;
+        }
+        Serial.printf("[snd] wrote %u of %u bytes in %lu ms (should be all, ~1000 ms)\n", (unsigned)total, 62u * 512u,
+                      (unsigned long)(millis() - t0));
+        codec.stop();
+      }
+      expander.digitalWrite(EXP_AMP_EN, LOW);
+      continue;
+    }
+    if (!strcmp(line, "powershow")) {
+      powerOffShow();
+      Serial.println("[power] show done (still on)");
+      nav.invalidate();
+      continue;
+    }
+#if BOARD_BATT_UNSEEN_ON_USB
+    // Set a T-Deck right by hand before it has learned from a charge of its own: how fast
+    // its cell fills on USB (percent an hour), and what it holds now.
+    if (!strncmp(line, "batt rate ", 10)) { battery.setRate(atof(line + 10)); battery.report(); continue; }
+    if (!strncmp(line, "batt pct ", 9)) { battery.setPercent((uint8_t)constrain(atoi(line + 9), 0, 100)); battery.report(); continue; }
+#endif
+    // Run from the battery with the cable still in, to check the figure on
+    // battery. Turns itself back off after the given minutes (at most 30).
+    if (!strncmp(line, "batt hiz ", 9)) {
+      const int min = atoi(line + 9);
+      if (min > 0) { battery.setHiZ(true); s_hizUntil = (millis() + constrain(min, 1, 30) * 60000UL) | 1; }
+      else { battery.setHiZ(false); s_hizUntil = 0; }
+      battery.report();
+      continue;
+    }
+#endif
+    if (!strcmp(line, "poweroff")) {        // same path as the menu; refuses with USB in
+      if (!app::powerOff("usb command")) Serial.println("[power] refused: USB is plugged in");
+      continue;
+    }
+    // Region scopes: "regions" shows them; "regions ask [name]" puts MeshCore's
+    // regions request to a repeater in direct range (by name, or the one heard
+    // most recently with no hops) and the answer prints when it comes.
+    if (!strncmp(line, "regions", 7) && g_node) {
+      if (!strcmp(line, "regions scan")) {         // what "ask repeaters nearby" does, printed
+        Serial.println(s_usbScan.start() ? "[regions] listening for repeaters in range..." : "[regions] radio busy");
+      } else if (!strncmp(line, "regions ask", 11)) {
+        const char* want = line[11] == ' ' ? line + 12 : "";
+        ContactInfo best, c;
+        bool found = false;
+        ContactsIterator it = g_node->startContactsIterator();
+        while (it.hasNext(g_node, c)) {
+          if (c.type != ADV_TYPE_REPEATER) continue;
+          if (*want ? !strcasestr(c.name, want) : c.out_path_len != 0) continue;
+          if (!found || c.lastmod > best.lastmod) { best = c; found = true; }
+        }
+        if (!found) Serial.println("[regions] no such repeater in direct range (try: regions ask <name>)");
+        else Serial.printf("[regions] asking %s: %s\n", best.name, g_node->requestRegions(best.id.pub_key) ? "sent" : "failed");
+      } else {
+        Serial.printf("[regions] default: %s\n", *regions::defaultName() ? regions::defaultName() : "(none: flood)");
+        for (int i = 0; i < MAX_GROUP_CHANNELS; i++) {
+          ChannelDetails ch;
+          if (g_node->getChannel(i, ch) && ch.name[0])
+            Serial.printf("[regions]   %-20s %s\n", ch.name, (*regions::effective(ch.channel.secret) ? regions::effective(ch.channel.secret) : "(flood)"));
+        }
+      }
+      continue;
+    }
+    // What is plugged into the top header, and what IO9 is doing.
+    // "gps": what the receiver has sent so far, then three seconds of it as it comes.
+    // "gpsprobe": listens on each of the two GPS pins at each speed in turn and counts
+    // what arrives, for a receiver wired in by hand - it says which pin it is talking on.
+    if (!strcmp(line, "gps")) {
+      const GpsFix& f = gps.fix();
+      Serial.printf("[gps] setting %s, listening on pin %d at %lu baud: %lu bytes, %lu good sentences, fix %s, %u sats\n",
+                    ui_settings.gpsOn ? "on" : "OFF", PIN_GPS_RX, (unsigned long)gps.baud(),
+                    (unsigned long)gps.bytesRead, (unsigned long)gps.goodSentences, gps.hasFix() ? "yes" : "no", f.satellites);
+      Serial.printf("[gps] hears %u satellites, strongest %u, sat clock %s, antenna '%s'\n",
+                    gps.heard(), gps.bestSignal(), gps.timeKnown() ? "yes" : "no", gps.antenna());
+      Serial.print("[gps] raw: ");
+      const uint32_t until = millis() + 3000;
+      uint32_t n = 0;
+      while ((int32_t)(millis() - until) < 0) {
+        while (Serial1.available()) { const int c = Serial1.read(); n++; Serial.write(c == '\n' || (c >= 32 && c < 127) ? c : '.'); }
+        delay(5);
+      }
+      Serial.printf("\n[gps] %lu bytes in 3 s\n", (unsigned long)n);
+      continue;
+    }
+    // "gpscmd BODY [seconds]": sends $BODY*checksum to the GPS and counts what comes back
+    // each second, to find out what a module does with a command (does it go quiet, and
+    // for how long). "gpscmd !" sends four 0xFF bytes instead: does a byte wake it.
+    // "gpshex BA CE 04 00 ... [/seconds]": the same, for a binary command written out in hex.
+    if (!strncmp(line, "gpscmd ", 7) || !strncmp(line, "gpshex ", 7)) {
+      int secs = 12;
+      if (line[3] == 'h') {
+        uint8_t raw[64]; size_t n = 0;
+        for (const char* p = line + 7; *p && n < sizeof(raw);) {
+          if (*p == ' ') { p++; continue; }
+          if (*p == '/') { secs = constrain(atoi(p + 1), 1, 120); break; }
+          char* end; const long v = strtol(p, &end, 16);
+          if (end == p) break;
+          raw[n++] = (uint8_t)v; p = end;
+        }
+        Serial1.write(raw, n);
+        Serial.printf("[gpscmd] sent %u bytes\n", (unsigned)n);
+      } else {
+        char body[80];
+        const char* sp = strrchr(line + 7, ' ');
+        if (sp && isdigit((unsigned char)sp[1])) { secs = constrain(atoi(sp + 1), 1, 120); snprintf(body, sizeof(body), "%.*s", (int)(sp - (line + 7)), line + 7); }
+        else snprintf(body, sizeof(body), "%s", line + 7);
+        if (!strcmp(body, "!")) {
+          static const uint8_t nudge[] = {0xFF, 0xFF, 0xFF, 0xFF};
+          Serial1.write(nudge, sizeof(nudge));
+          Serial.println("[gpscmd] sent four 0xFF bytes");
+        } else {
+          uint8_t sum = 0;
+          for (const char* p = body; *p; p++) sum ^= (uint8_t)*p;
+          Serial1.printf("$%s*%02X\r\n", body, sum);
+          Serial.printf("[gpscmd] sent $%s*%02X\n", body, sum);
+        }
+      }
+      Serial1.flush();
+      for (int s = 1; s <= secs; s++) {
+        const uint32_t until = millis() + 1000;
+        uint32_t n = 0;
+        char first[40]; uint8_t k = 0;
+        // Binary replies (CASIC 0xBA 0xCE, u-blox 0xB5 0x62) shown in hex: the ack says
+        // whether the module took a command.
+        char bin[100]; uint8_t bk = 0, binLeft = 0, prev = 0;
+        while ((int32_t)(millis() - until) < 0) {
+          while (Serial1.available()) {
+            const int c = Serial1.read(); n++;
+            if (k < sizeof(first) - 1 && c >= 32 && c < 127) first[k++] = (char)c;
+            if ((prev == 0xBA && c == 0xCE) || (prev == 0xB5 && c == 0x62)) binLeft = 14;
+            if (binLeft && bk < sizeof(bin) - 4) { bk += snprintf(bin + bk, sizeof(bin) - bk, "%02X ", c); binLeft--; }
+            prev = (uint8_t)c;
+          }
+          delay(5);
+        }
+        first[k] = 0;
+        bin[bk] = 0;
+        Serial.printf("[gpscmd] second %2d: %4lu bytes  %s%s%s\n", s, (unsigned long)n, first, bk ? "  bin: " : "", bin);
+      }
+      continue;
+    }
+    if (!strcmp(line, "gpsprobe")) {
+      static const int PINS[] = {PIN_GPS_RX, PIN_GPS_TX};
+      static const uint32_t BAUDS[] = {9600, 38400, 115200};
+      for (int pin : PINS) {
+        pinMode(pin, INPUT);
+        delay(5);
+        Serial.printf("[gpsprobe] pin %d idles %s\n", pin, digitalRead(pin) ? "high (something is driving or pulling it up)" : "low");
+        for (uint32_t b : BAUDS) {
+          Serial1.end();
+          Serial1.setRxBufferSize(2048);
+          Serial1.begin(b, SERIAL_8N1, pin, -1);
+          const uint32_t until = millis() + 1500;
+          uint32_t n = 0, dollars = 0, printable = 0;
+          char first[48]; size_t fl = 0;
+          while ((int32_t)(millis() - until) < 0) {
+            while (Serial1.available()) {
+              const int c = Serial1.read();
+              n++;
+              if (c == '$') dollars++;
+              if (c == '\n' || c == '\r' || (c >= 32 && c < 127)) printable++;
+              if (fl < sizeof(first) - 1 && c >= 32 && c < 127) first[fl++] = (char)c;
+            }
+            delay(5);
+          }
+          first[fl] = 0;
+          Serial.printf("[gpsprobe] pin %d at %6lu: %4lu bytes, %lu '$', %lu%% readable  %s\n", pin, (unsigned long)b,
+                        (unsigned long)n, (unsigned long)dollars, (unsigned long)(n ? printable * 100 / n : 0), first);
+        }
+      }
+      Serial1.end();
+      if (ui_settings.gpsOn) gps.begin();
+      Serial.println("[gpsprobe] done, back to normal");
+      continue;
+    }
+    // "who TEXT": this node, and how it sees every contact with TEXT in its name (its
+    // route, when it was last heard). "dm NAME|words": a direct message to the first
+    // contact with NAME in its name, sent the way the chat screen sends one; node.cpp
+    // prints each try and the delivery in this build.
+    if (!strncmp(line, "who", 3) || !strncmp(line, "dm ", 3)) {
+      if (!g_node) { Serial.println("[who] node not running"); continue; }
+      const bool dm = line[0] == 'd';
+      String want = dm ? String(line + 3) : String(line[3] ? line + 4 : "");
+      String words;
+      const int bar = want.indexOf('|');
+      if (dm && bar >= 0) { words = want.substring(bar + 1); want = want.substring(0, bar); }
+      want.toLowerCase();
+      if (!dm) {
+        char hex[10];
+        mesh::Utils::toHex(hex, g_node->self_id.pub_key, 4);
+        hex[8] = 0;
+        const NodePrefs& p = g_node->prefs();
+        Serial.printf("[who] me: %s  key %s  %.3f MHz sf%u bw%.1f cr%u tx%d  %d contacts, clock %lu\n", g_node->name(), hex,
+                      p.freq, p.sf, p.bw, p.cr, p.tx_power_dbm, g_node->getNumContacts(), (unsigned long)app::now());
+      }
+      int shown = 0;
+      for (int i = 0; i < g_node->getNumContacts(); i++) {
+        ContactInfo c;
+        if (!g_node->getContactByIdx(i, c)) continue;
+        String n = c.name;
+        n.toLowerCase();
+        if (want.length() && n.indexOf(want) < 0) continue;
+        if (!want.length() && !(c.flags & 0x01)) continue;        // no text: the favourites
+        if (dm) {
+          const ConvKey k = ConvKey::contact(c.id.pub_key);
+          const uint32_t id = history.add(k, HF_OUT, ST_SENDING, g_node->name(), words.c_str(), app::now());
+          Serial.printf("[dm] to %s: %s\n", c.name, g_node->sendDM(c.id.pub_key, words.c_str(), id) ? "queued" : "could not send");
+          shown++;
+          break;
+        }
+        if (++shown > 14) { Serial.println("[who] ...more"); break; }
+        char hex[10];
+        mesh::Utils::toHex(hex, c.id.pub_key, 4);
+        hex[8] = 0;
+        Serial.printf("[who] %-24s key %s type %u fav %u route %d  heard %ld s ago  advert %lu\n", c.name, hex, c.type, c.flags & 1,
+                      c.out_path_len == OUT_PATH_UNKNOWN ? -1 : (int)(c.out_path_len & 63),
+                      c.lastmod ? (long)(app::now() - c.lastmod) : -1L, (unsigned long)c.last_advert_timestamp);
+      }
+      if (!shown) Serial.println("[who] no contact with that in its name");
+      continue;
+    }
+    if (!strcmp(line, "ext")) { ext::report(); continue; }
+    dimmer.note();
+    if (!strcmp(line, "stores")) {
+      storeReport();
+    } else if (!strcmp(line, "recover")) {
+      Serial.printf("[stores] %s\n", recoverMissingContacts());
+      storeReport();
+    } else if (!strcmp(line, "shot")) {
+      // Compose the current screen into the canvas and send that: exact
+      // colours, unlike reading the panel back.
+      View* v = nav.top();
+      Canvas& g = nav.canvas();
+      g.fillScreen(theme.bg);
+      if (v && !v->isLock()) drawStatusBar(g, theme, !v->hasClock());
+      if (v) v->draw(g);
+      nav.drawOverlays(g);
+      Serial.flush();
+      Serial.printf("SHOT565 %d %d\n", L::W, L::H);
+      Serial.write((const uint8_t*)g.getBuffer(), L::W * L::H * 2);
+      Serial.flush();
+    } else if (!strncmp(line, "theme ", 6)) {
+      const int t = atoi(line + 6);
+      if (t >= 0 && t < THEME_COUNT) { ui_settings.themeId = t; app::applyTheme(); markUiDirty(); }
+    } else if (!strncmp(line, "key ", 4)) {
+      nav.key(line[4] == '\\' && line[5] == 'n' ? '\n' : line[4]);
+    } else if (!strcmp(line, "home")) {
+      nav.popToHome();
+    } else if (!strcmp(line, "lock")) {
+      app::lock();
+    } else if (!strncmp(line, "wheel ", 6)) {
+      nav.rotate(atoi(line + 6));
+    } else if (!strcmp(line, "press")) {
+      nav.press();
+    } else if (!strcmp(line, "dfu")) {
+      app::rebootToFlashMode();
+    } else if (!strcmp(line, "extpage")) {
+      ext::openPage();
+    }
+    nav.invalidate();
+#endif
+  }
+}
+
+// ---- boot screen ---------------------------------------------------------------------------------
+// The INW mark and wordmark, with a thin progress bar underneath. Steps that fail
+// are listed below the bar; everything else only goes to the serial log.
+constexpr int BOOT_STEPS = 12;
+static int s_bootStep = 0, s_bootErrY = boot::ERR_Y0;
+
+// The panel shares its SPI bus with the SD card and the radio, and the boot
+// animation draws from its own task while setup() is busy restoring from SD or
+// starting the radio. The SD and radio drivers hold this SPIClass's transaction
+// lock for every exchange, so taking the same lock around each boot-screen draw
+// keeps a frame from ever landing in the middle of an SD write. Only display
+// calls go inside one: anything that itself uses inw_spi would deadlock.
+struct BootBusLock {
+  BootBusLock()  { inw_spi.beginTransaction(SPISettings(4000000, MSBFIRST, SPI_MODE0)); }
+  ~BootBusLock() { inw_spi.endTransaction(); }
+};
+
+static volatile bool s_animRun = false;
+static SemaphoreHandle_t s_animDone = nullptr;
+
+static void bootAnimTask(void*) {
+  Canvas spr;
+  spr.setColorDepth(16);
+  if (spr.createSprite(boot::MARK_W, boot::MARK_H)) {
+    const uint32_t t0 = millis();
+    while (s_animRun) {
+      spr.fillScreen(theme.bg);
+      boot::drawMark(spr, -boot::MARK_X, -boot::MARK_Y, millis() - t0, true);
+      { BootBusLock lock; spr.pushSprite(&display, boot::MARK_X, boot::MARK_Y); }
+      vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    spr.fillScreen(theme.bg);                            // leave the still mark behind
+    boot::drawMark(spr, -boot::MARK_X, -boot::MARK_Y, 0, false);
+    { BootBusLock lock; spr.pushSprite(&display, boot::MARK_X, boot::MARK_Y); }
+    spr.deleteSprite();
+  }
+  xSemaphoreGive(s_animDone);
+  vTaskDelete(nullptr);
+}
+
+static void bootAnimStart() {
+  s_animDone = xSemaphoreCreateBinary();
+  if (!s_animDone) return;                               // no animation, boot goes on as before
+  s_animRun = true;
+  // core 0, away from setup(); if it can't start, the still logo is already up
+  if (xTaskCreatePinnedToCore(bootAnimTask, "bootanim", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+    s_animRun = false;
+    vSemaphoreDelete(s_animDone);
+    s_animDone = nullptr;
+  }
+}
+
+static void bootAnimStop() {                             // before anything else owns the screen
+  if (!s_animDone) return;
+  s_animRun = false;
+  xSemaphoreTake(s_animDone, pdMS_TO_TICKS(2000));
+}
+
+static void drawBootLogo() { boot::drawLogo(display); }
+
+static void powerOffShow() {
+  Canvas& g = nav.canvas();
+  panelWake();                             // lit only once the panel is awake
+  backlight.setLevel(dimmer.full());       // the dimmer isn't ticking from here on
+  // Save first, with the boot logo turning, until storage is idle. At most 45 s:
+  // an interrupted write leaves the previous file whole anyway.
+  const uint32_t t0 = millis();
+  for (;;) {
+    const bool idle = inwStoreFlush(20);
+    const uint32_t t = millis() - t0;
+    goodbyeFrame(g, t, -1);
+    g.pushSprite(nav.display(), 0, 0);
+    if ((idle && t >= 700) || t > 45000) break;
+  }
+  const uint32_t tb = millis();
+  for (;;) {
+    const int32_t b = (int32_t)(millis() - tb);
+    goodbyeFrame(g, millis() - t0, min(b, boot::BREAK_MS));
+    g.pushSprite(nav.display(), 0, 0);
+    if (b >= boot::BREAK_MS) break;
+  }
+  fx::powerDown(g);               // the theme's last word
+}
+
+static uint32_t s_bootT0 = 0, s_bootStepAt = 0;   // so a slow boot says which step was slow
+static const char* s_stepName[BOOT_STEPS] = {};
+static uint32_t s_stepMs[BOOT_STEPS] = {};
+
+static void bootTimingReport() {
+  Serial.printf("[boot] took %lums total:", (unsigned long)(millis() - s_bootT0));
+  for (int i = 0; i < BOOT_STEPS; i++)
+    if (s_stepName[i]) Serial.printf("  %s %lums", s_stepName[i], (unsigned long)s_stepMs[i]);
+  Serial.println();
+}
+
+static void bootStep(const char* what, bool ok, const char* detail = nullptr) {
+  s_bootStep = min(s_bootStep + 1, BOOT_STEPS);
+  const uint32_t at = millis();
+  const uint32_t took = at - (s_bootStepAt ? s_bootStepAt : s_bootT0);
+  Serial.printf("[boot] %-18s %s %5lums (%lums in) %s\n", what, ok ? "ok" : "FAILED",
+                (unsigned long)took, (unsigned long)(at - s_bootT0), detail ? detail : "");
+  s_bootStepAt = at;
+  // Native USB re-enumerates during a reset, so the early lines above are lost to
+  // anyone watching from a PC. Keep them and print the lot once at the end.
+  if (s_bootStep <= BOOT_STEPS) { s_stepName[s_bootStep - 1] = what; s_stepMs[s_bootStep - 1] = took; }
+  BootBusLock lock;
+  display.fillRect(boot::BAR_X + 1, boot::BAR_Y + 1, (boot::BAR_W - 2) * s_bootStep / BOOT_STEPS, 3, theme.green);
+  if (ok || s_bootErrY > boot::ERR_Y0 + 14) return;
+  display.setFont(&fonts::Font2);
+  display.setTextColor(theme.amber, theme.bg);
+  char line[64];
+  snprintf(line, sizeof(line), "%s: %s", what, detail && detail[0] ? detail : "not responding");
+  display.drawString(line, (L::W - display.textWidth(line)) / 2, s_bootErrY);
+  s_bootErrY += 14;
+}
+
+static void bootNote(const char* msg) {      // a long step the user should know about
+  BootBusLock lock;
+  display.setFont(&fonts::Font2);
+  display.fillRect(0, boot::ERR_Y0 - 2, L::W, 28, theme.bg);
+  display.setTextColor(theme.amber, theme.bg);
+  display.drawString(msg, (L::W - display.textWidth(msg)) / 2, boot::ERR_Y0 + 2);
+}
+
+#if BOARD_BATTERY_FROM_VOLTAGE
+#include "flat_hold.h"
+// A flat battery waits for a charge instead of starting (tdeck/flat_hold.h has the
+// rule and why). While it waits it sleeps, looks again every three minutes, and the
+// trackball click wakes it to look now.
+RTC_DATA_ATTR static uint8_t s_flatWaiting;
+
+static void flatSleep() {
+  s_flatWaiting = 1;
+  esp_sleep_enable_timer_wakeup((uint64_t)FlatHold::LOOK_EVERY_S * 1000000ULL);
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BUTTON, 0);
+  esp_deep_sleep_start();
+}
+
+// Woken by the timer while waiting: look at the cell and go straight back to sleep if
+// it still can't start, before the screen or anything else is powered.
+static void flatHoldQuickLook() {
+  if (!s_flatWaiting || esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) return;
+  analogReadResolution(12);
+  analogReadMilliVolts(PIN_BAT_ADC);                    // the first one after setup reads low
+  uint32_t sum = 0;
+  for (int i = 0; i < 8; i++) sum += analogReadMilliVolts(PIN_BAT_ADC);
+  if (FlatHold::hold((uint16_t)(2.037f * sum / 8), true, false)) flatSleep();
+}
+
+static void flatBatteryHold(int rr) {
+  const uint16_t mv = battery.millivolts();
+  if (!FlatHold::hold(mv, s_flatWaiting, rr == ESP_RST_BROWNOUT)) { s_flatWaiting = 0; return; }
+  Serial.printf("[power] battery flat (%u mV, needs %u): not starting\n", mv,
+                FlatHold::need(s_flatWaiting, rr == ESP_RST_BROWNOUT));
+  Serial.flush();
+  {
+    BootBusLock lock;
+    display.setFont(&fonts::Font2);
+    display.fillRect(0, boot::ERR_Y0 - 2, L::W, 34, theme.bg);
+    display.setTextColor(theme.amber, theme.bg);
+    char line[48];
+    snprintf(line, sizeof(line), "Battery empty (%u.%02u V): plug it in", mv / 1000, (mv % 1000) / 10);
+    display.drawString(line, (L::W - display.textWidth(line)) / 2, boot::ERR_Y0);
+    const char* more = "or hold the trackball to start anyway";
+    display.drawString(more, (L::W - display.textWidth(more)) / 2, boot::ERR_Y0 + 16);
+  }
+  // The way out if the reading is ever wrong: the click held for a second and a half.
+  const uint32_t until = millis() + 6000;
+  uint32_t downAt = 0;
+  while ((int32_t)(millis() - until) < 0) {
+    if (digitalRead(PIN_BUTTON) == LOW) {
+      if (!downAt) downAt = millis() | 1;
+      else if (millis() - downAt > 1500) {
+        Serial.println("[power] battery flat: started anyway (trackball held)");
+        logs.add(LOG_WARN, "battery flat (%umV): started anyway", mv);
+        bootNote("starting anyway");
+        s_flatWaiting = 0;
+        return;
+      }
+    } else downAt = 0;
+    delay(20);
+  }
+  backlight.setLevel(0);
+  flatSleep();
+}
+#endif
+
+void setup() {
+  clearForceDownloadBoot();     // first thing: one trip into flash mode stays one trip
+#if BOARD_BATTERY_FROM_VOLTAGE
+  flatHoldQuickLook();
+#endif
+  s_bootT0 = millis();
+  Serial.begin(115200);
+  delay(150);
+  Serial.println("\n[INW] boot " FW_VERSION);
+  static const char* RESET[] = {"unknown", "power on", "external", "software", "crash",
+                                 "interrupt watchdog", "task watchdog", "watchdog", "deep sleep",
+                                 "brownout", "sdio"};
+  const int rr = (int)esp_reset_reason();
+#if BOARD_HAS_REPORTS
+  report::capture();            // the last run's log lines, before this run's first one
+#endif
+  logs.add(rr == ESP_RST_POWERON || rr == ESP_RST_SW ? LOG_INFO : LOG_WARN, "boot %s, last reset: %s",
+           FW_VERSION, rr < 11 ? RESET[rr] : "?");
+  ui_settings.load();
+  themes::load();
+  if (!themes::valid(ui_settings.themeId)) ui_settings.themeId = 0;   // one of the owner's that is no longer here
+
+  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
+  pinMode(PIN_BUTTON, INPUT_PULLUP);
+  rotary.begin(PIN_ROTARY_A, PIN_ROTARY_B, PIN_ROTARY_PRESS);
+  // Every chip-select on the shared SPI bus idles high before anything talks on
+  // it, or a floating radio/NFC select answers the SD card's traffic.
+  for (int cs : { PIN_LORA_CS, PIN_NFC_CS, PIN_SD_CS }) if (cs >= 0) { pinMode(cs, OUTPUT); digitalWrite(cs, HIGH); }
+
+  const bool railsOk = expander.begin(Wire);
+  if (railsOk) {
+    bringup::powerAllRails(expander);
+    expander.enableRail(EXP_LORA_EN, 20);
+    if (!ui_settings.gpsOn) gpsPower(false);
+  }
+
+  display.init();
+  // Start the shared bus for the SD card and the radio now, while nothing is drawing.
+  // Its first begin() hardware-resets the SPI peripheral the panel also uses, and it
+  // takes no lock to do it. Left to the SD step, that reset could land in the middle of
+  // a boot-animation frame (drawn from its own task) and leave the panel showing junk
+  // until the next restart. Every later begin() is a no-op, so the bus ends up set
+  // exactly as before, only safely.
+  inw_spi.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI, -1);
+#if BOARD_HAS_TOUCH
+  display.setRotation(TFT_ROTATION ^ ((ui_settings.orient & 1) ? 2 : 0));   // Settings > Display: upside down
+#else
+  display.setRotation(TFT_ROTATION);
+#endif
+  app::applyTheme();
+  if (digitalRead(PIN_BUTTON) == LOW) {        // BOOT held: hardware self test
+    backlight.begin(PIN_TFT_BL);
+    backlight.setLevel(12);
+    bringup::scanToSerial(Wire);
+    bringup::report(display, Wire);
+    while (digitalRead(PIN_BUTTON) == LOW) delay(10);
+    delay(3000);
+  }
+  drawBootLogo();
+  bootAnimStart();
+  backlight.begin(PIN_TFT_BL);
+  dimmer.begin(&backlight, ui_settings.brightness, 3, ui_settings.dimSecs * 1000UL, ui_settings.sleepSecs * 1000UL);
+
+  bootStep("power rails", railsOk);
+#if BOARD_HAS_HAPTIC
+  haptic.begin(Wire);
+  haptic.setMode(ui_settings.vibeMode);
+  bootStep("vibration", haptic.ok());
+#endif
+  bootStep("keyboard", keyboard.begin(Wire));
+#if BOARD_HAS_TOUCH
+  bootStep("touch", touchPanel.begin(Wire));
+  // Pinch needs a second finger; the chip reports as many as its config says (0x804C).
+  Serial.printf("[touch] gt911 reports up to %u fingers\n", touchPanel.maxTouches());
+  applyOrientation();
+#endif
+  keyboard.setBacklight(ui_settings.kbBacklight);
+  bootStep("battery gauge", battery.begin(Wire));
+  battRestore();
+  battery.tick(millis());
+  if (battery.present())
+    logs.add(battery.configured() ? LOG_WARN : LOG_INFO, "battery %u%% (gauge %u%%) %umV, pack %umAh%s", battery.percent(),
+             battery.gaugePercent(), battery.millivolts(), battery.designNow(),
+             battery.configured() ? " (was set wrong, fixed)" : "");
+#if BOARD_BATTERY_FROM_VOLTAGE
+  flatBatteryHold(rr);
+#endif
+  const bool audioOk = codec.begin(Wire);
+  jingle.begin(&codec);
+  // The amp is powered only while a sound plays (it hisses and drains otherwise).
+  jingle.setAmp([](bool on) { expander.digitalWrite(EXP_AMP_EN, on ? HIGH : LOW); });
+  if (railsOk) expander.digitalWrite(EXP_AMP_EN, LOW);
+  app::applySound();
+  bootStep("audio", audioOk);
+  gps.setSpeedChoice(ui_settings.gpsBaud);       // Settings > GPS > speed (auto unless set)
+  if (ui_settings.gpsOn) gps.begin();
+
+  // Clock: the board RTC first, so the mesh has real time from the first packet.
+  const bool rtcOk = rtc.begin(Wire);
+  RtcTime rt;
+  if (rtcOk && rtc.read(rt) && rt.year >= 2025) rtc_clock.setQuiet(epochFrom(rt.year, rt.month, rt.day, rt.hour, rt.minute, rt.second));
+  rtc_clock.onSet = writeHardwareRtc;
+#if BOARD_HAS_RTC
+  bootStep("clock", rtcOk, app::timeValid() ? clockText(app::now(), true) : "not set");
+#else
+  (void)rtcOk;                    // no clock chip: GPS, Wi-Fi or the phone set the time
+#endif
+
+  // Under a multi-boot launcher (bmorcelli's Launcher) every firmware whose storage is
+  // called "spiffs" gets the same partition, and Meshtastic formats it as LittleFS: our
+  // contacts, settings and messages were wiped on every switch (Andrew, pager, 2026-11-21).
+  // Our -full.bin brings a partition of our own, "squatch", which Launcher keeps apart;
+  // use it whenever it is there. Everyone else keeps the usual "spiffs".
+  const esp_partition_t* ownStore =
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, "squatch");
+  const char* storeLabel = ownStore ? "squatch" : nullptr;
+  s_sharedStore = !storeLabel &&
+      esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_TEST, nullptr) != nullptr &&
+      esp_partition_find_first(ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, nullptr) != nullptr;
+  if (storeLabel) Serial.println("[boot] storage: our own partition (\"squatch\", launcher image)");
+  else if (s_sharedStore) Serial.println("[boot] storage: launcher's shared \"spiffs\": another firmware can erase it");
+  if (ownStore) {
+    // Launcher only creates a partition from an image that carries something for it, so
+    // the -full.bin carries a 16-byte marker. Launcher writes it over the start of the
+    // partition without clearing the rest: whatever was there (another firmware's files,
+    // or ours from before a reinstall) would mount half-broken. Seeing the marker, clear
+    // the whole partition first; the store then comes back from the SD card and the
+    // safety copy like any fresh store (dataio.cpp).
+    static const char MARK[16] = {'S','Q','U','A','T','C','H','-','N','E','W','S','T','O','R','E'};
+    char head[16] = {0};
+    if (esp_partition_read(ownStore, 0, head, sizeof(head)) == ESP_OK && !memcmp(head, MARK, sizeof(head))) {
+      bootNote(L::W < 400 ? "first start: preparing storage" : "first start: preparing storage, this takes a few minutes");
+      const esp_err_t e = esp_partition_erase_range(ownStore, 0, ownStore->size);
+      Serial.printf("[boot] storage: new launcher partition (%u kB) cleared: %s\n",
+                    (unsigned)(ownStore->size / 1024), esp_err_to_name(e));
+    }
+  }
+  bool fsOk = SPIFFS.begin(false, "/spiffs", 10, storeLabel);
+  int carried = 0;                  // files brought across from MeshCore's store
+  if (!fsOk) {
+    // First boot on this partition table: the store has to be formatted once.
+    // If MeshCore had this board, its store is still in flash until that format:
+    // take the identity, contacts and channels out of it first (fsmigrate.h).
+    carried = fsmigrate::rescue();
+    bootNote(carried ? "found MeshCore's data: bringing it across"
+                     : L::W < 400 ? "first start: preparing storage" : "first start: preparing storage, this takes a few minutes");
+    fsOk = SPIFFS.begin(true, "/spiffs", 10, storeLabel);
+    if (fsOk && carried) carried = fsmigrate::restore();
+    BootBusLock lock;
+    display.fillRect(0, boot::ERR_Y0 - 2, L::W, 28, theme.bg);
+  }
+  bootStep("storage", fsOk);
+#if BOARD_HAS_REPORTS
+  if (fsOk) report::begin();       // restarted from a crash: file what happened
+#endif
+  const bool sdOk = sdMount();
+  bootStep("sd card", true, sdOk ? "mounted" : "none");   // no card is normal
+  // NVS came up empty (wiped, or another firmware had the board): bring the
+  // preferences back from the copies rather than starting at defaults.
+  if (fsOk && !ui_settings.cameFromNvs()) {
+    const char* from = ui_settings.restoreIfWiped(sdOk);
+    if (from) {
+      app::applyTheme();
+      app::applyDisplay();
+      app::applySound();
+      dimmer.setFull(ui_settings.brightness);
+      keyboard.setBacklight(ui_settings.kbBacklight);
+      gps.setSpeedChoice(ui_settings.gpsBaud);
+      logs.add(LOG_WARN, "settings were empty, restored from %s", from);
+    }
+    // No bootStep here: it would make the progress bar jump on the rare boot
+    // that restores. The log line says what happened.
+    Serial.printf("[boot] settings           %s\n", from ? from : "defaults (no copy to restore)");
+  } else if (fsOk) {
+    ui_settings.saveMirror();               // keep the copy current from the first boot
+  }
+  // The web installer's "start fresh" or "reset everything", asked for over USB
+  // before this start (dataio.h). Done here, with nothing else running yet.
+  if (const uint8_t wipe = wipePending()) {
+    bootNote(wipe >= 2 ? (L::W < 400 ? "resetting everything" : "resetting everything: this takes a few minutes")
+                       : (L::W < 400 ? "starting fresh" : "starting fresh: clearing contacts and messages"));
+    wipeNow(wipe, [](int done, int total) {
+      char msg[48];
+      snprintf(msg, sizeof(msg), "starting fresh: %d of %d", done, total);
+      bootNote(msg);
+    });
+    Serial.println("[wipe] done, restarting");
+    Serial.flush();
+    delay(600);
+    ESP.restart();
+  }
+  char report[96];
+  importBeforeNode(report, sizeof(report));
+  if (carried) {
+    snprintf(report, sizeof(report), "from MeshCore: %s", fsmigrate::summary());
+    logs.add(LOG_INFO, "brought across from MeshCore's store: %s", fsmigrate::summary());
+  }
+  bootStep("restore", true, report);
+  bootStep("messages", history.begin());
+  regions::begin();                               // channels' region scopes (regions.h)
+
+  board.battReader = [] { return battery.millivolts(); };
+  s_radioOk = nodeBegin();
+  char rinfo[48] = "";
+  // radio_chip says which of the pager's two radios answered.
+  if (s_radioOk) snprintf(rinfo, sizeof(rinfo), "%s  %.3f MHz sf%u", radio_chip, g_node->prefs().freq, g_node->prefs().sf);
+  else strlcpy(rinfo, "not responding", sizeof(rinfo));
+  bootStep("radio", s_radioOk, rinfo);
+  // ECO (experimental): off unless turned on in Settings > Battery.
+  if (!power::initEco()) Serial.println("[power] ECO setting could not be read");
+  else if (power::eco()) logs.add(LOG_INFO, "ECO on: sleeps between messages when dark");
+  if (s_radioOk) logs.add(LOG_INFO, "radio up");
+  else logs.add(LOG_ERROR, "radio init failed: %s", s_radioFault);
+  if (s_radioOk) keepEssentials();
+  if (s_radioOk) {
+    importPrefsAfterNode(report, sizeof(report));
+    bootStep("import", true, report);
+    g_node->onEvent = onNodeEvent;
+    char info[64];
+    snprintf(info, sizeof(info), "%s  %d contacts", g_node->name(), g_node->getNumContacts());
+    bootStep("mesh node", true, info);
+    logs.add(LOG_INFO, "%s", info);
+  }
+  ext::begin();                                  // sensors on the top header, IO9
+  wifi::begin();
+  s_bootStep = BOOT_STEPS - 1;
+  bootStep("ready", true);
+  bootAnimStop();
+  bootTimingReport();
+  if (ui_settings.bootJingle && ui_settings.sound) jingle.play(app::themeSpec().boot);
+
+  nav.begin(&display, &theme);
+  nav.push(makeHomeView());
+  ota::announce();                                // "Updated, now on X" after an update restarted it
+  if (history.rescued()) {
+    char msg[48];
+    snprintf(msg, sizeof(msg), "%u lost messages put back", (unsigned)history.rescued());
+    nav.toast(msg, 5000);
+  }
+  // A new node is named after its key prefix; ask for a real name once.
+  if (g_node) {
+    char hex[10];
+    mesh::Utils::toHex(hex, g_node->self_id.pub_key, 4);
+    if (!strcmp(g_node->name(), hex)) {
+      prompt("Name this node", "how you appear on the mesh", "", 31, [](const String& s) {
+        if (!s.length()) return;
+        strlcpy(g_node->prefs().node_name, s.c_str(), sizeof(g_node->prefs().node_name));
+        g_node->savePrefsNow();
+        g_node->advertZeroHop();
+      });
+    }
+  }
+  // Region, time zone and units, once: on top, so it comes before the name.
+  if (!ui_settings.setupDone) startSetup();
+
+  // Hold the logo a moment (longer if something failed); any key skips it.
+  const uint32_t until = millis() + (s_bootErrY > boot::ERR_Y0 ? 5000 : 1200);
+  while ((int32_t)(millis() - until) < 0) {
+    jingle.tick();
+    if (rotary.takeDetents() || rotary.takePress()) break;
+    KeyEvent ev;
+    if (keyboard.read(ev) && ev.pressed) break;
+    if (g_node) nodeLoop();
+    delay(5);
+  }
+  nav.invalidate();
+  s_uiReady = true;                               // from here on, screen changes animate
+  // Run from a launcher on its shared storage: say once per start that another firmware
+  // can erase it, and what to install instead (the -full.bin has its own partition).
+  if (s_sharedStore) {
+    logs.add(LOG_WARN, "launcher: on the shared storage, another firmware can erase it");
+    nav.banner("Launcher", "install the -full.bin to keep your data", 10000);
+  }
+  s_readyAt = millis();
+}
+
+// ---- loop -------------------------------------------------------------------------------------------
+static void gpsTick() {
+  if ((!ui_settings.gpsOn || power::saver()) && !field::wantsGps()) return;
+  const uint32_t t0 = millis(), b0 = gps.bytesRead;
+  const bool parsed = gps.update();
+  if (millis() - t0 > 100)
+    logs.add(LOG_WARN, "gps read %lums, %lu bytes", (unsigned long)(millis() - t0), (unsigned long)(gps.bytesRead - b0));
+  if (!parsed) return;
+  static bool hadFix = false;
+  static uint32_t lastClock = 0, lastPosSave = 0;
+  static double savedLat = 0, savedLon = 0;
+  const GpsFix& f = gps.fix();
+  if (gps.hasFix() != hadFix) {
+    hadFix = gps.hasFix();
+    logs.add(LOG_INFO, hadFix ? "gps fix" : "gps fix lost");
+    nav.statusChanged();
+  }
+  if (!gps.hasFix()) return;
+  if (ui_settings.gpsSetsClock && f.year >= 2025 && (!lastClock || millis() - lastClock > 3600000UL)) {
+    const uint32_t e = epochFrom(f.year, f.month, f.day, f.hour, f.minute, f.second);
+    if (!app::timeValid() || labs((long)e - (long)app::now()) > 5) app::setTime(e);
+    lastClock = millis();
+  }
+  if (ui_settings.gpsLivePosition && g_node) {
+    sensors.node_lat = f.lat; sensors.node_lon = f.lon;
+    NodePrefs& p = g_node->prefs();
+    p.node_lat = f.lat; p.node_lon = f.lon;
+    // Persist only when it actually moved, and not more than every 10 minutes.
+    if ((!lastPosSave || millis() - lastPosSave > 600000UL) &&
+        app::distanceKm(savedLat, savedLon, f.lat, f.lon) > 0.05) {
+      savedLat = f.lat; savedLon = f.lon; lastPosSave = millis();
+      g_node->savePrefsNow();
+    }
+  }
+}
+
+// ---- radio: a "packet ready" interrupt the processor missed ------------------------------
+// The radio raises DIO1 when a packet has arrived or a send has finished, and its rising
+// edge sets MeshCore's flag. If that edge is missed, DIO1 stays high, no new edge ever
+// comes, and the device hears and sends nothing until a restart (seen on the pager
+// 2026-11-18). Anything that leaves DIO1 high with no flag for half a second gets the
+// flag set by hand, so MeshCore reads the radio and starts listening again. Logged.
+static void radioIrqWatch() {
+  static uint32_t highSince = 0;
+  if (!s_radioOk || digitalRead(PIN_LORA_DIO1) != HIGH || inwRadioFlagPending()) { highSince = 0; return; }
+  if (!highSince) { highSince = millis() | 1; return; }
+  if (millis() - highSince < 500) return;
+  highSince = 0;
+  inwRadioKick();
+  s_radioKicks++;
+  logs.add(LOG_WARN, "radio: missed irq picked up #%u", s_radioKicks);   // log lines hold 44 characters
+}
+
+// ---- radio: what the chip itself says it is doing ------------------------------------------
+static void radioChipState(char* out, size_t n) {
+  const unsigned dio1 = digitalRead(PIN_LORA_DIO1), busy = digitalRead(PIN_LORA_BUSY);
+  if (strcmp(radio_chip, "SX1262")) {
+    snprintf(out, n, "%s dio1=%u busy=%u rx=%d recv=%lu", radio_chip, dio1, busy,
+             radio_driver.isInRecvMode() ? 1 : 0, (unsigned long)radio_driver.getPacketsRecv());
+    return;
+  }
+  // RadioLib's getStatus() asks for zero bytes and always returns 0; read the status
+  // byte the chip sends after the GetStatus opcode instead.
+  uint8_t st = 0;
+  radio.getMod()->SPIreadStream(RADIOLIB_SX126X_CMD_GET_STATUS, &st, 1);   // bits 6:4 mode (2/3 standby, 4 fs, 5 rx, 6 tx), 3:1 last command
+  snprintf(out, n, "mode=%u cmd=%u modem=%u irq=%04lX err=%04X dio1=%u busy=%u rx=%d recv=%lu rxerr=%lu sent=%lu",
+           (st >> 4) & 7, (st >> 1) & 7, radio.getPacketType(), (unsigned long)radio.getIrqFlags(),
+           radio.getDeviceErrors(), dio1, busy, radio_driver.isInRecvMode() ? 1 : 0,
+           (unsigned long)radio_driver.getPacketsRecv(), (unsigned long)radio_driver.getPacketsRecvErrors(),
+           (unsigned long)radio_driver.getPacketsSent());
+}
+// The same in a few characters, for the on-device log.
+static void radioChipShort(char* out, size_t n) {
+  if (strcmp(radio_chip, "SX1262")) { snprintf(out, n, "r%lu", (unsigned long)radio_driver.getPacketsRecv()); return; }
+  uint8_t st = 0;
+  radio.getMod()->SPIreadStream(RADIOLIB_SX126X_CMD_GET_STATUS, &st, 1);
+  snprintf(out, n, "m%u p%u i%lX e%X r%lu x%lu", (st >> 4) & 7, radio.getPacketType(),
+           (unsigned long)radio.getIrqFlags(), radio.getDeviceErrors(),
+           (unsigned long)radio_driver.getPacketsRecv(), (unsigned long)radio_driver.getPacketsRecvErrors());
+}
+
+// The LoRa sync word the chip holds (MeshCore's private one reads 1424).
+static uint16_t radioSyncWord() {
+  if (strcmp(radio_chip, "SX1262")) return 0;
+  uint8_t b[2] = {0, 0};
+  radio.readRegister(RADIOLIB_SX126X_REG_LORA_SYNC_WORD_MSB, b, 2);
+  return (uint16_t)(b[0] << 8 | b[1]);
+}
+static uint16_t s_syncExpect = 0;   // what it held once it was listening properly (learned)
+
+// The radio from scratch, as at boot: a hardware reset and MeshCore's own set-up
+// (std_init), MeshCore's radio start (interrupt, preamble, idle), then the saved
+// frequency, bandwidth, SF, CR, power and gain. MeshCore starts receive on its next pass.
+static void radioSetupAgain(const char* why) {
+  static uint32_t loggedAt = 0;
+  char was[48], st[160];
+  radioChipShort(was, sizeof(was));
+  radioChipState(st, sizeof(st));
+  Serial.printf("[radio] setting the radio up again (%s): was %s sync=%04X meshcore_state=%u\n", why, st,
+                (unsigned)radioSyncWord(), (unsigned)inwRadioState());
+  const bool ok = radio.std_init(&inw_spi);
+  radio_driver.begin();
+  if (g_node) g_node->applyRadio();
+  s_radioSetups++;
+  snprintf(s_radioSetupWhy, sizeof(s_radioSetupWhy), "%s", why);
+  s_syncExpect = 0;
+  radioChipState(st, sizeof(st));
+  Serial.printf("[radio] %s: now %s sync=%04X\n", ok ? "set up again" : "SET-UP FAILED", st, (unsigned)radioSyncWord());
+  // The first few, then at most one pair of lines every 10 minutes (log lines hold 44 characters).
+  if (s_radioSetups <= 5 || !loggedAt || millis() - loggedAt > 600000UL) {
+    loggedAt = millis() | 1;
+    logs.add(ok ? LOG_WARN : LOG_ERROR, "radio set up again #%u: %s", (unsigned)s_radioSetups, why);
+    logs.add(LOG_WARN, "radio was %s", was);
+  }
+}
+
+// ---- radio: the chip not doing what MeshCore thinks it is doing ----------------------------
+// Every 2 s, from what the chip itself says (never from what MeshCore believes). Caught on
+// the pager 2026-11-19, same SX1262 and MeshCore as here:
+//  - MeshCore idle for 8 s: it starts receive on every pass, so idle that lasts means the
+//    chip keeps refusing (it was in standby with packet type 16, deaf for over an hour).
+//    8 s is MeshCore's own "radio stuck" rule, which only sets a flag.
+//  - "Listening" but the chip no longer set for LoRa, or its sync word changed. Twice running.
+//  Each of those: the radio is set up again from scratch (radioSetupAgain), at most every 20 s.
+//  - "Listening" with the chip in standby, settings intact: MeshCore is told it is idle and
+//    starts receive again.
+static void radioDeafWatch() {
+  if (!s_radioOk || !g_node || strcmp(radio_chip, "SX1262")) return;
+  const uint32_t now = millis();
+  static uint32_t checkAt = 0, idleSince = 0, setupAt = 0, rxKickLoggedAt = 0;
+  static uint8_t standbyReads = 0, wrongReads = 0;
+  if (now - checkAt < 2000) return;
+  checkAt = now;
+  const unsigned char ms = inwRadioState();     // 0 idle, 1 listening, 3 sending; +16 flag pending
+  const char* setup = nullptr;
+
+  if (ms == 0) {
+    if (!idleSince) idleSince = now | 1;
+    else if (now - idleSince >= 8000) setup = "not listening 8 s";
+  } else idleSince = 0;
+
+  if (ms == 1) {
+    uint8_t s = 0;
+    radio.getMod()->SPIreadStream(RADIOLIB_SX126X_CMD_GET_STATUS, &s, 1);
+    const uint8_t mode = (s >> 4) & 7;           // 2/3 standby, 4 fs, 5 rx, 6 tx
+    const uint8_t type = radio.getPacketType();
+    const uint16_t sync = radioSyncWord();
+    const bool notLora = type != RADIOLIB_SX126X_PACKET_TYPE_LORA;
+    const bool syncMoved = s_syncExpect && sync != s_syncExpect;
+    wrongReads = (notLora || syncMoved) ? wrongReads + 1 : 0;
+    standbyReads = (mode == 2 || mode == 3) ? standbyReads + 1 : 0;
+    if (!notLora && !s_syncExpect && mode == 5) s_syncExpect = sync;
+    if (wrongReads >= 2) setup = notLora ? "not set for LoRa" : "sync word changed";
+    else if (standbyReads >= 2) {
+      standbyReads = 0;
+      s_radioRxKicks++;
+      if (!rxKickLoggedAt || now - rxKickLoggedAt > 60000) {   // at most one line a minute
+        rxKickLoggedAt = now | 1;
+        char t[160];
+        radioChipShort(t, sizeof(t));
+        logs.add(LOG_WARN, "radio stby->rx #%u %s", s_radioRxKicks, t);
+        radioChipState(t, sizeof(t));
+        Serial.printf("[radio] standby while listening: %s\n", t);
+      }
+      inwRadioSetIdle();              // MeshCore's next pass starts receive again
+    }
+  } else { standbyReads = 0; wrongReads = 0; }
+
+  if (setup && (!setupAt || now - setupAt >= 20000)) {
+    setupAt = now | 1;
+    idleSince = 0; wrongReads = 0; standbyReads = 0;
+    radioSetupAgain(setup);
+  }
+}
+
+static uint32_t s_bootAdvert = 8000, s_lastAdvert = 0;   // ECO wakes for them (loop)
+static void autoAdvertTick() {
+  if (!g_node) return;
+  if (s_bootAdvert && millis() > s_bootAdvert) { s_bootAdvert = 0; g_node->advertZeroHop(); s_lastAdvert = millis(); }
+  if (ui_settings.autoAdvertHours && millis() - s_lastAdvert > ui_settings.autoAdvertHours * 3600000UL) {
+    s_lastAdvert = millis();
+    g_node->advertFlood();
+    logs.add(LOG_INFO, "auto flood advert");
+  }
+}
+
+#if BOARD_FRAME_MS
+uint32_t g_paceMs = BOARD_FRAME_MS;   // frame interval; "pace N" over USB adjusts it to tune
+#endif
+#if INW_DEV
+// How even the real drawn-frame cadence is (USB "loopcad"): the interval between the
+// frames the loop actually draws, which the pacing is meant to hold steady.
+static uint32_t s_lcLast = 0, s_lcMin = 0xFFFFFFFF, s_lcMax = 0, s_lcSum = 0, s_lcCnt = 0;
+void inwFrameTick(uint32_t nowMs) {
+  if (s_lcLast) { const uint32_t iv = nowMs - s_lcLast; if (iv < s_lcMin) s_lcMin = iv; if (iv > s_lcMax) s_lcMax = iv; s_lcSum += iv; s_lcCnt++; }
+  s_lcLast = nowMs;
+}
+uint32_t inwLoopCad(uint32_t* mn, uint32_t* mx, uint32_t* avg) {
+  const uint32_t c = s_lcCnt;
+  if (c) { *mn = s_lcMin; *mx = s_lcMax; *avg = s_lcSum / c; }
+  s_lcMin = 0xFFFFFFFF; s_lcMax = 0; s_lcSum = 0; s_lcCnt = 0; s_lcLast = 0;
+  return c;
+}
+#endif
+
+void loop() {
+  // Anything that holds the loop long enough to feel like a freeze gets logged
+  // with where the time went.
+  const uint32_t tLoop = millis();
+  uint32_t lapAt = tLoop;
+  uint16_t laps[8] = {};
+  auto lap = [&](uint8_t i) { const uint32_t now = millis(); laps[i] = now - lapAt; lapAt = now; };
+#if BOARD_HAS_TRACKBALL
+  int8_t ballX = 0, ballY = 0;
+  rotary.takeXY(ballX, ballY);
+  const int8_t detents = ballX + ballY ? ballX + ballY : (ballX ? ballX : 0);   // opposite ways at once still count as a roll
+#else
+  const int8_t detents = rotary.takeDetents();
+#endif
+  bool press = rotary.takePress();
+  bool backspace = false, anyKey = false;
+  char chars[16];
+  uint8_t nchars = 0;
+  KeyEvent ev;
+  while (nextKey(ev)) {
+    if (!ev.pressed) continue;
+    anyKey = true;
+    if (ev.index == KEY_IDX_BACKSPACE) backspace = true;
+    else if (ev.ch && nchars < sizeof(chars)) chars[nchars++] = ev.ch;
+  }
+#if BOARD_HAS_TOUCH
+  // The touchscreen, this board's main input. With the screen off, touches are read
+  // and dropped - a pocket touches everything - and only the trackball wakes it.
+  // On the lock screen only a tap or a swipe counts as someone using it.
+  {
+    bool down; int16_t tx, ty;
+    touchPanel.poll(down, tx, ty);
+    TouchEvent te;
+    // A glide belongs to the screen it started on: any change of screen (a message
+    // opening one, the trackball) ends it.
+    static View* coastOn = nullptr;
+    if (nav.top() != coastOn) { gestures.stopCoast(); coastOn = nav.top(); }
+    gestures.allowCoast(!dimmer.asleep() && nav.top() && nav.top()->coasts());
+    // Two fingers: a pinch. While both are down the one-finger gesture is set aside
+    // (cancelled, so lifting cannot end as a tap) and the screen gets Pinch events.
+    // The second finger lifting sends PinchEnd; then nothing more is read until every
+    // finger is off the glass.
+    bool skipFeed = false;
+    {
+      static bool pinching = false, waitUp = false;
+      static float d0 = 1, lastScale = 1;
+      static int16_t cx0 = 0, cy0 = 0, lcx = 0, lcy = 0;
+      int16_t x2, y2;
+      if (down && !dimmer.asleep() && touchPanel.second(x2, y2)) {
+        lcx = (tx + x2) / 2; lcy = (ty + y2) / 2;
+        const float d = hypotf((float)(x2 - tx), (float)(y2 - ty));
+        if (!pinching) { pinching = true; d0 = d > 20 ? d : 20; cx0 = lcx; cy0 = lcy; gestures.cancel(); }
+        TouchEvent pe = {};
+        pe.type = TouchEvent::Pinch;
+        pe.x = lcx; pe.y = lcy; pe.x0 = cx0; pe.y0 = cy0;
+        pe.scale = lastScale = d / d0;
+        dimmer.note();
+        nav.touch(pe);
+        waitUp = true;
+      } else if (pinching) {
+        pinching = false;
+        TouchEvent pe = {};
+        pe.type = TouchEvent::PinchEnd;
+        pe.x = lcx; pe.y = lcy; pe.x0 = cx0; pe.y0 = cy0; pe.scale = lastScale;
+        nav.touch(pe);
+      }
+      if (waitUp && !down) waitUp = false;
+      skipFeed = waitUp;
+    }
+    while (!skipFeed && gestures.feed(down, tx, ty, millis(), te)) {
+      if (dimmer.asleep()) {
+        s_darkTouchAt = millis() | 1;   // ECO stays awake a moment, for the second tap
+        // Double tap to wake, if it's on (Settings > Display): two taps close together.
+        static uint32_t lastTap = 0;
+        if (ui_settings.tapWake && te.type == TouchEvent::Tap) {
+          if (lastTap && millis() - lastTap < 450) { s_touchWake = true; lastTap = 0; }
+          else lastTap = millis();
+        }
+        continue;
+      }
+      const bool onLock = nav.top() && nav.top()->isLock();
+      if (!onLock || te.type == TouchEvent::Swipe || te.type == TouchEvent::Tap || te.type == TouchEvent::Up) dimmer.note();
+      View* before = nav.top();
+      nav.touch(te);
+      // A lift sends Up, then Swipe. When the Up has already changed the screen (the
+      // lock face unlocking), the Swipe mustn't act on the screen underneath too.
+      if (nav.top() != before) { gestures.dropQueued(); gestures.stopCoast(); }
+    }
+    // A finger resting on the screen sends nothing, but someone is holding it and
+    // reading: that counts as use too (not on the lock face, where a pocket presses).
+    if (gestures.down() && !dimmer.asleep() && !(nav.top() && nav.top()->isLock())) dimmer.note();
+  }
+#endif
+#if BOARD_HAS_SIDE_BUTTON
+  // The side (middle) button, like a phone's: a tap sleeps or wakes the screen,
+  // a 2.5 s hold asks to power off, five fast taps arm an SOS. Screen-off happens
+  // on RELEASE of a tap, so holding never blanks the screen under the prompt.
+  // (The right-hand PWR button is wired to the charger and can't be read.)
+  static bool btnWas = false;
+  const bool btn = digitalRead(PIN_BUTTON) == LOW;
+  const bool btnDown = btn && !btnWas, btnUp = !btn && btnWas;
+  btnWas = btn;
+  static uint32_t btnDownAt = 0;
+  static bool btnNoTap = false, btnHeld = false;
+  bool btnPress = false;                      // screen off: wake on the press itself
+  bool btnTap = false;                        // screen on: sleep on a short release
+  if (btnDown) {
+    btnDownAt = millis() | 1;
+    btnNoTap = btnHeld = false;
+    View* before = nav.top();
+    field::sosNoteButton();
+    if (nav.top() != before) { btnNoTap = btnHeld = true; dimmer.note(); nav.invalidate(); }   // SOS armed
+    else if (dimmer.asleep()) { btnPress = true; btnNoTap = true; }   // its release mustn't sleep again
+  }
+  // Signed: btnDownAt is millis()|1, so on an even millisecond it is 1 ahead of
+  // millis() and an unsigned difference wraps to ~4e9 - which fired the prompt
+  // on a plain tap about half the time.
+  if (btn && btnDownAt && !btnHeld && (int32_t)(millis() - btnDownAt) >= 2500) {
+    btnHeld = btnNoTap = true;
+    app::powerOffPrompt();
+  }
+  if (btnUp && btnDownAt) {
+    if (!btnNoTap) btnTap = true;
+    btnDownAt = 0;
+  }
+#else
+  // No side button (T-Deck): holding the trackball down does what a tap of the
+  // pager's side button does - lock and screen off - and a click wakes it. A
+  // click that wakes the screen is used up waking it.
+  bool btnPress = false;
+  const bool btnTap = rotary.takeLongPress();
+  if (dimmer.asleep() && (press || s_touchWake)) { btnPress = true; press = false; }
+  s_touchWake = false;
+#endif
+
+  if (dimmer.asleep()) {
+    // Screen off: only the side button wakes it. Keys and the wheel get pressed in
+    // a pocket, and each stray wake lit the screen and let the next bump unlock it.
+    // Their events were read above so they don't pile up; here they are dropped.
+    if (btnPress) { if (ui_settings.lockOnSleep) app::lock(); screenWakeAnimated(); }
+  } else if (detents || press || anyKey || btnTap) {
+    // With wheel-only unlock, on the lock screen only a wheel press counts as someone
+    // using it, so stray keys can't keep a pocketed screen lit.
+    const bool onLock = nav.top() && nav.top()->isLock();
+    if (!onLock || !ui_settings.wheelUnlock || press || btnTap) dimmer.note();
+    if (btnTap) {
+      // Like a phone: a tap of the side button locks and turns the screen off,
+      // with the theme's turn-off animation.
+      nav.compose();
+      fx::screenOff(nav.canvas());
+      dimmer.sleepInstant();                     // dark first, so locking doesn't animate unseen
+      app::lock();
+    } else {
+      if (detents && ui_settings.scrollTick) haptic.tick();
+      else if ((anyKey || press) && ui_settings.keyHaptics) haptic.tick();
+      // Which input, on which screen, took the time (the "in" column of the slow log).
+      char before[32];
+      strlcpy(before, g_screenTitle, sizeof(before));
+      const uint32_t tIn = millis();
+      const char* what = detents ? "wheel" : press ? "press" : backspace ? "backspace" : "key";
+#if BOARD_HAS_TRACKBALL
+      if (detents) nav.roll(ballX, ballY);
+#else
+      if (detents) nav.rotate(detents);
+#endif
+      if (press) nav.press();
+      for (uint8_t i = 0; i < nchars; i++) {
+        View* v = nav.top();
+        if (chars[i] == '\n' && v && !v->wantsAllKeys() && !v->isHome() && !v->isLock()) nav.press();
+        else nav.key(chars[i]);
+      }
+      if (backspace) nav.backspace();
+      if (millis() - tIn > 120)
+        Serial.printf("[W] input slow: %s on '%s' took %lums\n", what, before, (unsigned long)(millis() - tIn));
+    }
+  }
+
+  // Screen went dark: next wake lands on the lock face.
+  static bool wasAsleep = false;
+  if (dimmer.asleep() && !wasAsleep && ui_settings.lockOnSleep) app::lock();
+  if (dimmer.asleep() && !wasAsleep) { spooky::next(); jolly::next(); }   // Halloween: another costume and place each time the screen goes dark
+  wasAsleep = dimmer.asleep();
+
+  lap(0);
+  gpsTick();
+  lap(1);
+  wifi::tick();
+  { static bool w = false; if (wifi::connected() != w) { w = wifi::connected(); nav.statusChanged(); } }
+  {
+    static int8_t lv = 0;
+    if (s_sigAsked && g_node && g_node->heardAt && (int32_t)(g_node->heardAt - s_sigAsked) > 0) { s_sigAsked = 0; s_sigRise = millis() | 1; }
+    if (s_sigAsked && millis() - s_sigAsked >= 3000) { s_sigAsked = 0; nav.statusChanged(); }
+    if (app::signalBars() && app::signalLevel() != lv) {
+      if (app::signalLevel() > lv && !s_sigRise) s_sigRise = millis() | 1;
+      lv = app::signalLevel();
+      nav.statusChanged();
+    }
+    if (s_sigRise && millis() - s_sigRise >= 600) { s_sigRise = 0; nav.statusChanged(); }
+  }
+  {
+    static uint32_t asked = 0;
+    const uint32_t every = app::signalCheckMins() * 60000UL;
+    if (every && app::signalBars() && g_node && app::radioOk() && !dimmer.asleep() && !power::saver() &&
+        (!asked || millis() - asked > every) && (!g_node->heardAt || millis() - g_node->heardAt > every)) {
+      if (g_node->signalCheck()) s_sigAsked = millis() | 1;
+      asked = millis() | 1;
+    }
+  }
+  lap(2);
+#if BOARD_BATTERY_FROM_VOLTAGE
+  // The screen going dark (and Wi-Fi and the GPS with it) lifts the cell's voltage as
+  // a small charger would, and waking sags it: say so, or the estimate reads them as
+  // plugging in and unplugging (a charging icon and a chime with nothing plugged in).
+  {
+    static int was = -1;
+    // Roughly, in mA above the least it draws: only the changes matter.
+    const int draw = (dimmer.asleep() ? 0 : dimmer.dimmed() ? 30 : 80) + (wifi::enabled() ? 80 : 0) + (s_gpsRail ? 25 : 0);
+    if (draw != was) { battery.drawChanged(millis(), draw); was = draw; }
+  }
+#endif
+  battery.tick(millis());
+  {   // keep the battery count through restarts (RTC, every 5 s) and power loss (flash, every 30 min)
+    static uint32_t rtcAt = 0, flashAt = 0;
+    if (millis() - rtcAt > 5000) { rtcAt = millis(); battSave(false); }
+    if (millis() - flashAt > 30UL * 60UL * 1000UL) { flashAt = millis(); battSave(true); }
+  }
+  if (s_hizUntil && (int32_t)(millis() - s_hizUntil) > 0) { s_hizUntil = 0; battery.setHiZ(false); Serial.println("[batt] charger input back on"); }
+  power::tick();
+  ota::tick();
+#if BOARD_HAS_REPORTS
+  report::tick();
+#endif
+  ext::tick();
+  radioIrqWatch();
+  radioDeafWatch();
+  nodeLoop();
+  lap(3);
+  nav.tick();
+  lap(4);
+  // Something woke the screen (a message, say): the panel wakes before it is drawn
+  // on or lit.
+  if (!dimmer.asleep()) panelWake();
+  // Frame pacing: hold a steady interval between frames. Motion advances by real time,
+  // so when the per-frame draw cost swings with what is on screen (an empty row vs one
+  // with an avatar and long text) the frames arrive unevenly and the motion looks like
+  // it speeds up and slows down. Capping the rate to a cadence the screen can keep makes
+  // it even. A frame that overruns the interval just passes through; the first frame
+  // after idle is always due, so a tap still shows at once.
+#if BOARD_FRAME_MS
+  static uint32_t s_frameAt = 0;
+  const bool frameDue = millis() - s_frameAt >= g_paceMs;
+#else
+  const bool frameDue = true;
+#endif
+  if (frameDue && (!dimmer.asleep() || nav.overlayActive())) {
+#if INW_DEV
+    extern void inwFrameTick(uint32_t nowMs);
+    inwFrameTick(millis());
+#endif
+#if BOARD_FRAME_MS
+    s_frameAt = millis();
+#endif
+    nav.draw();
+  }
+  // (They wait for a frame on its way out themselves, and only when they have something to draw.)
+  if (!dimmer.asleep() && nav.top() && !nav.top()->isLock()) animateBatteryIcon(nav.displayNoWait(), theme);
+  if (!dimmer.asleep() && nav.top() && !nav.top()->isLock() && !nav.overlayActive()) animateSignalIcon(nav.displayNoWait(), theme);
+  lap(5);
+  if (!dimmer.asleep()) panelWake();       // before the light can come up
+#if BOARD_FADE_BY_CLOCK
+  // And the picture is on the panel before it does: the frame just drawn may still be
+  // on its way (it is sent from the other core), and the light coming up first would
+  // show a flash of whatever the panel held when it went dark. The fade counts from here.
+  // Once a wake: starting it over on every pass would hold the light at nothing.
+  {
+    static bool waking = false;
+    if (dimmer.asleep()) waking = true;
+    else if (waking) {
+      waking = false;
+      if (backlight.fading()) { nav.waitPresented(); backlight.restartFade(); }
+    }
+  }
+#endif
+  dimmer.tick();
+  jingle.tick();
+  if (const uint8_t f = jingle.takeFailure())
+    logs.add(LOG_WARN, "sound failed: %s, internal RAM %u kB free, largest %u kB",
+             f == 1 ? "no task" : "no I2S",
+             (unsigned)(heap_caps_get_free_size(MALLOC_CAP_INTERNAL) / 1024),
+             (unsigned)(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL) / 1024));
+
+  // The panel follows the backlight: once it has been dark a moment it also gets
+  // its sleep command, which saves more than the backlight alone.
+  {
+    static uint32_t darkSince = 0;
+    if (dimmer.asleep()) {
+      s_lastDarkAt = millis();
+      if (!darkSince) darkSince = millis() | 1;
+      if (!s_panelOff && (int32_t)(millis() - darkSince) > 1000) panelSleep();
+    } else {
+      darkSince = 0;
+      panelWake();
+    }
+  }
+#if BOARD_RADIO_ONLY_WHEN_DARK
+  // Wi-Fi parks a minute into the dark on battery, and is back the moment the screen
+  // wakes. ui_settings.wifiOn (the user's switch) is left alone; plugged in it stays
+  // up, so updates and problem reports still go while it charges.
+  {
+    static bool parked = false;
+    static uint32_t darkAt = 0;
+    if (dimmer.asleep()) { if (!darkAt) darkAt = millis() | 1; } else darkAt = 0;
+    const bool park = ui_settings.wifiOn && darkAt && (int32_t)(millis() - darkAt) > 60000 && !app::pluggedIn();
+    if (park != parked && !power::saver()) {   // battery saver switches Wi-Fi itself meanwhile
+      parked = park;
+      wifi::setEnabled(!park && ui_settings.wifiOn, true);   // back in the background: the wake isn't held for it
+      logs.add(LOG_INFO, park ? "wifi parked: screen dark on battery" : "wifi back");
+    }
+  }
+#endif
+  // Woken onto the lock screen and left alone (a message, a bump of the button):
+  // back to sleep in 10 s instead of waiting out the dim and sleep timers.
+  if (!dimmer.asleep() && nav.top() && nav.top()->isLock() && dimmer.idleFor() > 10000UL) dimmer.sleepNow();
+  gpsSchedule();
+#if BOARD_GPS_SLEEP_BY_COMMAND
+  gps.wakeTick();                       // a woken GPS gets nudged until it talks again
+#endif
+
+  // Night brightness comes on and goes off with the clock: looked at every 10 s.
+  {
+    static uint32_t at = 0;
+    static int8_t was = -1;
+    if (!at || millis() - at > 10000) {
+      at = millis() | 1;
+      const int8_t n = app::nightNow();
+      if (n != was) { if (was >= 0 || n) app::applyDisplay(); was = n; }
+    }
+  }
+  // Each dim goes in the log with how long nothing had been touched and where, so a
+  // "dims while I'm using it" report shows what it took for idleness.
+  {
+    static bool wasDim = false;
+    if (dimmer.dimmed() && !wasDim)
+      logs.add(LOG_INFO, "screen dimmed: %lus idle on '%s' (dim after %us%s)", (unsigned long)(dimmer.idleFor() / 1000),
+               g_screenTitle, power::saver() ? (unsigned)min<uint16_t>(ui_settings.dimSecs, 10) : (unsigned)ui_settings.dimSecs,
+               power::saver() ? ", battery saver" : "");
+    wasDim = dimmer.dimmed();
+  }
+  // Keyboard light follows the screen (or flashes for a message).
+  {
+    static uint8_t prev = 1;
+    uint8_t kb = dimmer.asleep() || power::saver() ? 0 : dimmer.dimmed() ? ui_settings.kbBacklight / 6 : ui_settings.kbBacklight;
+    if (s_kbFlashUntil) { if ((int32_t)(millis() - s_kbFlashUntil) < 0) kb = 255; else s_kbFlashUntil = 0; }
+    if (kb != prev) { keyboard.setBacklight(kb); prev = kb; }
+  }
+
+  // Phone link changes show in the status bar.
+  static bool bleWas = false;
+  if (bleConnected() != bleWas) { bleWas = bleConnected(); nav.statusChanged(); if (bleWas) nav.toast("phone connected"); }
+
+  if (s_prefsDirtyAt && millis() - s_prefsDirtyAt > 3000) { s_prefsDirtyAt = 0; if (g_node) g_node->savePrefsNow(); }
+  // No contacts flush here on purpose. MeshCore already writes them lazily, five
+  // seconds after anything changes them (LAZY_CONTACTS_WRITE_DELAY in MyMesh),
+  // so a timer of ours only added a second full-file write on top of that - and
+  // hasPendingWork() is also true for queued outbound packets, so it fired far
+  // more often than intended. Each write is the whole table, about a second at
+  // 1000+ contacts, with the screen frozen for it.
+  if (s_uiDirtyAt && millis() - s_uiDirtyAt > 2000) { s_uiDirtyAt = 0; ui_settings.save(); }
+  if (g_shotAt && (int32_t)(millis() - g_shotAt) >= 0) { g_shotAt = 0; takeScreenshot(); }
+#if INW_DEV
+  // USB "regions scan": each answer prints as it comes (onNodeEvent), the tally at the end.
+  if (s_usbScan.running() && s_usbScan.tick() && s_usbScan.done()) {
+    Serial.printf("[regions] done: %d answered, %d pass flood, %d silent, %d added to contacts\n",
+                  s_usbScan.answered, s_usbScan.wholeMesh, s_usbScan.silent, s_usbScan.added);
+    for (int i = 0; i < s_usbScan.count(); i++)
+      Serial.printf("[regions]   %-20s %d\n", s_usbScan.name(i), s_usbScan.servedBy(i));
+  }
+#endif
+  usbCommands();
+
+  lap(6);
+  autoAdvertTick(); sdBackupTick(); inwStoreTick(); keepEssentialsIfDue(); field::tick();
+  // Background flash writes wait for the screen to be off: they freeze PSRAM, where
+  // the screen is drawn, so a write while it's lit is dropped frames (the choppy
+  // animations). And off for 15 s, not just off: even a 276-byte file takes ~2.5 s
+  // on this SPIFFS, so a write that began the moment the side button darkened the
+  // screen was still running when it was tapped back on a second later, and the
+  // wake stalled 1.3 s. A timeout-sleep has already been idle far longer than that.
+#if BOARD_HAS_POWER_OFF
+  inwSetUserBusy(!dimmer.asleep() || dimmer.idleFor() < 15000);
+#else
+  // No software power-off here (the T-Deck's slide switch cuts the battery at
+  // once), so a save held for the screen to go dark - a minute for messages, ten
+  // for contacts - is a save lost when it's switched off with the screen on. Hold
+  // them only while someone is actually touching or typing: a few dropped frames
+  // on a screen nobody is moving beat losing a chat.
+  // And while a message is being typed (a screen that takes text is on top), for up
+  // to 20 s after the last key: a write starting between two words froze the typing.
+  // Each kind of save still has its own deadline, so nothing waits past that.
+  // And for the first 20 s after it starts: what is saved then is what was just loaded,
+  // written again, and it was stalling the first screens someone looks at.
+  // And while the lock face is up: it is the one screen that moves by itself, so a save
+  // under it shows (its animation dropped to three frames a second, measured), and it
+  // is only ever up for the ten seconds before it sleeps again - then the save goes.
+  inwSetUserBusy(!dimmer.asleep() && (dimmer.idleFor() < 3000 || millis() - s_readyAt < 20000 ||
+                 (nav.top() && nav.top()->isLock()) ||
+                 (nav.top() && nav.top()->wantsAllKeys() && dimmer.idleFor() < 20000)));
+#endif
+  inwSetScreenOn(!dimmer.asleep());
+  archive::tick(dimmer.asleep());      // messages leaving history go to the SD card in the dark
+  lap(7);
+  const uint32_t total = millis() - tLoop;
+  if (total > 150) {
+    // At most one a minute: a slow screen wrote one every pass and pushed every other
+    // line out of the log (seen on the pager 2026-11-19: 48 of 48).
+    static uint32_t slowLoggedAt = 0;
+    if (!slowLoggedAt || millis() - slowLoggedAt > 60000) {
+      slowLoggedAt = millis() | 1;
+      logs.add(LOG_WARN, "slow %lu: in%u gps%u wf%u msh%u tk%u drw%u x%u bk%u",
+               (unsigned long)total, laps[0], laps[1], laps[2], laps[3], laps[4], laps[5], laps[6], laps[7]);
+    }
+    extern char g_screenTitle[32];
+    if (laps[5] > 150) Serial.printf("[W] draw slow: %ums on '%s'%s\n", laps[5], g_screenTitle, dimmer.asleep() ? " (screen off)" : "");
+  }
+  // Screen off and nothing playing: poll gently. It used to spin every 2 ms with
+  // the screen dark. The radio holds a received packet until it's read, so 30 ms
+  // loses nothing and the CPU idles in between. A connected phone keeps the fast
+  // pace so syncing stays quick.
+  const bool idleDark = dimmer.asleep() && !jingle.playing() && !bleConnected();
+#if BOARD_SLOW_CPU_WHEN_DARK
+  // And run the main chip at 80 MHz meanwhile: a third of the speed for ~15 mA less,
+  // and still enough for Wi-Fi, the radio and flash writes (the peripherals' own
+  // 80 MHz clock doesn't change). Back to 240 the moment the screen wakes.
+  if (idleDark != s_cpuSlow) { setCpuFrequencyMhz(idleDark ? 80 : 240); s_cpuSlow = idleDark; }
+#endif
+  // ECO (experimental, Settings > Battery; from the pager, PR #13): with the screen dark
+  // and nothing else going on, the chip sleeps between messages instead of looking every
+  // 30 ms. The radio's "packet ready" line, the trackball click and the touchscreen wake
+  // it at once; otherwise it wakes for the next thing scheduled (a DM retry, an advert,
+  // a contacts save), at most 30 s on. Off, the T-Deck runs exactly as before.
+  bool slept = false;
+  if (idleDark && power::eco()) {
+    const uint32_t now = millis();
+    SleepDeadline deadline(now);
+    if (g_node) deadline.limit(g_node->sleepBudgetMs(now));
+    if (s_bootAdvert) deadline.at(s_bootAdvert + 1);
+    if (ui_settings.autoAdvertHours) deadline.after(s_lastAdvert, ui_settings.autoAdvertHours * 3600000UL + 1);
+    if (s_hizUntil) deadline.at(s_hizUntil + 1);
+    if (g_shotAt) deadline.at(g_shotAt);
+    using SleepReason = power::SleepReason;
+#if BOARD_HAS_TOUCH
+    // A touch on the dark screen may be the first of a double tap: stay up for the second.
+    const bool touching = s_darkTouchAt && millis() - s_darkTouchAt < 700;
+#else
+    const bool touching = false;
+#endif
+    const bool foreground = !s_panelOff || backlight.fading() || nav.overlayActive() ||
+      s_kbFlashUntil || s_prefsDirtyAt || s_uiDirtyAt || field::wantsGps() || touching;
+    power::sleepDiagnosticContext(touching ? SleepReason::Input : !s_panelOff ? SleepReason::Panel : backlight.fading() ? SleepReason::Fade :
+      nav.overlayActive() ? SleepReason::Overlay : s_kbFlashUntil ? SleepReason::KeyboardEffect :
+      s_prefsDirtyAt ? SleepReason::PrefsSave : s_uiDirtyAt ? SleepReason::UiSave :
+      field::wantsGps() ? SleepReason::Field : SleepReason::Background);
+    const uint8_t meshBlock = g_node ? g_node->radioSleepBlock() : 0;
+    const bool radioReceiving = radio_driver.isInRecvMode();
+    power::sleepDiagnosticMeshContext(meshBlock == 1 ? SleepReason::MeshPoolInvalid :
+      meshBlock == 2 ? SleepReason::MeshTxQueue : meshBlock == 3 ? SleepReason::MeshAllocated :
+      SleepReason::RadioNotRx);
+    power::SleepInputs idle{true, jingle.playing(), false, bleEnabled(), wifi::enabled(), s_gpsRail,
+      g_node && (meshBlock != 0 || !radioReceiving), s_radioOk, false, foreground, false, false,
+      now + deadline.ms()};
+    bool storeHeld = false;
+    if (!idle.audio && !idle.bluetooth && !idle.wifi && !idle.gps && idle.radioReady && !idle.meshBusy &&
+        !idle.background && deadline.ms() >= 2 && now >= 120000) {
+      // Plugged into a computer: never (a sleeping chip can't answer it). Asked of the USB
+      // port itself (the host's 1 ms frames), not the battery pin: that pin's "on USB" stays
+      // set after the cable comes out while the cell reads high (2026-11-20: 67 min unplugged,
+      // ECO on, radios off, not one nap). A wall charger is no computer: naps there are fine.
+      idle.usb = HWCDC::isPlugged() || (bool)Serial;
+      if (!idle.usb) {
+        idle.bluetooth = !blePrepareLightSleep();
+        if (!idle.bluetooth) {
+          storeHeld = inwStoreBeginSleep(); idle.background = !storeHeld;
+          if (!storeHeld) power::sleepDiagnosticContext(SleepReason::StoreQueue);
+        }
+      }
+    }
+    slept = power::idleLightSleep(idle);
+    if (storeHeld) inwStoreEndSleep();
+  }
+  if (!slept) delay(idleDark ? 30 : 2);
+}

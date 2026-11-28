@@ -1,0 +1,234 @@
+#include "power.h"
+#include <math.h>
+#include "app.h"
+#include "battery.h"
+#include "netwifi.h"
+#include "node.h"
+#include "settings.h"
+#include "logstore.h"
+#include "dataio.h"
+#include "regional.h"
+
+extern Battery battery;
+extern LogStore logs;
+extern void gpsPower(bool on);
+extern void markUiDirty();
+
+namespace power {
+
+static bool s_saver = false, s_dismissed = false, s_wifiWas = false, s_bleWas = false;
+
+static bool s_plugged = false;
+static uint32_t s_plugAt = 0;          // millis
+static bool s_planned = false;         // this charge is long enough to hold
+static uint32_t s_releaseAt = 0;       // epoch: stop holding and finish to 100%
+static bool s_released = false;
+
+static constexpr uint8_t HOLD_PCT = 80, REHOLD_BELOW = 75;
+static constexpr uint32_t FINISH_BEFORE_S = 2UL * 3600UL;    // 80 -> 100 with a slow taper
+
+static int localMinute() {
+  const int64_t t = (int64_t)app::now() + regional::offsetMin(app::now()) * 60;
+  return (int)(((t % 86400) + 86400) % 86400 / 60);
+}
+
+// ---- learning the unplug time ----------------------------------------------------------
+// Minute-of-day is circular (23:50 and 00:10 are close), so average on a circle.
+// Slots hold minute + 1 so 0 can mean empty.
+int predictedUnplugMin() {
+  double sx = 0, sy = 0;
+  int n = 0;
+  for (uint8_t i = 0; i < UiSettings::UNPLUG_N; i++) {
+    const uint16_t v = ui_settings.unplugMin[i];
+    if (!v) continue;
+    const double a = (v - 1) * 2.0 * M_PI / 1440.0;
+    sx += cos(a); sy += sin(a); n++;
+  }
+  if (n < 4) return -1;
+  const double r = sqrt(sx * sx + sy * sy) / n;      // 1 = always the same time
+  if (r < 0.85) return -1;                          // no routine (spread over ~2 h)
+  double a = atan2(sy, sx);
+  if (a < 0) a += 2.0 * M_PI;
+  return (int)lround(a * 1440.0 / (2.0 * M_PI)) % 1440;
+}
+
+uint8_t unplugSamples() {
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < UiSettings::UNPLUG_N; i++) if (ui_settings.unplugMin[i]) n++;
+  return n;
+}
+
+static void recordUnplug() {
+  if (!app::timeValid()) return;
+  ui_settings.unplugMin[ui_settings.unplugPos] = localMinute() + 1;
+  ui_settings.unplugPos = (ui_settings.unplugPos + 1) % UiSettings::UNPLUG_N;
+  markUiDirty();
+}
+
+// ---- optimised charging -----------------------------------------------------------------
+static void planCharge() {
+  s_planned = false;
+  if (!ui_settings.smartCharge || !app::timeValid()) return;
+  const int pred = predictedUnplugMin();
+  if (pred < 0) return;
+  const int until = (pred - localMinute() + 1440) % 1440;
+  // Only a long charge ahead is worth holding: overnight, not a top-up at lunch.
+  if (until < 3 * 60 || until > 14 * 60) return;
+  s_planned = true;
+  s_releaseAt = app::now() + until * 60UL - FINISH_BEFORE_S;
+  s_released = false;
+  logs.add(LOG_INFO, "optimised charging: hold at %u%%, full by %02d:%02d", HOLD_PCT, pred / 60, pred % 60);
+}
+
+static void chargeTick() {
+  const bool plugged = battery.pluggedIn();
+  static bool first = true;               // already on the charger at boot: no chime
+#if BOARD_BATT_UNSEEN_ON_USB
+  // This board can't see its cell on USB (battery_est.h): the log keeps what it went by,
+  // so a figure that looks wrong can be traced afterwards.
+  {
+    static float rate = 0;
+    if (plugged != s_plugged)
+      logs.add(LOG_INFO, plugged ? "usb power in: cell was %u mV, %u%%, fills %u.%u%%/h" : "usb power out: reckoned %u%%",
+               plugged ? battery.cellMillivolts() : battery.percent(), battery.percent(),
+               (unsigned)battery.rate(), (unsigned)(battery.rate() * 10) % 10);
+    if (rate != battery.rate()) {
+      if (rate) logs.add(LOG_INFO, "battery: this cell fills %u.%u%% an hour on usb (learned from the last charge)",
+                         (unsigned)battery.rate(), (unsigned)(battery.rate() * 10) % 10);
+      rate = battery.rate();
+    }
+  }
+#endif
+  if (plugged && !s_plugged) {
+    s_plugged = true; s_plugAt = millis(); planCharge();
+    if (!first) app::pluggedInFeedback();
+  }
+  first = false;
+  if (!plugged && s_plugged) {
+    nav.statusChanged();
+    s_plugged = false;
+    battery.holdCharge(false);
+    if (millis() - s_plugAt > 60UL * 60UL * 1000UL) recordUnplug();   // real charges only
+    s_planned = false;
+  }
+  if (!plugged) return;
+
+  const bool want = ui_settings.smartCharge && s_planned && !s_released;
+  if (!want) { battery.holdCharge(false); return; }
+  if (app::now() >= s_releaseAt) {
+    s_released = true;
+    battery.holdCharge(false);
+    logs.add(LOG_INFO, "optimised charging: finishing to 100%%");
+    return;
+  }
+  const uint8_t pct = battery.percent();
+  if (!battery.chargeHeld() && pct >= HOLD_PCT) battery.holdCharge(true);
+  else if (battery.chargeHeld() && pct < REHOLD_BELOW) battery.holdCharge(false);
+}
+
+bool holding() { return battery.chargeHeld(); }
+void chargeFullNow() { s_released = true; battery.holdCharge(false); }
+
+const char* chargeStatus() {
+  static char b[64];
+  const int pred = predictedUnplugMin();
+  if (!ui_settings.smartCharge) return "off";
+  if (holding() && pred >= 0) { snprintf(b, sizeof(b), "held at %u%%, full by %02d:%02d", HOLD_PCT, pred / 60, pred % 60); return b; }
+  if (s_plugged && s_planned && !s_released) return "on, will hold at 80%";
+  if (pred < 0) { snprintf(b, sizeof(b), "learning your routine (%u of 4+ unplugs)", unplugSamples()); return b; }
+  snprintf(b, sizeof(b), "ready, you usually unplug ~%02d:%02d", pred / 60, pred % 60);
+  return b;
+}
+
+// ---- battery saver ------------------------------------------------------------------------
+static void enterSaver(bool automatic) {
+  if (s_saver) return;
+  s_saver = true;
+  s_wifiWas = wifi::enabled();
+  s_bleWas = bleEnabled();
+  if (s_wifiWas) wifi::setEnabled(false);
+  if (s_bleWas) bleSetEnabled(false);
+  if (ui_settings.gpsOn) gpsPower(false);
+  app::applyDisplay();
+  nav.statusChanged();
+  logs.add(LOG_INFO, "battery saver on at %u%%%s", battery.percent(), automatic ? "" : " (manual)");
+  nav.banner("Battery saver on", "gps, bluetooth and wi-fi are off. messages still work.", 6000);
+}
+
+static void exitSaver(const char* why) {
+  if (!s_saver) return;
+  s_saver = false;
+  if (s_wifiWas) wifi::setEnabled(true);
+  if (s_bleWas) bleSetEnabled(true);
+  if (ui_settings.gpsOn) gpsPower(true);
+  app::applyDisplay();
+  nav.statusChanged();
+  logs.add(LOG_INFO, "battery saver off: %s", why);
+  nav.toast("battery saver off", 3000);
+}
+
+bool saver() { return s_saver; }
+
+void setSaver(bool on) {
+  if (on) { s_dismissed = false; enterSaver(false); }
+  else { exitSaver("turned off"); s_dismissed = true; }
+}
+
+static void saverTick() {
+  const uint8_t pct = battery.percent();
+  const bool plugged = battery.pluggedIn();
+  if (s_dismissed && (plugged || pct > ui_settings.saverPct + 5)) s_dismissed = false;
+  if (!s_saver && ui_settings.autoSaver && !s_dismissed && !plugged && pct && pct <= ui_settings.saverPct) enterSaver(true);
+  if (s_saver && plugged && pct >= 80) exitSaver("charged to 80%");
+}
+
+// Nearly flat and not charging: put everything on flash now, once, rather than
+// trust the next batched save to beat the battery. Turning the pager off cuts
+// power in hardware with no warning to us, so that case is covered by saves
+// landing within minutes of a change instead (tools/patch_meshcore.py).
+static void lowBatterySave() {
+  static bool done = false;
+  const bool plugged = battery.pluggedIn();
+  if (plugged) { done = false; return; }
+  const uint16_t mv = battery.millivolts();
+  const bool critical = (battery.percent() && battery.percent() <= 3) || (mv && mv < 3450);
+  if (done || !critical) return;
+  done = true;
+  if (g_node) {
+    if (g_node->hasPendingWork()) g_node->saveContactsNow();
+    g_node->savePrefsNow();
+  }
+  ui_settings.save();
+  const bool landed = inwStoreFlush(10000);
+  logs.add(LOG_WARN, "battery critical (%u%%, %umV): saved everything%s", battery.percent(), mv, landed ? "" : " (slow)");
+}
+
+// Flat: turn off properly instead of running the cell down into brownout resets
+// (which over-discharge it). A minute of readings must agree, so a radio burst
+// sagging the voltage can't do it.
+static void criticalPowerOff() {
+  static uint8_t lowRuns = 0;
+  if (battery.pluggedIn()) { lowRuns = 0; return; }
+  const uint16_t mv = battery.millivolts();
+  const bool flat = battery.percent() <= 1 && mv && mv < 3400;
+  lowRuns = flat ? (uint8_t)min(lowRuns + 1, 250) : 0;
+  if (lowRuns >= 12) app::powerOff("battery empty");     // 12 x 5 s
+}
+
+void tick() {
+  static uint32_t last = 0, lastPoll = 0;
+  if (!battery.present() || !battery.hasReading() || millis() < 15000) return;
+  bool changed = false;
+  if (millis() - lastPoll > 500) {
+    lastPoll = millis();
+    changed = battery.pollVbus() != s_plugged;
+  }
+  if (!changed && millis() - last < 5000) return;
+  last = millis();
+  chargeTick();
+  saverTick();
+  lowBatterySave();
+  criticalPowerOff();
+}
+
+}  // namespace power
