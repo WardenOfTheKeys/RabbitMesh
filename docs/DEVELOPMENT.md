@@ -36,7 +36,7 @@ cp $B/firmware.bin rabbitmesh-tdeck-update.bin
 ```bash
 test/run.sh                  # host tests: every tool's logic (wardrive, deck, spectrum, MECP, fox, WiGLE,
                              # flock, holidays, time zone, mesh clock, camera map)
-preview/render.sh build      # the lock scenes, the rabbit and the Deck screens, through the real drawing code,
+preview/render.sh build      # the lock scenes, the rabbit, the Deck screens and the game, through the real drawing code,
                              # to preview/out/*.png
 preview/check.sh build       # the animation checks: the walk, the talk frames, a stress test under ASan/UBSan
 ```
@@ -56,7 +56,8 @@ src/flock.{h,cpp}                the Flock hunt: the camera map and the radio li
 src/fox.{h,cpp}                  the fox hunt (any signal, a repeater, a WiFi network)
 src/spectrum.{h,cpp}             the spectrum analyzer: borrowing the radio, the sweep, handing it back
 src/mecp.{h,cpp}                 MECP emergency messages: write, inbox, alerts
-src/sdview.{h,cpp}               the SD card viewer
+src/sdview.{h,cpp}               the SD card viewer (and formatting a card it can't read)
+src/bricks*.{h,cpp}              Burrow Breach: the game (bricks_core.h), its look (bricks_draw.h), the screen
 src/needs.h                      the "needs: gps fix ok, sd card NO" line
 src/meshclock.{h,cpp}            the clock from the mesh
 src/tzauto.{h,cpp}               the time zone from location

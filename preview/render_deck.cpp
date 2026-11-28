@@ -33,15 +33,16 @@ int main() {
   auto clear = [&] { d.fillRect(0, 0, W, H, t.bg); };
 
   // hub
-  Tile tiles[14] = {
+  Tile tiles[15] = {
     {"DRIVE", "12.4 mi  0h42m", IC_DRIVE, true, 'd'},   {"WARDRV", "83 stops", IC_WARDRIVE, true, 'w'},
     {"WIFI/BT", "412 wifi 96bt", IC_WIFI, true, 'b'},  {"FLOCK", "1830 mapped", IC_FLOCK, false, 'f'},
     {"FOX", "find a signal", IC_FOX, false, 'x'},       {"TRIP", "12.4 mi  REC", IC_TRIP, true, 't'},
     {"RF MON", "noise -121", IC_RF, false, 'r'},    {"SPECTRUM", "sweep band", IC_SPECTRUM, false, 's'},
     {"AIRTIME", "load 3.4%", IC_AIR, false, 'a'},       {"RADAR", "12 placed", IC_RADAR, false, 'n'},
     {"MECP", "1 urgent", IC_MECP, true, 'e'},           {"FIELD", "sos range trl", IC_FIELD, false, 'i'},
-    {"SD CARD", "27.3 GB free", IC_SD, false, 'c'},     {"MORE", "all tools", IC_MORE, false, 'o'}};
-  clear(); hub(d, t, tiles, 14, 0, 1.3f); save(d, "deck_hub", t, "Deck");
+    {"SD CARD", "27.3 GB free", IC_SD, false, 'c'},     {"GAME", "burrow breach", IC_GAME, false, 'g'},
+    {"MORE", "all tools", IC_MORE, false, 'o'}};
+  clear(); hub(d, t, tiles, 15, 13, 1.3f); save(d, "deck_hub", t, "Deck");
 
   // monitor
   deckcore::Series<96> rs, ns;

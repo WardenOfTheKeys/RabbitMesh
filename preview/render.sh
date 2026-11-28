@@ -12,9 +12,9 @@ BUILD=${1:-$HERE/../build}
 OUT=${2:-$HERE/out}
 STAGE=$(mktemp -d)
 mkdir -p "$OUT"
-cp "$BUILD"/src/{theme.h,themes.h,mascot.h,scenes.h,scene_halloween.h,scene_squatchmas.h,scene_rabbit.h,scene_cyber.h,scene_holiday.h,costume_sprite.h,holiday_sprite.h,holiday_sprite.cpp,rabbit.h,rabbit_sprite.h,rabbit_sprite.cpp,squatch_talk.h,rabbit_talk.h,deck_core.h,deck_draw.h,spectrum_core.h,mecp_core.h} "$STAGE"/
+cp "$BUILD"/src/{theme.h,themes.h,mascot.h,scenes.h,scene_halloween.h,scene_squatchmas.h,scene_rabbit.h,scene_cyber.h,scene_holiday.h,costume_sprite.h,holiday_sprite.h,holiday_sprite.cpp,rabbit.h,rabbit_sprite.h,rabbit_sprite.cpp,squatch_talk.h,rabbit_talk.h,deck_core.h,deck_draw.h,spectrum_core.h,mecp_core.h,bricks_core.h,bricks_draw.h} "$STAGE"/
 cp "$HERE"/mock/* "$STAGE"/          # after the real headers: the mocks replace display_config.h and audio_jingle.h
-for r in render render_deck render_lock; do
+for r in render render_deck render_lock render_game; do
   g++ -std=c++17 -Wno-misleading-indentation -I"$STAGE" "$HERE/$r.cpp" "$STAGE/rabbit_sprite.cpp" "$STAGE/holiday_sprite.cpp" -o "$STAGE/$r"
   (cd "$OUT" && "$STAGE/$r" > /dev/null)
 done

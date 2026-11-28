@@ -67,7 +67,7 @@ inline void dashedH(G& g, int x, int y, int w, uint16_t c, int on = 3, int off =
 
 // ---- the hub ---------------------------------------------------------------------------------
 enum Icon : uint8_t { IC_RF = 0, IC_AIR, IC_RADAR, IC_TRIP, IC_WARDRIVE, IC_DISCOVER, IC_SNIFF, IC_FIELD, IC_MORE, IC_SPECTRUM, IC_MECP, IC_GPS,
-                      IC_FOX, IC_WIFI, IC_FLOCK, IC_DRIVE, IC_SD };
+                      IC_FOX, IC_WIFI, IC_FLOCK, IC_DRIVE, IC_SD, IC_GAME };
 
 struct Tile {
   const char* title;
@@ -204,6 +204,13 @@ inline void icon(G& g, const Theme& t, uint8_t ic, int x, int y, uint16_t c, uin
       for (int i = 0; i < 3; i++) g.fillRect(x + 9 + i * 2, y + 2, 1, 4, c2);
       g.fillRect(x + 6, y + 12, 8, 5, mix(t.panel, c, 0.4f));
       break;
+    case IC_GAME: {                                        // a wall of blocks, a packet bouncing under it, the board
+      for (int r = 0; r < 2; r++) for (int i = 0; i < 4; i++) g.fillRect(x + i * 5, y + 1 + r * 4, 4, 3, r ? c2 : c);
+      const float b = fabsf(sinf(phase * 2.2f));
+      g.fillCircle(x + 6 + (int)(b * 8), y + 10 + (int)(b * 5), 1, t.white);
+      g.fillRect(x + 4, y + 18, 12, 2, c);
+      break;
+    }
     case IC_GPS:                                           // a satellite
       g.fillRect(x + 7, y + 7, 6, 6, c);
       g.fillRect(x, y + 8, 6, 4, c2); g.fillRect(x + 14, y + 8, 6, 4, c2);

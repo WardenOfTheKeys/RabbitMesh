@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Host tests for the wardrive, deck, spectrum, MECP, fox hunt, WiGLE, Flock signature, holiday, time zone, mesh clock and camera-map logic (no hardware, no PlatformIO).
+# Host tests for the wardrive, deck, spectrum, MECP, fox hunt, WiGLE, Flock signature, holiday, time zone, mesh clock, game and camera-map logic (no hardware, no PlatformIO).
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 OUT=$(mktemp -d)
-for t in wardrive_core_test deck_core_test spectrum_core_test mecp_core_test fox_core_test wigle_core_test flock_core_test holiday_core_test tz_core_test meshclock_core_test; do
+for t in wardrive_core_test deck_core_test spectrum_core_test mecp_core_test fox_core_test wigle_core_test flock_core_test holiday_core_test tz_core_test meshclock_core_test bricks_core_test; do
   g++ -std=c++17 -Wall -Wextra -Wno-unused-function -I"$HERE/../src" "$HERE/$t.cpp" -o "$OUT/$t"
   "$OUT/$t"
 done

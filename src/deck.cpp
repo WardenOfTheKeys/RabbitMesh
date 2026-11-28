@@ -23,6 +23,7 @@
 #include "tzauto.h"
 #include "meshclock.h"
 #include "drive.h"
+#include "bricks.h"
 #include "sdview.h"
 #include "updcheck.h"
 #include "ui.h"
@@ -620,8 +621,8 @@ void openTrip() { nav.push(new TripView()); }
 // The tiles, in hub order, with their shortcut letters (shown on each tile). Numbers 1-9 and 0
 // open the first ten as before.
 enum TileId : uint8_t { T_DRIVE, T_WARDRV, T_WIFI, T_FLOCK, T_FOX, T_TRIP, T_RF, T_SPECTRUM, T_AIR,
-                        T_RADAR, T_MECP, T_FIELD, T_SD, T_MORE, T_COUNT };
-static const char TILE_KEY[T_COUNT] = {'d', 'w', 'b', 'f', 'x', 't', 'r', 's', 'a', 'n', 'e', 'i', 'c', 'o'};
+                        T_RADAR, T_MECP, T_FIELD, T_SD, T_GAME, T_MORE, T_COUNT };
+static const char TILE_KEY[T_COUNT] = {'d', 'w', 'b', 'f', 'x', 't', 'r', 's', 'a', 'n', 'e', 'i', 'c', 'g', 'o'};
 
 class HubView : public View {
 public:
@@ -665,7 +666,7 @@ private:
 
   void refresh() { countNearby(); _sdText = sdview::tileText(); }
 
-  // Five rows of three: driving, hunting, the radio, comms and the field, the card and the rest.
+  // Five rows of three: driving, hunting, the radio, comms and the field, then the card, the game and the rest.
   void build(Tile* t) {
     char d[20];
     setTile(t[T_DRIVE], "DRIVE", drive::tileText().c_str(), IC_DRIVE, drive::on(), TILE_KEY[T_DRIVE]);
@@ -700,6 +701,7 @@ private:
     else if (flockhunt::mappedCount()) snprintf(t[T_FLOCK].stat, sizeof t[T_FLOCK].stat, "%lu mapped", (unsigned long)flockhunt::mappedCount());
     else snprintf(t[T_FLOCK].stat, sizeof t[T_FLOCK].stat, "alpr cameras");
     setTile(t[T_SD], "SD CARD", _sdText.c_str(), IC_SD, false, TILE_KEY[T_SD]);
+    setTile(t[T_GAME], "GAME", "burrow breach", IC_GAME, false, TILE_KEY[T_GAME]);
     setTile(t[T_MORE], "MORE", "all tools", IC_MORE, false, TILE_KEY[T_MORE]);
   }
   void launch(int i) {
@@ -717,6 +719,7 @@ private:
       case T_FIELD: field::openMenu(); break;
       case T_FLOCK: flockhunt::openMenu(); break;
       case T_SD: sdview::open(); break;
+      case T_GAME: bricks::open(); break;
       default: app::openTools(); break;
     }
   }

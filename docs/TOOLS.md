@@ -6,7 +6,7 @@ Everything on the T-Deck's **Deck**, what each tool shows, its keys, and what to
 
 ## The Deck
 
-The deck is a hub of 14 tiles, three across. Each tile shows a live figure and its shortcut letter, and tools running in the background pulse. Open it with `t` on the home screen, the **Deck** card or dock button, or Tools > deck. Move with the trackball, tap a tile, or press its letter: `d` drive, `w` wardrive, `b` wifi/bt, `f` flock, `x` fox, `t` trip, `r` rf monitor, `s` spectrum, `a` airtime, `n` radar, `e` mecp, `i` field, `c` sd card, `o` more (`1`–`9`/`0` open the first ten).
+The deck is a hub of 15 tiles, three across. Each tile shows a live figure and its shortcut letter, and tools running in the background pulse. Open it with `t` on the home screen, the **Deck** card or dock button, or Tools > deck. Move with the trackball, tap a tile, or press its letter: `d` drive, `w` wardrive, `b` wifi/bt, `f` flock, `x` fox, `t` trip, `r` rf monitor, `s` spectrum, `a` airtime, `n` radar, `e` mecp, `i` field, `c` sd card, `g` game, `o` more (`1`–`9`/`0` open the first ten).
 
 ![Deck](deck-hub.png)
 
@@ -25,6 +25,7 @@ The deck is a hub of 14 tiles, three across. Each tile shows a live figure and i
 | **Wardrive** | the mesh coverage survey: see [Wardrive](#wardrive-mesh-coverage) below | menu: start/stop, live view, show coverage, review a run |
 | **Field** | range test (a discover every few seconds, logged), SOS (a call for help on a channel every 5 minutes, after a 20-second countdown you can cancel), breadcrumb trail (with a way back to the start) | menu |
 | **SD card** | a card that's in but can't be read (exFAT, or a Mac format) says so and offers to format it as FAT32; how full the card is; what each tool saved (files and size per folder); the files newest first; a look at the start of one; delete a file or a folder's logs (each asks first) | press: open, backspace: back |
+| **Game** | Burrow Breach, a brick-breaker: the rabbit's hoverboard bats a data packet into a firewall. Five levels (Port Scan, Firewall, Carrot, Ears, Mainframe), then round again faster; ICE blocks take two hits; carrots drop power-ups (W wider board for 15 s, M three packets, S slower packet for 10 s, + a life). Three lives; the best score is kept across restarts. The mesh keeps running; the game pauses when the screen goes dark or another screen opens over it | roll / `a` `d` / a finger: move, press: launch, `p`: pause, `s`: sound, backspace: quit |
 | **More** | the full Tools list (Discover, GPS, settings and the rest) | |
 
 
