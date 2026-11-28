@@ -13,6 +13,8 @@
 #include "display_config.h"
 #include "theme.h"
 #include "mascot.h"
+#include "rabbit.h"         // RabbitMesh: the Neon Rabbit theme's character
+#include "costume_sprite.h"  // RabbitMesh: the Halloween ghost (scene_holiday.h)
 
 namespace scenes {
 
@@ -298,5 +300,10 @@ inline void halloween(lgfx::LovyanGFX& d, const Theme& t, float phase, float scr
 inline void squatchmas(lgfx::LovyanGFX& d, const Theme& t, float phase, float scroll, bool unread) {
   squatchmas(d, t, SpookyFrame{W, GROUND, MASCOT_X, NARROW, 0, 0, 0, 0}, phase, scroll, unread);
 }
+
+// RabbitMesh: the Neon Rabbit theme's rainy city.
+#include "scene_rabbit.h"
+#include "scene_cyber.h"    // RabbitMesh: Red Team and Blue Team
+#include "scene_holiday.h"  // RabbitMesh: its holidays
 
 }  // namespace scenes

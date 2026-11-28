@@ -14,7 +14,7 @@
 #   ./check.sh [source tree] [output dir]
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-BUILD=${1:-$HERE/../build}
+BUILD=${1:-$HERE/..}
 OUT=${2:-$HERE/out/compare}
 STAGE=$(mktemp -d)
 mkdir -p "$OUT"

@@ -151,7 +151,7 @@ void drawStatusBar(lgfx::LovyanGFX& d, const Theme& t, bool withClock, bool with
     char keyName[10] = "";
     if (g_node) mesh::Utils::toHex(keyName, g_node->self_id.pub_key, 4);
     if (name[0] && strcmp(name, keyName) && strcmp(name, "NONAME")) x = drawUtf8(d, name, 6, 1, NARROW ? 110 : 140);
-    else x += d.drawString("SQUATCH", 6, 1);
+    else x += d.drawString(RABBITMESH ? "RABBIT" : "SQUATCH", 6, 1);
   }
   x += 8;
   const uint16_t un = app::unread();
@@ -1367,13 +1367,18 @@ void TextPageView::tick() {
       for (String line : _lines) {
         if (g.textWidth(line) > maxW) while (line.indexOf("   ") >= 0) line.replace("   ", "  ");
         bool first = true;
-        while (g.textWidth(line) > maxW) {
+        for (int pass = 0; pass < 32 && g.textWidth(line) > maxW; pass++) {
+          // RabbitMesh: never cut inside the indent. A wrapped rest that is one long word (a log
+          // file's path) used to split off the indent's own spaces and rebuild the same line for
+          // ever: the screen froze until the watchdog restarted it.
+          int lead = 0;
+          while (lead < (int)line.length() && line[lead] == ' ') lead++;
           int cut = -1;
-          for (int i = line.indexOf(' ', 1); i > 0; i = line.indexOf(' ', i + 1)) {
+          for (int i = line.indexOf(' ', lead + 1); i > 0; i = line.indexOf(' ', i + 1)) {
             if (g.textWidth(line.substring(0, i)) > maxW) break;
             cut = i;
           }
-          if (cut <= 0) break;                      // one long word: let it run
+          if (cut <= lead) break;                   // one long word: let it run
           out.push_back(line.substring(0, cut));
           String rest = line.substring(cut);
           rest.trim();

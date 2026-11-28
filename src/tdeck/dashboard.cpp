@@ -13,6 +13,7 @@
 #include "gps.h"
 #include "netwifi.h"
 #include "regional.h"
+#include "deck.h"       // RabbitMesh
 
 namespace {
 
@@ -28,7 +29,11 @@ const DockItem DOCK[DOCK_N] = {
   { "Chats",    'm', [] { app::openChats(); } },
   { "People",   'c', [] { app::openContacts(); } },
   { "Map",      'p', [] { app::openMap(); } },
+#if RABBITMESH
+  { "Deck",     't', [] { deck::open(); } },          // RabbitMesh: the tools hub
+#else
   { "Tools",    't', [] { app::openTools(); } },
+#endif
   { "Settings", 's', [] { app::openSettings(); } },
 };
 

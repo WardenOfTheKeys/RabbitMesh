@@ -13,6 +13,8 @@
 #include "backlight.h"
 #include "logstore.h"
 #include "regional.h"
+#include "wardrive.h"   // RabbitMesh: runs from field::tick(), keeps the GPS on via wantsGps()
+#include "deck.h"       // RabbitMesh: the deck's airtime history and trip, the same way
 
 extern LogStore logs;
 
@@ -105,9 +107,10 @@ bool rangeOn() { return s_range; }
 
 static void rangeStart() {
   if (!g_node) { nav.toast("radio not running"); return; }
+  if (wardrive::running()) { nav.toast("stop the wardrive first - they share the discover", 3000); return; }
   if (!openLog("range", "range", "time_utc,lat,lon,sats,repeater,key,they_hear_us_db,we_hear_them_db,rssi_dbm", s_rangePath, sizeof(s_rangePath))) {
-    nav.toast("needs an sd card for the log", 3000);
-    return;
+    s_rangePath[0] = 0;                      // RabbitMesh: the live readings work without a card
+    nav.toast("no sd card: testing without a log", 3000);
   }
   s_range = true;
   s_rounds = s_hitsTotal = s_answered = 0;
@@ -169,7 +172,8 @@ static void rangePage() {
     if (s_rangeAsked) out.push_back(String("listening... ") + (LISTEN_MS - (millis() - s_rangeAsked)) / 1000 + " s");
     else if (s_rounds) out.push_back(String("last round: ") + s_lastHits + (s_lastHits == 1 ? " repeater" : " repeaters"));
     if (s_rangeBest[0]) out.push_back(String("best heard: ") + s_rangeBest + "  " + String(s_bestSnr4 / 4.0, 1) + " dB");
-    if (s_rangePath[0]) out.push_back(String("log  sd ") + s_rangePath);
+    const char* file = strrchr(s_rangePath, '/');   // RabbitMesh: the name only, it fits the screen
+    out.push_back(s_rangePath[0] ? String("log  ") + (file ? file + 1 : s_rangePath) : String("log  none (no sd card)"));
     out.push_back("");
     out.push_back("press: start / stop");
   }, 1000);
@@ -181,6 +185,7 @@ static void rangePage() {
 static bool s_sos = false;
 static uint32_t s_sosNext = 0, s_sosSent = 0;
 static const uint32_t SOS_EVERY_MS = 5UL * 60UL * 1000UL;
+static const uint32_t SOS_RETRY_MS = 30UL * 1000UL;   // RabbitMesh: after a send that didn't go out
 
 bool sosOn() { return s_sos; }
 
@@ -202,9 +207,9 @@ static void setSosChannel(int idx) {
   if (p.begin("inw-field", false)) { p.putInt("sosch", idx); p.end(); }
 }
 
-static void sosSend() {
+static bool sosSend() {
   const int idx = sosChannel();
-  if (idx < 0 || !g_node) { logs.add(LOG_ERROR, "sos: no channel to send on"); return; }
+  if (idx < 0 || !g_node) { logs.add(LOG_ERROR, "sos: no channel to send on"); s_sosNext = millis() + SOS_RETRY_MS; return false; }
   ChannelDetails ch;
   g_node->getChannel(idx, ch);
   double la, lo;
@@ -217,17 +222,22 @@ static void sosSend() {
   else
     snprintf(text, sizeof(text), "SOS - %s needs help. Position unknown (no gps fix)", g_node->name());
   const uint32_t id = history.add(ConvKey::channel(ch.channel.secret), HF_OUT, ST_SENDING, g_node->name(), text, app::now());
-  g_node->sendChannel(idx, text, id);
+  if (!g_node->sendChannel(idx, text, id)) {   // RabbitMesh: the radio couldn't queue it - try again soon
+    logs.add(LOG_ERROR, "sos NOT sent on %s: retrying in 30 s", ch.name);
+    s_sosNext = millis() + SOS_RETRY_MS;
+    return false;
+  }
   s_sosSent++;
   logs.add(LOG_WARN, "sos sent (%lu) on %s", (unsigned long)s_sosSent, ch.name);
+  return true;
 }
 
 static void sosStart() {
   if (sosChannel() < 0) { nav.toast("join a channel first - sos goes to a channel", 3000); return; }
   s_sos = true;
   s_sosSent = 0;
-  sosSend();                                 // position may be old; the next send has a fresh fix
   s_sosNext = millis() + SOS_EVERY_MS;
+  sosSend();                                 // position may be old; the next send has a fresh fix (a failed one: 30 s)
   haptic.buzz(3);
   nav.banner("SOS on", "sent now and every 5 minutes. tools > field to stop.", 6000);
 }
@@ -242,7 +252,7 @@ static void sosStop() {
 static void sosTick() {
   if (!s_sos || (int32_t)(millis() - s_sosNext) < 0) return;
   s_sosNext = millis() + SOS_EVERY_MS;
-  sosSend();
+  sosSend();                                 // sets a 30 s retry itself if it didn't go out
 }
 
 // Countdown before an SOS goes out: a pocketed pager pressed five times shouldn't
@@ -410,6 +420,7 @@ static double s_walked = 0;
 static char s_trailPath[64] = "";
 static const size_t TRAIL_MAX = 5000;       // ~40 kB in PSRAM; about 75 km at 15 m spacing
 static const double TRAIL_STEP_M = 15;
+static uint8_t s_trailJumps = 0;            // far fixes in a row (see trailTick)
 
 bool trailOn() { return s_trail; }
 const TrailPt* trail(size_t& n) { n = s_pts ? s_pts->size() : 0; return n ? s_pts->data() : nullptr; }
@@ -419,6 +430,7 @@ static void trailStart() {
   s_pts->clear();
   s_pts->reserve(256);
   s_walked = 0;
+  s_trailJumps = 0;
   s_trail = true;
   s_trailCheck = 0;
   if (!openLog("trail", "trail", "time_utc,lat,lon,sats", s_trailPath, sizeof(s_trailPath))) s_trailPath[0] = 0;
@@ -440,8 +452,15 @@ static void trailTick() {
     const TrailPt& p = s_pts->back();
     const double d = metres(p.lat, p.lon, la, lo);
     if (d < TRAIL_STEP_M) return;
-    if (d > 2000) return;                    // a GPS jump, not a walk
-    s_walked += d;
+    // A GPS jump, not a walk - unless the fixes keep saying so: after a stretch with no fix
+    // (a tunnel, a drive) every new point is far from the last, and the trail used to stop
+    // for good. RabbitMesh: three in a row, a new stretch starts there (the gap isn't walked).
+    if (d > 2000) {
+      if (++s_trailJumps < 3) return;
+    } else {
+      s_walked += d;
+    }
+    s_trailJumps = 0;
   }
   if (s_pts->size() >= TRAIL_MAX) s_pts->erase(s_pts->begin() + 1);   // keep the start, drop the oldest after it
   s_pts->push_back({(float)la, (float)lo});
@@ -461,7 +480,8 @@ static void trailPage() {
     } else if (!fix(la, lo)) {
       out.push_back("gps  searching for a fix...");
     }
-    if (s_trailPath[0]) out.push_back(String("log  sd ") + s_trailPath);
+    const char* file = strrchr(s_trailPath, '/');   // RabbitMesh: the name only, it fits the screen
+    if (s_trailPath[0]) out.push_back(String("log  ") + (file ? file + 1 : s_trailPath));
     out.push_back("the map shows the trail and the start point");
     out.push_back("");
     out.push_back(s_trail ? "press: stop" : "press: start a new trail");
@@ -471,13 +491,15 @@ static void trailPage() {
 }
 
 // ---- menu / loop ------------------------------------------------------------------------------
-bool wantsGps() { return s_range || s_sos || s_trail; }
+bool wantsGps() { return s_range || s_sos || s_trail || wardrive::wantsGps() || deck::wantsGps(); }
 
 void tick() {
   rangeTick();
   armTick();
   sosTick();
   trailTick();
+  wardrive::tick();
+  deck::tick();
 }
 
 void openMenu() {

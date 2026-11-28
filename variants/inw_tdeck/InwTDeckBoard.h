@@ -10,5 +10,9 @@ public:
   uint16_t (*battReader)() = nullptr;
   void begin() { ESP32Board::begin(); }
   uint16_t getBattMilliVolts() override { return battReader ? battReader() : 0; }
+#if RABBITMESH
+  const char* getManufacturerName() const override { return "LilyGo T-Deck (RabbitMesh)"; }   // what the phone app shows
+#else
   const char* getManufacturerName() const override { return "LilyGo T-Deck (Squatch Mesh)"; }
+#endif
 };

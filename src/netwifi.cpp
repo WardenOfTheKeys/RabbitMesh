@@ -379,10 +379,12 @@ static uint8_t s_recentHead = 0;
 static void buildUrl(const Req& r, char* url, size_t cap, bool& wantJpg) {
   wantJpg = false;
   switch (ui_settings.tileSource) {
+#if !RABBITMESH   // RabbitMesh uses no other project's servers: a saved "1" gets OpenStreetMap
     case 1:   // Wadamesh's proxy: HTTP, transcoded to JPEG
       snprintf(url, cap, "http://tiles.wadamesh.com/%u/%ld/%ld.jpg", r.z, (long)r.x, (long)r.y);
       wantJpg = true;
       break;
+#endif
     case 2: {
       String base = ui_settings.tileUrl;
       while (base.endsWith("/")) base.remove(base.length() - 1);
@@ -415,7 +417,11 @@ static void fetchTask(void*) {
     http.setTimeout(4000);
     bool began = https ? http.begin(secure, url) : http.begin(plain, url);
     if (!began) { s_fail++; continue; }
+#if RABBITMESH
+    http.addHeader("User-Agent", "RabbitMesh/" RABBITMESH_VERSION " (LilyGo T-Deck)");   // who's really asking
+#else
     http.addHeader("User-Agent", "SquatchMesh/1.0 (LilyGo T-Lora Pager mesh firmware; github.com/BamBam1121)");
+#endif
     const int code = http.GET();
     s_lastCode = code;
     bool ok = false;

@@ -1,5 +1,7 @@
 // Problem reports (bugreport.h).
 #include "bugreport.h"
+#include "board_pins.h"
+#if BOARD_HAS_REPORTS   // off in RabbitMesh (board_pins.h): none of this is built, no report address in it
 #include <SPIFFS.h>
 #include "tls_client.h"   // WiFiClientSecure without its stray close(0)
 #include <HTTPClient.h>
@@ -427,3 +429,4 @@ void tick() {
 
 // For ota.cpp: the two take turns on the network.
 bool reportPosting() { return report::posting(); }
+#endif  // BOARD_HAS_REPORTS

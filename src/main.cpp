@@ -57,10 +57,14 @@ static Gestures   gestures;
 #include "history.h"
 #include "dataio.h"
 #include "fieldtools.h"
+#include "mecp.h"         // RabbitMesh
 #include "netwifi.h"
 #include "fx.h"
 #include "regional.h"
 #include "bootscreen.h"
+#if RABBIT_BOOT_ART
+#include "boot_rabbit.h"   // the rings the boot task animates
+#endif
 #include "fsmigrate.h"
 #include "extport.h"
 #include "qrview.h"
@@ -384,9 +388,22 @@ void app::applyDisplay() {
 void app::applySound() { jingle.setVolume(ui_settings.sound ? ui_settings.volume : 0); }
 void app::applyHaptics() { haptic.setMode(ui_settings.vibeMode); }
 
+#if RABBITMESH
+#include "holiday.h"
+// A holiday's theme is shown over the owner's while it lasts (holiday.h); theirs is untouched.
+const ThemeSpec& app::themeSpec() {
+  const int h = holiday::shownId();
+  return themes::spec(h >= 0 ? (uint8_t)h : ui_settings.themeId);
+}
+#else
 const ThemeSpec& app::themeSpec() { return themes::spec(ui_settings.themeId); }
+#endif
 
 void app::applyTheme() {
+#if RABBITMESH
+  // A hidden Squatch look (a restored backup, a USB "theme" command): the Neon Rabbit instead.
+  if (!themeListed(ui_settings.themeId)) ui_settings.themeId = THEME_NEON;   // upstream looks and custom themes too
+#endif
   const ThemeSpec& th = themeSpec();
   theme.apply(display, th.palette, th.style);
   theme.own = themes::isCustom(ui_settings.themeId) && themes::valid(ui_settings.themeId);
@@ -901,6 +918,7 @@ static void onNodeEvent(NodeEvent e, const void* arg) {
       const ConvKey k = ConvKey::channel(ch.channel.secret);
       HistMsg* m = history.last(k);
       if (!m) return;
+      if (mecp::onChannelMessage(ch.name, *m)) return;   // RabbitMesh: a MECP MAYDAY/URGENT has its own alert
       if (ui_settings.ignoreOneChar && strlen(m->text) <= 1) { if (g_openConv == k) history.markRead(k); return; }
       if (g_openConv == k && !dimmer.asleep()) { history.markRead(k); return; }
       const bool mention = m->flags & HF_MENTION;
@@ -2158,6 +2176,32 @@ struct BootBusLock {
 static volatile bool s_animRun = false;
 static SemaphoreHandle_t s_animDone = nullptr;
 
+#if RABBIT_BOOT_ART
+// RabbitMesh: drawLogo() drew the rabbit on this (the main) task; the animation task only
+// pulses the rings out of his antenna, in a small box over a copy of what was under it, so
+// it never draws the rabbit (his image data and frame buffer stay on one task).
+static Canvas s_ringBack;
+static rabbit::Point s_ringAt = {-1, -1};      // where drawLogo() put the antenna, on the screen
+static void bootAnimTask(void*) {
+  Canvas spr;
+  spr.setColorDepth(16);
+  const rabbit::Point p = s_ringAt;
+  const int x0 = p.x - bootrabbit::RING_DX, y0 = p.y - bootrabbit::RING_DY;
+  if (p.x >= 0 && s_ringBack.width() && spr.createSprite(bootrabbit::RING_W, bootrabbit::RING_H)) {
+    const uint32_t t0 = millis();
+    while (s_animRun) {
+      s_ringBack.pushSprite(&spr, 0, 0);
+      bootrabbit::rings(spr, theme, bootrabbit::RING_DX, bootrabbit::RING_DY, millis() - t0);
+      { BootBusLock lock; spr.pushSprite(&display, x0, y0); }
+      vTaskDelay(pdMS_TO_TICKS(40));
+    }
+    { BootBusLock lock; s_ringBack.pushSprite(&display, x0, y0); }   // leave him still
+    spr.deleteSprite();
+  }
+  xSemaphoreGive(s_animDone);
+  vTaskDelete(nullptr);
+}
+#else
 static void bootAnimTask(void*) {
   Canvas spr;
   spr.setColorDepth(16);
@@ -2178,12 +2222,33 @@ static void bootAnimTask(void*) {
   vTaskDelete(nullptr);
 }
 
+#endif
+
 static void bootAnimStart() {
+#if RABBIT_BOOT_ART
+  // What's under the rings' box, drawn here on the main task before the animation starts.
+  {
+    const rabbit::Point p = s_ringAt = rabbit::ledPoint();   // drawing the copy below moves it
+    s_ringBack.setColorDepth(16);
+    if (p.x >= 0 && s_ringBack.createSprite(bootrabbit::RING_W, bootrabbit::RING_H)) {
+      const int x0 = p.x - bootrabbit::RING_DX, y0 = p.y - bootrabbit::RING_DY;
+      s_ringBack.fillScreen(theme.bg);
+      boot::drawMark(s_ringBack, -x0, -y0, 0, false);
+    }
+  }
+#endif
   s_animDone = xSemaphoreCreateBinary();
   if (!s_animDone) return;                               // no animation, boot goes on as before
   s_animRun = true;
   // core 0, away from setup(); if it can't start, the still logo is already up
-  if (xTaskCreatePinnedToCore(bootAnimTask, "bootanim", 4096, nullptr, 1, nullptr, 0) != pdPASS) {
+#if RABBIT_BOOT_ART
+  // The rabbit takes ~2 KB of stack to draw (Squatch's mesh mark took next to none), and
+  // LovyanGFX's push on top: 4 KB overflowed. 12 KB leaves plenty.
+  constexpr uint32_t BOOT_ANIM_STACK = 12288;
+#else
+  constexpr uint32_t BOOT_ANIM_STACK = 4096;
+#endif
+  if (xTaskCreatePinnedToCore(bootAnimTask, "bootanim", BOOT_ANIM_STACK, nullptr, 1, nullptr, 0) != pdPASS) {
     s_animRun = false;
     vSemaphoreDelete(s_animDone);
     s_animDone = nullptr;
@@ -2333,7 +2398,11 @@ void setup() {
   s_bootT0 = millis();
   Serial.begin(115200);
   delay(150);
+#if RABBITMESH
+  Serial.println("\n[RabbitMesh] boot v" RABBITMESH_VERSION " (built on Squatch Mesh " FW_VERSION ")");
+#else
   Serial.println("\n[INW] boot " FW_VERSION);
+#endif
   static const char* RESET[] = {"unknown", "power on", "external", "software", "crash",
                                  "interrupt watchdog", "task watchdog", "watchdog", "deep sleep",
                                  "brownout", "sdio"};
@@ -2486,6 +2555,14 @@ void setup() {
   // preferences back from the copies rather than starting at defaults.
   if (fsOk && !ui_settings.cameFromNvs()) {
     const char* from = ui_settings.restoreIfWiped(sdOk);
+#if RABBITMESH
+    // A copy saved by Squatch Mesh brings its Squatch theme along: coming over to RabbitMesh,
+    // start in the Neon Rabbit once, and keep that (applyTheme would map it every boot anyway).
+    if (from && !themeListed(ui_settings.themeId)) {
+      ui_settings.themeId = THEME_NEON;
+      ui_settings.save();
+    }
+#endif
     if (from) {
       app::applyTheme();
       app::applyDisplay();

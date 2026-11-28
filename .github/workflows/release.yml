@@ -1,6 +1,6 @@
 # Builds RabbitMesh and publishes a GitHub Release with the two flash files: when a version tag
 # (v0.1.0, v0.1.1, ...) is pushed, or from the Actions tab (Run workflow, with the version), which
-# tags the commit it builds. The version has to match RABBITMESH_VERSION in the patch.
+# tags the commit it builds. The version has to match RABBITMESH_VERSION in platformio.ini.
 # Release notes come from docs/releases/<tag>.md when there is one.
 name: Release
 
@@ -31,13 +31,13 @@ jobs:
       - name: The tag matches the firmware's version
         run: |
           v="${TAG#v}"
-          grep -q "RABBITMESH_VERSION=\\\\\"$v\\\\\"" patches/rabbitmesh-tdeck.patch || {
-            echo "tag $TAG doesn't match RABBITMESH_VERSION in patches/rabbitmesh-tdeck.patch"; exit 1; }
+          grep -q "RABBITMESH_VERSION=\\\\\"$v\\\\\"" platformio.ini || {
+            echo "tag $TAG doesn't match RABBITMESH_VERSION in platformio.ini"; exit 1; }
 
       - uses: actions/cache@v4
         with:
           path: ~/.platformio
-          key: pio-${{ hashFiles('patches/rabbitmesh-tdeck.patch') }}
+          key: pio-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-
 
       - name: Host tests
@@ -46,13 +46,12 @@ jobs:
       - name: Build
         run: |
           pip install platformio
-          ./setup.sh build
-          cd build && pio run -e t-deck-rabbit
+          pio run -e t-deck-rabbit
 
       - name: The two flash files
         run: |
           v="${TAG#v}"
-          B=build/.pio/build/t-deck-rabbit
+          B=.pio/build/t-deck-rabbit
           python3 ~/.platformio/packages/tool-esptoolpy/esptool.py --chip esp32s3 merge_bin \
             -o "rabbitmesh-$v-tdeck-full.bin" --flash_mode dio --flash_size 16MB \
             0x0 $B/bootloader.bin 0x8000 $B/partitions.bin \

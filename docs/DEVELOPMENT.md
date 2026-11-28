@@ -4,22 +4,20 @@ For installing a ready-made build, see the [README](../README.md). This page is 
 
 ## How the source is put together
 
-RabbitMesh doesn't copy the firmware it builds on. `setup.sh` fetches [Squatch Mesh](https://github.com/BamBam1121/inw-mesh) at a pinned commit (`tdeck-v1.2.7`), applies `patches/rabbitmesh-tdeck.patch` (RabbitMesh's edits to Squatch's own files), and copies RabbitMesh's own files from `src/` in beside them, into `./build`. MeshCore and the other libraries come in through PlatformIO.
+RabbitMesh is built on [Squatch Mesh](https://github.com/BamBam1121/inw-mesh)'s T-Deck firmware (GPL-3.0), whose source is kept in this repository: everything needed builds from here alone. It was imported unmodified from Squatch's tag `tdeck-v1.2.7` (commit `cf32120`) in one commit ("Import Squatch Mesh's T-Deck firmware"), and RabbitMesh's changes to those files are in the commit after it, so `git diff <import commit> -- <file>` shows what RabbitMesh changed in any of them. RabbitMesh's own files sit beside them in `src/`. MeshCore and the other libraries come in through PlatformIO, pinned to exact versions in `platformio.ini`.
 
 You need [PlatformIO](https://platformio.org) (`pip install platformio`) and git.
 
 ```bash
-./setup.sh                           # fetch Squatch Mesh, patch it, add src/ -> ./build
-cd build
-pio run -e t-deck-rabbit             # build
+pio run -e t-deck-rabbit             # build, from the top of the repository
 pio run -e t-deck-rabbit -t upload   # flash over USB: hold the trackball while powering on for download mode
 ```
 
 Back up the T-Deck first (Settings > backup). The build uses about 82% of the app slot and 43% of RAM.
 
-To change RabbitMesh, edit `src/` here (or, for a change to one of Squatch's files, the file in `build/` and then regenerate the patch with `cd build && git diff > ../patches/rabbitmesh-tdeck.patch`), copy `src/` into `build/src`, and build again.
+To change RabbitMesh, edit the files in `src/` (RabbitMesh's own and Squatch's alike) and build again.
 
-**The two flash files.** After `pio run`, from the `build` folder:
+**The two flash files.** After `pio run`:
 
 ```bash
 B=.pio/build/t-deck-rabbit
@@ -36,16 +34,19 @@ cp $B/firmware.bin rabbitmesh-tdeck-update.bin
 ```bash
 test/run.sh                  # host tests: every tool's logic (wardrive, deck, spectrum, MECP, fox, WiGLE,
                              # flock, holidays, time zone, mesh clock, camera map)
-preview/render.sh build      # the lock scenes, the rabbit, the Deck screens and the game, through the real drawing code,
+preview/render.sh            # the lock scenes, the rabbit, the Deck screens and the game, through the real drawing code,
                              # to preview/out/*.png
-preview/check.sh build       # the animation checks: the walk, the talk frames, a stress test under ASan/UBSan
+preview/check.sh             # the animation checks: the walk, the talk frames, a stress test under ASan/UBSan
 ```
 
 ## Where things are
 
 ```
-setup.sh                         fetch upstream at a pinned commit, patch it, copy src/ in
-patches/rabbitmesh-tdeck.patch   RabbitMesh's edits to Squatch Mesh's own files
+platformio.ini                   the build: env t-deck-rabbit, the version, the MeshCore pin
+src/                             the firmware: Squatch Mesh's files (with RabbitMesh's changes) and RabbitMesh's own
+variants/inw_tdeck/              the T-Deck board definition (from Squatch Mesh)
+tools/patch_meshcore.py          edits MeshCore's source at build time (from Squatch Mesh)
+licenses/                        the third-party licences, Squatch Mesh's notices among them
 
 src/deck.{h,cpp}                 the Deck hub, RF Monitor (+ packet detail and packet log), Airtime, Radar, Trip
 src/deck_draw.h                  how the Deck's screens look (shared by the device and the preview)
@@ -93,7 +94,7 @@ The generated sprite files are committed, so building doesn't need Python. To ch
 
 ## Releasing
 
-1. Set the version: `RABBITMESH_VERSION` in `platformio.ini` (in `patches/rabbitmesh-tdeck.patch`).
+1. Set the version: `RABBITMESH_VERSION` in `platformio.ini`.
 2. Write the notes in `docs/releases/vX.Y.Z.md` (optional; without them GitHub writes a list of changes).
 3. Tag and push (`git tag vX.Y.Z && git push origin vX.Y.Z`), or on GitHub: Actions > Release > Run workflow, with the version; that tags the newest `main` itself.
 
@@ -112,7 +113,7 @@ For the job to open pull requests, allow it once: Settings > Actions > General >
 
 ## MeshCore version
 
-RabbitMesh builds on MeshCore companion **v1.18.0** (`81dbae5`), the latest release when this was written, pinned to that exact commit in `platformio.ini` (patched in by `patches/rabbitmesh-tdeck.patch`). A pin means every build is the code that was tested, and MeshCore's own changes come in on purpose. To move to a newer release by hand: `python3 tools/bump_meshcore.py --apply` (or put its `companion-vX.Y.Z` commit in that line yourself), build, and fix whatever `tools/patch_meshcore.py` reports (it edits MeshCore's source by pattern and stops if a pattern has moved) and whatever `src/node.cpp` no longer compiles against. Then test on a T-Deck: messages both ways, the phone app pairing (each device picks its own Bluetooth PIN; Settings > Bluetooth shows it), and a reboot keeping contacts and settings. Going from 1.17.1 to 1.18.0 took three small API changes in `node.cpp` and moving the PIN default, which 1.18 took out of `MyMesh::begin()`.
+RabbitMesh builds on MeshCore companion **v1.18.0** (`81dbae5`), the latest release when this was written, pinned to that exact commit in `platformio.ini`. A pin means every build is the code that was tested, and MeshCore's own changes come in on purpose. To move to a newer release by hand: `python3 tools/bump_meshcore.py --apply` (or put its `companion-vX.Y.Z` commit in that line yourself), build, and fix whatever `tools/patch_meshcore.py` reports (it edits MeshCore's source by pattern and stops if a pattern has moved) and whatever `src/node.cpp` no longer compiles against. Then test on a T-Deck: messages both ways, the phone app pairing (each device picks its own Bluetooth PIN; Settings > Bluetooth shows it), and a reboot keeping contacts and settings. Going from 1.17.1 to 1.18.0 took three small API changes in `node.cpp` and moving the PIN default, which 1.18 took out of `MyMesh::begin()`.
 
 ## Its own name, and nothing phoning home
 

@@ -11,6 +11,7 @@ struct GpsFix {
     double   lat = 0, lon = 0;
     float    altitudeM = 0;
     uint8_t  satellites = 0;
+    float    hdop = 0;           // RabbitMesh: GGA's horizontal dilution of precision, 0 = not reported
     uint16_t year = 0;
     uint8_t  month = 0, day = 0, hour = 0, minute = 0, second = 0;
     uint32_t updatedAt = 0;      // millis() of the last good sentence
@@ -124,6 +125,12 @@ public:
     // It has the time, which it only gets by decoding a satellite (or from its own
     // backup battery, if the board has one that is charged).
     bool timeKnown() const { return _timeKnown; }
+    // RabbitMesh: what the module says about its fix, sentence by sentence, for the GPS page.
+    // rmcStatus: 'A' (fix), 'V' (none) or 0 (no RMC heard in 5 s); ggaQuality: 0 none, 1 GPS,
+    // 2 DGPS...; ggaUsed: satellites in the fix (not just heard).
+    char rmcStatus() const { return millis() - _rmcAt < 5000 ? _rmcStatus : 0; }
+    uint8_t ggaQuality() const { return millis() - _ggaAt < 5000 ? _ggaQuality : 0; }
+    uint8_t ggaUsed() const { return _fix.satellites; }
     // The module's own antenna check, on boards that send one: "ok", "open", "short",
     // or "" when it has said nothing.
     const char* antenna() const { return _antenna == 1 ? "ok" : _antenna == 2 ? "open" : _antenna == 3 ? "short" : ""; }
@@ -235,6 +242,8 @@ private:
         }
         char* status = field(_line, 2);
         _fix.valid = status && *status == 'A';
+        _rmcStatus = status ? *status : 'V';             // RabbitMesh: for the GPS page
+        _rmcAt = millis();
 
         char* lat = field(_line, 3); char* ns = field(_line, 4);
         char* lon = field(_line, 5); char* ew = field(_line, 6);
@@ -254,8 +263,26 @@ private:
     }
 
     bool parseGga() {
+        // RabbitMesh: GGA's fix quality too. Some modules send no RMC (or not every second): then
+        // the fix and position come from here, so the tools aren't kept waiting on a sentence
+        // that never comes.
+        char* q = field(_line, 6);
+        _ggaQuality = (q && isdigit((unsigned char)q[0])) ? (uint8_t)(q[0] - '0') : 0;
+        _ggaAt = millis();
+        if (millis() - _rmcAt > 3000 || !_rmcAt) {
+            char* lat = field(_line, 2); char* ns = field(_line, 3);
+            char* lon = field(_line, 4); char* ew = field(_line, 5);
+            _fix.valid = _ggaQuality > 0 && lat && ns && lon && ew && lat[0] != ',' && lon[0] != ',';
+            if (_fix.valid) {
+                _fix.lat = degMin(lat, *ns);
+                _fix.lon = degMin(lon, *ew);
+                _fix.updatedAt = millis();
+            }
+        }
         char* sats = field(_line, 7);
         if (sats) _fix.satellites = (uint8_t)atoi(sats);
+        char* hdop = field(_line, 8);
+        _fix.hdop = (hdop && hdop[0]) ? (float)atof(hdop) : 0;
         char* alt = field(_line, 9);
         if (alt) _fix.altitudeM = (float)atof(alt);
         return true;
@@ -298,6 +325,9 @@ private:
     struct Sys { char a = 0, b = 0; uint8_t heard = 0, best = 0, pendHeard = 0, pendBest = 0; uint32_t at = 0; };
     Sys      _sys[4];
     bool     _timeKnown = false;
+    char     _rmcStatus = 0;              // RabbitMesh: see rmcStatus()
+    uint32_t _rmcAt = 0, _ggaAt = 0;
+    uint8_t  _ggaQuality = 0;
     uint8_t  _antenna = 0;
     uint8_t  _choice = 0, _try = 0;
     uint32_t _probeFrom = 0, _goodFrom = 0;

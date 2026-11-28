@@ -7,7 +7,13 @@ enum : uint8_t { STYLE_INW = 0, STYLE_BLOCKS, STYLE_HERO, STYLE_AURORA };
 // What the lock screen shows, when it isn't the style's own scene. Halloween has the
 // Squatch look (cards, screen changes) with its own streets and a dressed-up sasquatch;
 // Squatchmas the same with snow, lights and his holiday outfits.
-enum : uint8_t { SCENE_STYLE = 0, SCENE_HALLOWEEN, SCENE_SQUATCHMAS };
+// RabbitMesh: SCENE_NEONRABBIT is the Squatch look with a rainy neon city and the
+// cyberpunk rabbit (scene_rabbit.h, rabbit.h) in place of the sasquatch.
+enum : uint8_t { SCENE_STYLE = 0, SCENE_HALLOWEEN, SCENE_SQUATCHMAS, SCENE_NEONRABBIT,
+                 SCENE_REDTEAM, SCENE_BLUETEAM,                       // RabbitMesh: the cyber themes (scene_cyber.h)
+                 SCENE_RHALLOWEEN, SCENE_RTHANKS, SCENE_RXMAS, SCENE_RNEWYEAR, SCENE_REASTER, SCENE_RJULY4 };   // and its holidays (scene_holiday.h)
+// The scenes the rabbit walks (his lines, his speech bubble, his hop through screen changes).
+inline bool rabbitScene(uint8_t s) { return s >= SCENE_NEONRABBIT && s <= SCENE_RJULY4; }
 
 struct Palette {
     uint32_t bg, panel, line, green, greenDim, txt, dim, amber;

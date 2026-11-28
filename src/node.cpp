@@ -10,6 +10,8 @@
 #include <vector>
 #include "app.h"
 #include "regions.h"
+#include "spectrum.h"   // RabbitMesh: the analyzer borrows the radio
+#include "meshclock.h"  // RabbitMesh: the clock from the mesh
 #include <helpers/esp32/SerialBLEInterface.h>
 #include <helpers/TxtDataHelpers.h>
 #include <helpers/AdvertDataHelpers.h>
@@ -43,7 +45,7 @@ extern bool inwBleWanted();
 // ---------------------------------------------------------------------------
 InwNode::InwNode(mesh::Radio& radio, mesh::RNG& rng, mesh::RTCClock& rtc,
                  SimpleMeshTables& tables, DataStore& store)
-    : MyMesh(radio, rng, rtc, tables, store, nullptr), _ds(store) {
+    : MyMesh(radio, rng, rtc, tables, store), _ds(store) {   // MeshCore 1.18: no UI pointer
   _idlePacketCount = _mgr->getFreeCount();
   memset(_echo, 0, sizeof(_echo));
   memset(discovered, 0, sizeof(discovered));
@@ -410,6 +412,7 @@ void InwNode::onChannelMessageRecv(const mesh::GroupChannel& ch, mesh::Packet* p
 
 void InwNode::onDiscoveredContact(ContactInfo& contact, bool is_new, uint8_t path_len, const uint8_t* path) {
   MyMesh::onDiscoveredContact(contact, is_new, path_len, path);
+  meshclock::heard(contact.id.pub_key, contact.last_advert_timestamp);   // RabbitMesh: the time from the mesh
   _contactsGen++;
   if (is_new) emit(NodeEvent::NewContact, &contact);
   else emit(NodeEvent::ContactsChanged);
@@ -477,7 +480,7 @@ bool InwNode::sendCli(const uint8_t* pub, const char* cmd) {
   if (!c) return false;
   uint32_t est = 0;
   const uint32_t ts = getRTCClock()->getCurrentTimeUnique();
-  if (sendCommandData(*c, ts, 0, cmd, est) == MSG_SEND_FAILED) return false;
+  if (sendCommandData(*c, ts, 0, TXT_TYPE_CLI_DATA, cmd, est) == MSG_SEND_FAILED) return false;
   cliAppend("> ", cmd);
   return true;
 }
@@ -804,6 +807,7 @@ void InwNode::logPacket(bool tx, uint8_t header, uint8_t pathLen, uint8_t len, f
   PacketLogEntry& e = pktLog[pktHead];
   e.at = millis();
   e.tx = tx;
+  e.srcLen = e.viaLen = 0;                 // RabbitMesh: logRxRaw fills them for what it hears
   e.routeType = header & 0x03;
   e.payloadType = (header >> 2) & 0x0F;
   e.hops = pathLen & 63;
@@ -828,6 +832,22 @@ void InwNode::logRxRaw(float snr, float rssi, const uint8_t raw[], int len) {
   // Transport-coded routes carry 4 bytes of codes before the path length.
   const int pl = (route == 0 || route == 3) ? 5 : 1;
   logPacket(false, header, len > pl ? raw[pl] : 0, (uint8_t)min(len, 255), snr, rssi);
+  // RabbitMesh: the sender and the last hop, for the RF Monitor's detail page.
+  PacketLogEntry& e = pktLog[(pktHead + PKT_LOG_MAX - 1) % PKT_LOG_MAX];
+  e.srcLen = e.viaLen = 0;
+  if (len <= pl) return;
+  const uint8_t pathLen = raw[pl];
+  const int hsz = (pathLen >> 6) + 1, cnt = pathLen & 63, pathAt = pl + 1, body = pathAt + hsz * cnt;
+  if (body > len) return;
+  if (cnt > 0 && (route == 0 || route == 1)) {          // a flood: its path so far, the last hop next to us
+    e.viaLen = (uint8_t)min(hsz, 3);
+    memcpy(e.via, raw + pathAt + (cnt - 1) * hsz, e.viaLen);
+  }
+  const int left = len - body;
+  const uint8_t type = (header >> 2) & 0x0F;
+  if (type == PAYLOAD_TYPE_ADVERT && left >= 32) { memcpy(e.src, raw + body, 4); e.srcLen = 4; }
+  else if ((type == PAYLOAD_TYPE_TXT_MSG || type == PAYLOAD_TYPE_REQ || type == PAYLOAD_TYPE_RESPONSE ||
+            type == PAYLOAD_TYPE_PATH) && left >= 2) { e.src[0] = raw[body + 1]; e.srcLen = 1; }
 }
 
 void InwNode::logTx(mesh::Packet* packet, int len) {
@@ -882,7 +902,7 @@ bool nodeBegin() {
   g_node = new (mem) InwNode(radio_driver, g_rng, rtc_clock, g_tables, g_store);
 
   g_store.begin();
-  g_node->begin(false);
+  g_node->begin();   // MeshCore 1.18: no has_display flag (it only chose the PIN: tools/patch_meshcore.py)
 
   g_ble.begin(BLE_NAME_PREFIX, g_node->getNodePrefs()->node_name, g_node->getBLEPin());
   g_ifaces.addInterface(InterfaceType::Bluetooth, &g_ble);
@@ -894,6 +914,10 @@ bool nodeBegin() {
 
 void nodeLoop() {
   if (!g_node) return;
+  // RabbitMesh: the spectrum analyzer has the radio. The mesh keeps its hands off it
+  // (anything sent meanwhile waits in the queue) until spectrum.cpp hands it back with
+  // the mesh settings restored and receive armed again. The clock keeps going.
+  if (spectrum::ownsRadio()) { rtc_clock.tick(); return; }
   // Store writes no longer happen here (tools/patch_meshcore.py moves them to a
   // background task), yet the slow log still showed steady ~250 ms "msh"
   // stalls. Name the packet that was being handled when one happens, so the

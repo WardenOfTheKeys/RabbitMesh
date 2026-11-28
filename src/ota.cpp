@@ -1,4 +1,24 @@
 #include "ota.h"
+
+#if RABBITMESH
+// RabbitMesh installs nothing over the air. The upstream firmware's update site carries the
+// upstream firmware (installing it would replace RabbitMesh), so none of that code is built:
+// no update address, no download, nothing that writes the firmware. RabbitMesh is updated by
+// flashing it (README: Install a ready-made binary).
+namespace ota {
+static const char* const NOPE = "RabbitMesh updates by flashing";
+bool supported() { return false; }
+bool replacesOther() { return false; }
+bool checking() { return false; }
+Info check() { Info i; strlcpy(i.error, NOPE, sizeof i.error); return i; }
+Info check(bool) { return check(); }
+const char* install(const Info&) { return NOPE; }
+void tick() {}
+bool autoInstall() { return false; }
+void setAutoInstall(bool) {}
+void announce() {}
+}  // namespace ota
+#else
 #include <HTTPClient.h>
 #include "tls_client.h"   // WiFiClientSecure without its stray close(0)
 #include <ArduinoJson.h>
@@ -45,6 +65,11 @@ static uint8_t s_sig[64];
 #endif
 
 bool supported() {
+#if RABBITMESH
+  // A fork: Squatch Mesh's update site carries Squatch Mesh, and installing it would
+  // put this firmware back to stock. Updates for RabbitMesh are flashed by hand.
+  return false;
+#endif
   const esp_partition_t* next = esp_ota_get_next_update_partition(nullptr);
   return next && next != esp_ota_get_running_partition();
 }
@@ -362,6 +387,9 @@ static void checkTask(void*) {
 bool checking() { return s_bg == 1; }
 
 void tick() {
+#if RABBITMESH
+  return;                                        // no automatic updates in the fork (see supported())
+#endif
   static bool checked = false, pending = false, asking = false;
   static uint32_t connectedAt = 0, lastCheck = 0;
   static Info found;
@@ -458,3 +486,4 @@ void tick() {
 }
 
 }  // namespace ota
+#endif  // !RABBITMESH

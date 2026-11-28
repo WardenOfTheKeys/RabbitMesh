@@ -21,6 +21,13 @@
 #if BOARD_HAS_REPORTS
 #include "bugreport.h"
 #endif
+#if RABBITMESH
+#include "updcheck.h"     // RabbitMesh: the weekly new-version notice
+#endif
+#if RABBITMESH
+#include "holiday.h"
+#include "tzauto.h"
+#endif
 #include "logstore.h"
 #include "regional.h"
 #include "regions.h"
@@ -164,7 +171,12 @@ static String zoneShort() {
   const int b = n.indexOf(" (");
   return b > 0 ? n.substring(0, b) : n;
 }
-static void setZone(uint8_t z) { ui_settings.tzZone = z; markUiDirty(); nav.statusChanged(); }
+static void setZone(uint8_t z) {
+#if RABBITMESH
+  tzauto::manualPick();                      // a zone picked by hand sticks: following the GPS goes off
+#endif
+  ui_settings.tzZone = z; markUiDirty(); nav.statusChanged();
+}
 
 // next: during setup, where picking one (or keeping what's there) goes on to.
 static void regionMenu(const char* title, std::function<void()> next) {
@@ -187,6 +199,9 @@ static void regionMenu(const char* title, std::function<void()> next) {
 static void zoneMenu(const char* title, std::function<void()> next) {
   auto* m = new MenuView(title);
   if (next) m->action("keep  " + regional::zoneName(), next);
+#if RABBITMESH
+  m->toggle("set it from location (gps)", [] { return tzauto::autoOn(); }, [] { tzauto::setAuto(!tzauto::autoOn()); });
+#endif
   for (int i = 0; i < regional::ZONE_COUNT; i++)
     m->toggle(regional::ZONES[i].name, [i] { return ui_settings.tzZone == i + 1; }, [i, next] {
       setZone(i + 1);
@@ -662,10 +677,16 @@ static void wifiMenu() {
     v.header("map tiles");
     v.toggle("download tiles while viewing map", [] { return ui_settings.tileFetch; },
              [] { ui_settings.tileFetch = !ui_settings.tileFetch; markUiDirty(); });
+#if RABBITMESH
+    // OpenStreetMap or the owner's own server: no other project's tile proxy.
+    v.value("tile source", []() -> String { return String(ui_settings.tileSource == 2 ? "custom url" : "openstreetmap"); },
+      [] { ui_settings.tileSource = ui_settings.tileSource == 2 ? 0 : 2; markUiDirty(); });
+#else
     v.value("tile source", []() -> String {
       static const char* S[] = {"openstreetmap", "wadamesh proxy", "custom url"};
       return String(S[ui_settings.tileSource % 3]); },
       [] { ui_settings.tileSource = (ui_settings.tileSource + 1) % 3; markUiDirty(); });
+#endif
     v.action("set custom tile url", [] {
       prompt("Tile server", "base url; /{z}/{x}/{y}.png is added", ui_settings.tileUrl, 90, [](const String& u) {
         strlcpy(ui_settings.tileUrl, u.c_str(), sizeof(ui_settings.tileUrl));
@@ -719,7 +740,11 @@ static void gpsMenu() {
 static void clockMenu() {
   auto* m = new MenuView("Clock & time");
   m->info("now", []() -> String { return app::timeValid() ? String(clockText(app::now(), true)) : String("not set"); });
+#if RABBITMESH
+  m->submenu("time zone", [] { zoneMenu("Time zone", nullptr); }, [] { return zoneShort() + (tzauto::autoOn() ? String(" (gps)") : String("")); });
+#else
   m->submenu("time zone", [] { zoneMenu("Time zone", nullptr); }, [] { return zoneShort(); });
+#endif
   m->toggle("24-hour clock", [] { return ui_settings.clock24; },
             [] { ui_settings.clock24 = !ui_settings.clock24; markUiDirty(); nav.statusChanged(); });
   m->toggle("set from gps", [] { return ui_settings.gpsSetsClock; },
@@ -786,7 +811,7 @@ static void displayMenu() {
   m->toggle("wake screen on message", [] { return ui_settings.wakeOnMessage; },
             [] { ui_settings.wakeOnMessage = !ui_settings.wakeOnMessage; markUiDirty(); });
   // The lock screen's sasquatch and his speech bubble (squatch_talk.h).
-  m->toggle("sasquatch talks", [] { return !ui_settings.squatchQuiet; },
+  m->toggle(RABBITMESH ? "rabbit talks" : "sasquatch talks", [] { return !ui_settings.squatchQuiet; },
             [] { ui_settings.squatchQuiet = !ui_settings.squatchQuiet; markUiDirty(); });
   // Each theme animates the change from one screen to the next, about half a second a
   // time. Off: screens change at once (waking, sleeping and locking still animate).
@@ -855,11 +880,27 @@ static void themeMenu() {
   auto* m = new MenuView("Theme");
   m->rebuild = [](MenuView& v) {
     // The four built in, then the owner's own (made at squatchmesh.com/theme-maker).
+#if RABBITMESH
+    // RabbitMesh: its own three themes, nothing else (THEME_ORDER).
+    for (uint8_t n = 0; n < sizeof(THEME_ORDER); n++) {
+      const uint8_t i = THEME_ORDER[n];
+#else
     for (uint8_t n = 0; n < themes::count(); n++) {
       const uint8_t i = themes::idAt(n);
+#endif
+#if RABBITMESH
+      v.value(themes::spec(i).name, [i]() -> String {
+        if (holiday::shownId() == i) return String("showing now");
+        return ui_settings.themeId == i ? String(holiday::shownId() >= 0 ? "yours" : "active") : String("");
+      }, [i] {
+#else
       v.value(themes::spec(i).name, [i]() -> String { return ui_settings.themeId == i ? String("active") : String(""); }, [i] {
+#endif
         if (!themes::valid(i)) { nav.toast("that theme has been taken off"); return; }   // removed over USB with this menu open
         const ThemeSpec& sp = themes::spec(i);
+#if RABBITMESH
+        holiday::picked(i);                         // their pick wins over a holiday's for the rest of it
+#endif
         ui_settings.themeId = i;
         app::applyTheme();
         markUiDirty();
@@ -868,6 +909,9 @@ static void themeMenu() {
         nav.toast(sp.blurb, 3000);
       });
     }
+#if RABBITMESH
+    v.toggle("holiday themes by date", [] { return holiday::autoOn(); }, [] { holiday::setAuto(!holiday::autoOn()); });
+#endif
     v.header("preview this theme");
     v.action("boot sound", [] { previewSound(app::themeSpec().boot); });
     v.action("message", [] { previewSound(app::themeSpec().msg);
@@ -878,7 +922,7 @@ static void themeMenu() {
       haptic.pattern(app::themeSpec().vibeMention.seq, app::themeSpec().vibeMention.n); });
     v.action("see the lock screen", [] { app::lock(); });
     // The owner's own can be taken off here too, not only from the theme maker.
-    if (themes::count() > THEME_COUNT) {
+    if (!RABBITMESH && themes::count() > THEME_COUNT) {
       v.header("your own themes");
       for (uint8_t n = THEME_COUNT; n < themes::count(); n++) {
         const uint8_t i = themes::idAt(n);
@@ -1152,7 +1196,22 @@ static void systemMenu() {
   auto* m = new MenuView("System");
   m->action("run first-start setup", [] { startSetup(); });
   m->header("updates");
+#if RABBITMESH
+  // RabbitMesh: no update site and no installing over WiFi; a weekly look at its own GitHub
+  // releases (updcheck.h) says when there's a newer one, and updating is flashing it.
+  m->info("version", []() -> String { return String("RabbitMesh v" RABBITMESH_VERSION); });
+  m->info("newest", []() -> String { return updcheck::status(); });
+  m->action("check for updates", [] { updcheck::checkNow(); });
+  m->toggle("tell me about new versions (weekly, wi-fi)", [] { return updcheck::enabled(); }, [] {
+    updcheck::setEnabled(!updcheck::enabled());
+    nav.toast(updcheck::enabled() ? "a weekly look at github for a newer version" : "no update checks", 3000);
+  });
+  m->info("to update", []() -> String { return String("flash the update file from the releases page"); });
+  m->info("releases", []() -> String { return String("github.com/WardenOfTheKeys/rabbitmesh"); });
+#else
   m->info("version", []() -> String { return String(FW_VERSION); });
+#endif
+#if !RABBITMESH
   if (ota::supported()) {
     m->action("check for updates", [] {
       nav.busy("checking for updates...");
@@ -1190,7 +1249,8 @@ static void systemMenu() {
       }, 120000));
     });
   }
-#ifdef OTA_BOARD
+#endif
+#if defined(OTA_BOARD) && !RABBITMESH
   // This board's updates go in by themselves once it's idle (ota.h).
   m->toggle("install updates by itself", [] { return ota::autoInstall(); }, [] {
     ota::setAutoInstall(!ota::autoInstall());
@@ -1205,12 +1265,16 @@ static void systemMenu() {
                                 : "problem reports off", 3500);
   });
 #endif
+#if !RABBITMESH                                   // RabbitMesh has no update site to check
   m->toggle("check on start (wi-fi)", [] { return ui_settings.autoUpdateCheck; },
             [] { ui_settings.autoUpdateCheck = !ui_settings.autoUpdateCheck; markUiDirty(); });
+#endif
+#if !RABBITMESH                                   // RabbitMesh publishes releases only
   m->toggle("beta updates (every build)", [] { return ui_settings.betaUpdates; }, [] {
     ui_settings.betaUpdates = !ui_settings.betaUpdates; markUiDirty();
     nav.toast(ui_settings.betaUpdates ? "beta: you get builds before release" : "stable releases only", 3000);
   });
+#endif
   m->header("device");
   m->action("usb flash mode (for the web installer)", [] {
     confirm("Enter USB flash mode?", "the screen goes dark until you install from the website or power-cycle.",
@@ -1246,8 +1310,13 @@ static void systemMenu() {
 
 static void aboutPage() {
   nav.push(new TextPageView("About", [](std::vector<String>& out) {
+#if RABBITMESH
+    out.push_back("RabbitMesh firmware v" RABBITMESH_VERSION);
+    out.push_back("# built on Squatch Mesh " FW_VERSION " and WadaMesh's tools (GPL-3.0)");
+#else
     out.push_back("Squatch Mesh firmware " FW_VERSION);
     out.push_back("# for the LilyGo T-Lora Pager, made in the Inland Northwest");
+#endif
     out.push_back("mesh engine   MeshCore " FIRMWARE_VERSION " (companion)");
     out.push_back("graphics      LovyanGFX");
     out.push_back("ideas from    Wadamesh (layouts, map, tools)");

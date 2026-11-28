@@ -3,12 +3,12 @@
 # the deck screens (with
 # sample data) on a computer, through the real headers and a small stand-in for
 # LovyanGFX (mock/). For working on the look without flashing. Needs a built source
-# tree (../setup.sh) and g++; PNGs need Python + Pillow (text uses DejaVu Sans Mono).
+# tree (this repository, by default) and g++; PNGs need Python + Pillow (text uses DejaVu Sans Mono).
 #
 #   ./render.sh [source tree] [output dir]
 set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
-BUILD=${1:-$HERE/../build}
+BUILD=${1:-$HERE/..}
 OUT=${2:-$HERE/out}
 STAGE=$(mktemp -d)
 mkdir -p "$OUT"

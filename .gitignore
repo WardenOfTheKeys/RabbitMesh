@@ -1,4 +1,18 @@
-# build output (setup.sh makes it)
+# build output
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/
+*.bin
+*.elf
+*.map
+# a real config export or identity carries a private key and contacts: never commit one
+*_meshcore_config_*.json
+*meshcore-config*.json
+inwmesh-identity*
+# optional per-device identity seed (a private key)
+src/identity_seed.h
+# an old setup.sh build folder
 build/
 # tools/alpr_extract.py keeps its download beside it
 tools/cameras-*.geojson.gz

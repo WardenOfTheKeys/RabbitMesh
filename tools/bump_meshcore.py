@@ -4,8 +4,8 @@
     python3 tools/bump_meshcore.py            # say which MeshCore it's on and which is newest
     python3 tools/bump_meshcore.py --apply    # move the pin to the newest release
 
-RabbitMesh builds on an exact MeshCore commit, pinned in patches/rabbitmesh-tdeck.patch (the
-`+ ...MeshCore.git#<commit>` line it adds to platformio.ini). This looks up MeshCore's
+RabbitMesh builds on an exact MeshCore commit, pinned in platformio.ini (its
+`...MeshCore.git#<commit>` line). This looks up MeshCore's
 companion releases (git tags companion-vX.Y.Z), and with --apply puts the newest one's commit
 in that line and its version in docs/DEVELOPMENT.md. Then build and test: MeshCore's own
 changes can need fixes in tools/patch_meshcore.py or src/node.cpp. The weekly GitHub job
@@ -21,10 +21,10 @@ import subprocess
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..")
-PATCH = os.path.join(ROOT, "patches", "rabbitmesh-tdeck.patch")
+INI = os.path.join(ROOT, "platformio.ini")
 DOC = os.path.join(ROOT, "docs", "DEVELOPMENT.md")
 REPO = "https://github.com/meshcore-dev/MeshCore.git"
-PIN = re.compile(r"^(\+\s+https://github\.com/meshcore-dev/MeshCore\.git#)([0-9a-f]{40})\s*$", re.M)
+PIN = re.compile(r"^(\s+https://github\.com/meshcore-dev/MeshCore\.git#)([0-9a-f]{40})\s*$", re.M)
 DOC_VERSION = re.compile(r"MeshCore companion \*\*v[0-9.]+\*\* \(`[0-9a-f]{7}`\)")
 
 
@@ -53,10 +53,10 @@ def main():
     ap.add_argument("--github-output", help="also write key=value lines here (GitHub Actions)")
     args = ap.parse_args()
 
-    patch = open(PATCH).read()
-    m = PIN.search(patch)
+    ini = open(INI).read()
+    m = PIN.search(ini)
     if not m:
-        raise SystemExit("couldn't find the MeshCore pin in " + PATCH)
+        raise SystemExit("couldn't find the MeshCore pin in " + INI)
     current = m.group(2)
     tags = releases()
     if not tags:
@@ -70,11 +70,11 @@ def main():
           + ("" if changed else " - up to date"))
 
     if changed and args.apply:
-        open(PATCH, "w").write(PIN.sub(lambda x: x.group(1) + sha, patch, count=1))
+        open(INI, "w").write(PIN.sub(lambda x: x.group(1) + sha, ini, count=1))
         doc = open(DOC).read()
         new_doc = DOC_VERSION.sub(f"MeshCore companion **{version}** (`{sha[:7]}`)", doc, count=1)
         open(DOC, "w").write(new_doc)
-        print(f"pin moved to {tag}; now build (setup.sh, pio run) and run test/run.sh")
+        print(f"pin moved to {tag}; now build (pio run -e t-deck-rabbit) and run test/run.sh")
 
     if args.github_output:
         with open(args.github_output, "a") as f:

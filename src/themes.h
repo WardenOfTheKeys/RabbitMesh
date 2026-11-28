@@ -78,6 +78,64 @@ namespace tunes {
   static const ToneStep SQM_MEN[]  = {{587, 330}, {523, 110}, {494, 220}, {440, 220}, {392, 460}};
   static const ToneStep SQM_CHG[]  = {{1047, 90}, {1319, 90}, {1568, 90}, {2093, 360}};
 
+  // Neon Rabbit (RabbitMesh): square-wave synth arps, minor and quick, like a
+  // night-drive soundtrack. Start-up climbs an A-minor arpeggio and lands an octave up;
+  // a message is a two-note blip; a direct message a little run; a mention a glitchy
+  // stutter; the charger a power-up sweep.
+  static const ToneStep NEO_BOOT[] = {{220, 90}, {262, 90}, {330, 90}, {440, 90}, {0, 40}, {392, 90}, {330, 90},
+                                      {440, 120}, {0, 40}, {880, 380}};
+  static const ToneStep NEO_MSG[]  = {{988, 60}, {0, 30}, {1319, 110}};
+  static const ToneStep NEO_DM[]   = {{659, 60}, {784, 60}, {988, 60}, {1319, 160}};
+  static const ToneStep NEO_MEN[]  = {{1760, 40}, {0, 25}, {1760, 40}, {0, 25}, {1760, 40}, {0, 60}, {1319, 70}, {2093, 220}};
+  static const ToneStep NEO_CHG[]  = {{330, 220, 1320}, {0, 30}, {1760, 140}};
+
+  // Red Team (RabbitMesh): square-wave alarms and a modem's handshake. Start-up dials in;
+  // a message is two sharp blips, a direct message a rising scan, a mention the klaxon.
+  static const ToneStep RED_BOOT[] = {{1200, 60}, {0, 30}, {2200, 60}, {0, 30}, {1200, 60}, {0, 60}, {392, 90}, {523, 90}, {784, 220}};
+  static const ToneStep RED_MSG[]  = {{1568, 50}, {0, 40}, {1568, 70}};
+  static const ToneStep RED_DM[]   = {{523, 50}, {784, 50}, {1047, 50}, {1568, 140}};
+  static const ToneStep RED_MEN[]  = {{880, 140, 1760}, {0, 30}, {880, 140, 1760}, {0, 30}, {1760, 200}};
+  static const ToneStep RED_CHG[]  = {{220, 160, 880}, {0, 30}, {1319, 120}};
+  // Blue Team (RabbitMesh): sonar pings on sine, calm and clear. A message is a ping and its
+  // echo, a direct message two pings rising, a mention three, then a bright confirmation.
+  static const ToneStep BLU_BOOT[] = {{392, 160}, {523, 160}, {659, 160}, {784, 380}};
+  static const ToneStep BLU_MSG[]  = {{1319, 120}, {0, 70}, {1319, 60}};
+  static const ToneStep BLU_DM[]   = {{988, 110}, {0, 50}, {1319, 160}};
+  static const ToneStep BLU_MEN[]  = {{1175, 80}, {0, 40}, {1175, 80}, {0, 40}, {1175, 80}, {0, 60}, {1760, 260}};
+  static const ToneStep BLU_CHG[]  = {{523, 200, 1047}, {0, 30}, {1568, 200}};
+
+  // RabbitMesh's holidays: each start-up is a short motif in the season's voice.
+  static const ToneStep RH_BOOT[] = {{392, 140}, {370, 140}, {349, 140}, {330, 380}, {0, 60}, {247, 300}};     // Halloween: creeping down
+  static const ToneStep RH_MSG[]  = {{330, 90}, {0, 40}, {311, 160}};
+  static const ToneStep RH_DM[]   = {{262, 80}, {311, 80}, {370, 200}};
+  static const ToneStep RH_MEN[]  = {{880, 260, 440}, {0, 40}, {330, 90}, {330, 90}, {330, 90}};
+  static const ToneStep RT_BOOT[] = {{392, 160}, {494, 160}, {587, 160}, {784, 360}};                       // Thanksgiving: warm
+  static const ToneStep RT_MSG[]  = {{659, 120}, {784, 200}};
+  static const ToneStep RT_DM[]   = {{587, 110}, {659, 110}, {784, 220}};
+  static const ToneStep RT_MEN[]  = {{784, 90}, {659, 90}, {784, 90}, {988, 260}};
+  static const ToneStep RX_BOOT[] = {{659, 120}, {659, 120}, {659, 240}, {659, 120}, {659, 120}, {659, 240}, {659, 120}, {784, 120}, {523, 160}, {587, 120}, {659, 360}};   // bells
+  static const ToneStep RX_MSG[]  = {{1319, 90}, {0, 40}, {1568, 160}};
+  static const ToneStep RX_DM[]   = {{1047, 90}, {1319, 90}, {1568, 220}};
+  static const ToneStep RX_MEN[]  = {{1568, 70}, {0, 30}, {1568, 70}, {0, 30}, {2093, 240}};
+  static const ToneStep RN_BOOT[] = {{523, 90}, {659, 90}, {784, 90}, {1047, 90}, {0, 60}, {1568, 70}, {2093, 280}};   // New Year: a rocket and a burst
+  static const ToneStep RN_MSG[]  = {{400, 140, 1600}, {0, 30}, {2093, 90}};
+  static const ToneStep RN_DM[]   = {{600, 120, 1800}, {0, 30}, {1568, 80}, {2093, 160}};
+  static const ToneStep RN_MEN[]  = {{300, 200, 2000}, {0, 40}, {2093, 60}, {1760, 60}, {2349, 200}};
+  static const ToneStep RE_BOOT[] = {{784, 140}, {988, 140}, {1175, 140}, {1568, 300}};                      // Easter: bright and light
+  static const ToneStep RE_MSG[]  = {{1175, 90}, {1568, 140}};
+  static const ToneStep RE_DM[]   = {{988, 80}, {1175, 80}, {1568, 180}};
+  static const ToneStep RE_MEN[]  = {{1568, 60}, {1319, 60}, {1568, 60}, {2093, 220}};
+  static const ToneStep RJ_BOOT[] = {{523, 110}, {523, 110}, {659, 110}, {784, 240}, {0, 60}, {1047, 300}};  // 4th of July: a fanfare
+  static const ToneStep RJ_MSG[]  = {{784, 80}, {0, 30}, {1047, 140}};
+  static const ToneStep RJ_DM[]   = {{659, 80}, {784, 80}, {1047, 200}};
+  static const ToneStep RJ_MEN[]  = {{500, 160, 1800}, {0, 30}, {1047, 80}, {1319, 80}, {1568, 200}};
+  static const ToneStep RH_CHG[]  = {{220, 300, 660}};
+  static const ToneStep RT_CHG[]  = {{392, 160}, {587, 260}};
+  static const ToneStep RX_CHG[]  = {{1047, 120}, {1568, 260}};
+  static const ToneStep RN_CHG[]  = {{400, 200, 1600}};
+  static const ToneStep RE_CHG[]  = {{784, 140}, {1175, 260}};
+  static const ToneStep RJ_CHG[]  = {{523, 120}, {784, 260}};
+
   #define J(name, steps, wave, bell) static const Jingle name = {#name, steps, sizeof(steps) / sizeof(steps[0]), wave, bell}
   J(INW_BOOT_J, INW_BOOT, WAVE_SINE, false);
   J(INW_MSG_J,  INW_MSG,  WAVE_SINE, false);
@@ -109,6 +167,33 @@ namespace tunes {
   J(SQM_DM_J,   SQM_DM,   WAVE_CHIME, true);
   J(SQM_MEN_J,  SQM_MEN,  WAVE_CHIME, true);
   J(SQM_CHG_J,  SQM_CHG,  WAVE_CHIME, true);
+  J(NEO_BOOT_J, NEO_BOOT, WAVE_SQUARE, false);
+  J(NEO_MSG_J,  NEO_MSG,  WAVE_SQUARE, false);
+  J(NEO_DM_J,   NEO_DM,   WAVE_SQUARE, false);
+  J(NEO_MEN_J,  NEO_MEN,  WAVE_SQUARE, false);
+  J(NEO_CHG_J,  NEO_CHG,  WAVE_SQUARE, false);
+  J(RED_BOOT_J, RED_BOOT, WAVE_SQUARE, false);
+  J(RED_MSG_J,  RED_MSG,  WAVE_SQUARE, false);
+  J(RED_DM_J,   RED_DM,   WAVE_SQUARE, false);
+  J(RED_MEN_J,  RED_MEN,  WAVE_SQUARE, false);
+  J(RED_CHG_J,  RED_CHG,  WAVE_SQUARE, false);
+  J(BLU_BOOT_J, BLU_BOOT, WAVE_SINE, true);
+  J(BLU_MSG_J,  BLU_MSG,  WAVE_SINE, true);
+  J(BLU_DM_J,   BLU_DM,   WAVE_SINE, true);
+  J(BLU_MEN_J,  BLU_MEN,  WAVE_SINE, true);
+  J(BLU_CHG_J,  BLU_CHG,  WAVE_SINE, false);
+  J(RH_BOOT_J, RH_BOOT, WAVE_TRIANGLE, false); J(RH_MSG_J, RH_MSG, WAVE_TRIANGLE, false); J(RH_DM_J, RH_DM, WAVE_TRIANGLE, false);
+  J(RH_MEN_J, RH_MEN, WAVE_TRIANGLE, false); J(RH_CHG_J, RH_CHG, WAVE_TRIANGLE, false);
+  J(RT_BOOT_J, RT_BOOT, WAVE_SINE, true); J(RT_MSG_J, RT_MSG, WAVE_SINE, true); J(RT_DM_J, RT_DM, WAVE_SINE, true);
+  J(RT_MEN_J, RT_MEN, WAVE_SINE, true); J(RT_CHG_J, RT_CHG, WAVE_SINE, true);
+  J(RX_BOOT_J, RX_BOOT, WAVE_CHIME, true); J(RX_MSG_J, RX_MSG, WAVE_JINGLE, false); J(RX_DM_J, RX_DM, WAVE_CHIME, true);
+  J(RX_MEN_J, RX_MEN, WAVE_JINGLE, false); J(RX_CHG_J, RX_CHG, WAVE_CHIME, true);
+  J(RN_BOOT_J, RN_BOOT, WAVE_SQUARE, false); J(RN_MSG_J, RN_MSG, WAVE_SQUARE, false); J(RN_DM_J, RN_DM, WAVE_SQUARE, false);
+  J(RN_MEN_J, RN_MEN, WAVE_SQUARE, false); J(RN_CHG_J, RN_CHG, WAVE_SQUARE, false);
+  J(RE_BOOT_J, RE_BOOT, WAVE_CHIME, true); J(RE_MSG_J, RE_MSG, WAVE_CHIME, true); J(RE_DM_J, RE_DM, WAVE_CHIME, true);
+  J(RE_MEN_J, RE_MEN, WAVE_CHIME, true); J(RE_CHG_J, RE_CHG, WAVE_CHIME, true);
+  J(RJ_BOOT_J, RJ_BOOT, WAVE_SQUARE, false); J(RJ_MSG_J, RJ_MSG, WAVE_SQUARE, false); J(RJ_DM_J, RJ_DM, WAVE_SQUARE, false);
+  J(RJ_MEN_J, RJ_MEN, WAVE_SQUARE, false); J(RJ_CHG_J, RJ_CHG, WAVE_SQUARE, false);
   #undef J
 }
 
@@ -165,7 +250,11 @@ static const ThemeSpec THEMES[] = {
   // his holiday outfits, somewhere new every time the screen comes on), its own screen
   // changes (fx_squatchmas.cpp) and carols. Gold accent on pine green, cranberry for
   // what's unread.
+#if RABBITMESH
+  { "Christmas", "snow, lights, and a new holiday outfit every time it wakes",
+#else
   { "Squatchmas", "snow, lights, and a new holiday outfit every time it wakes",
+#endif
     { 0x07110c, 0x0d1a13, 0x1e3a2a, 0xffcf5a, 0x8d5b3a, 0xf4ede0, 0x8ea595, 0xff6b6b,
       0xff4d4d, 0xfffaf0, 0x13231a, 0x4a1416, 0x9ad7ff, 0x1b3024, 0x3a1418 },
     STYLE_INW, &tunes::SQM_BOOT_J, &tunes::SQM_MSG_J, &tunes::SQM_DM_J, &tunes::SQM_MEN_J,
@@ -174,5 +263,81 @@ static const ThemeSpec THEMES[] = {
     {{14, 0x80 | 10, 47, 0x80 | 6, 47, 0x80 | 6, 47}, 7},
     {{14, 0x80 | 12, 14, 0x80 | 12, 14, 0x80 | 20, 47}, 7},
     7, 0x40, &tunes::SQM_CHG_J, SCENE_SQUATCHMAS },
+  // Neon Rabbit (RabbitMesh): the Squatch look (cards, terminal type) in cyan and
+  // magenta on violet-black, with the rainy-city lock scene and the cyberpunk rabbit.
+  // Last in the list so the built-in ids before it keep their numbers.
+  { "Neon Rabbit", "a cyberpunk rabbit hopping through a rainy neon city",
+    { 0x07040d, 0x120a1f, 0x2a1745, 0x00f0ff, 0xff2bd6, 0xd8d0ff, 0x7a6a9e, 0xffe14d,
+      0xff3860, 0xf6f0ff, 0x1a1030, 0x3a0d4a, 0x7b5cff, 0x24123d, 0x3d2a08 },
+    STYLE_INW, &tunes::NEO_BOOT_J, &tunes::NEO_MSG_J, &tunes::NEO_DM_J, &tunes::NEO_MEN_J,
+    // Hops: two quick taps, a third for a direct message, a stutter for a mention.
+    {{47, 0x80 | 7, 47}, 3},
+    {{47, 0x80 | 7, 47, 0x80 | 7, 14}, 5},
+    {{47, 0x80 | 4, 47, 0x80 | 4, 47, 0x80 | 10, 14}, 7},
+    7, 0x40, &tunes::NEO_CHG_J, SCENE_NEONRABBIT },
+#if RABBITMESH
+  // Red Team: crimson on black, the data centre after hours. Ids 7 and 8: after the Neon
+  // Rabbit, so every id before them (and every saved setting) keeps its theme.
+  { "Red Team", "the rabbit slips through a data centre after hours",
+    { 0x0a0506, 0x160a0c, 0x3a1418, 0xff3355, 0x8a1a2a, 0xf2dadc, 0x8c6c70, 0xffb02e,
+      0xff7a2e, 0xfff4f4, 0x1e0d10, 0x4a0d16, 0x5ab0ff, 0x2a0f14, 0x3a2a08 },
+    STYLE_INW, &tunes::RED_BOOT_J, &tunes::RED_MSG_J, &tunes::RED_DM_J, &tunes::RED_MEN_J,
+    // Alarm taps: hard and quick, a burst for a mention.
+    {{47, 0x80 | 5, 47}, 3},
+    {{14, 0x80 | 6, 47, 0x80 | 6, 47}, 5},
+    {{14, 0x80 | 4, 14, 0x80 | 4, 14, 0x80 | 4, 14}, 7},
+    7, 0x40, &tunes::RED_CHG_J, SCENE_REDTEAM },
+  // Blue Team: steel blue on navy, the security operations centre's wall of screens.
+  { "Blue Team", "the rabbit on watch in the security operations centre",
+    { 0x030812, 0x08132a, 0x15284a, 0x38b6ff, 0x1f5fbf, 0xd2e4ff, 0x6a82a8, 0xffc24a,
+      0xff4d5e, 0xf4f8ff, 0x0c1a36, 0x0f3a6a, 0x7ae0ff, 0x102448, 0x3a2c08 },
+    STYLE_INW, &tunes::BLU_BOOT_J, &tunes::BLU_MSG_J, &tunes::BLU_DM_J, &tunes::BLU_MEN_J,
+    // Sonar: one long pulse, two for a direct message, three for a mention.
+    {{14, 0x80 | 30, 14}, 3},
+    {{14, 0x80 | 20, 14, 0x80 | 20, 14}, 5},
+    {{14, 0x80 | 14, 14, 0x80 | 14, 14, 0x80 | 14, 14}, 7},
+    7, 0x40, &tunes::BLU_CHG_J, SCENE_BLUETEAM },
+  // RabbitMesh's holidays (ids 9-14), shown by themselves on their dates (holiday.h) or picked.
+  #define RM_VIBES {{47, 0x80 | 7, 47}, 3}, {{47, 0x80 | 7, 47, 0x80 | 7, 14}, 5}, {{47, 0x80 | 4, 47, 0x80 | 4, 47, 0x80 | 10, 14}, 7}
+  { "Halloween", "the rabbit's neon Halloween: a huge moon, bats, jack-o'-lanterns and a ghost",
+    { 0x0a0612, 0x150b22, 0x2e1a3d, 0xff8a1f, 0x9b4dff, 0xeadfcd, 0x8d7a9c, 0xb8f24a,
+      0xff4d5a, 0xfff6ea, 0x1c1229, 0x4a2608, 0x6fd3ff, 0x2a1838, 0x2c3a10 },
+    STYLE_INW, &tunes::RH_BOOT_J, &tunes::RH_MSG_J, &tunes::RH_DM_J, &tunes::RH_MEN_J, RM_VIBES, 7, 0x40, &tunes::RH_CHG_J, SCENE_RHALLOWEEN },
+  { "Thanksgiving", "an amber dusk, a harvest moon and leaves blowing down the street",
+    { 0x120a06, 0x1f120a, 0x3d2412, 0xff9a3c, 0x9b3d1a, 0xf3e2c8, 0x9c8068, 0xffd166,
+      0xd9432e, 0xfff7ea, 0x24150c, 0x4a260e, 0x7fb3d5, 0x2e1a0e, 0x3a2c08 },
+    STYLE_INW, &tunes::RT_BOOT_J, &tunes::RT_MSG_J, &tunes::RT_DM_J, &tunes::RT_MEN_J, RM_VIBES, 7, 0x40, &tunes::RT_CHG_J, SCENE_RTHANKS },
+  { "Christmas", "snow, lights over the street, neon trees, and a Santa hat",
+    { 0x050d0a, 0x0c1a13, 0x1e3a2a, 0x3ddc84, 0x1f7a4a, 0xeef6ee, 0x86a595, 0xffcf5a,
+      0xff4d5a, 0xffffff, 0x0f2219, 0x4a1416, 0x9ad7ff, 0x123024, 0x3a1418 },
+    STYLE_INW, &tunes::RX_BOOT_J, &tunes::RX_MSG_J, &tunes::RX_DM_J, &tunes::RX_MEN_J, RM_VIBES, 7, 0x40, &tunes::RX_CHG_J, SCENE_RXMAS },
+  { "New Year's", "fireworks over the skyline in gold, silver and magenta",
+    { 0x06050d, 0x100d1f, 0x272045, 0xffd23f, 0xff2bd6, 0xece6ff, 0x857aa8, 0xffe9a8,
+      0xff4d6d, 0xffffff, 0x15112a, 0x3d1440, 0x7b9cff, 0x1c1636, 0x3d2a08 },
+    STYLE_INW, &tunes::RN_BOOT_J, &tunes::RN_MSG_J, &tunes::RN_DM_J, &tunes::RN_MEN_J, RM_VIBES, 7, 0x40, &tunes::RN_CHG_J, SCENE_RNEWYEAR },
+  { "Easter", "a pastel dawn and glowing eggs along the street",
+    { 0x0d0a14, 0x1a1426, 0x352a4a, 0x7ef0c0, 0xc79bff, 0xf3ecff, 0x9a8fb0, 0xffd98a,
+      0xff7aa8, 0xffffff, 0x1e1830, 0x3a2450, 0x8fd3ff, 0x261d38, 0x3a3010 },
+    STYLE_INW, &tunes::RE_BOOT_J, &tunes::RE_MSG_J, &tunes::RE_DM_J, &tunes::RE_MEN_J, RM_VIBES, 7, 0x40, &tunes::RE_CHG_J, SCENE_REASTER },
+  { "4th of July", "fireworks in red, white and blue",
+    { 0x04070f, 0x0a1226, 0x1b2a4a, 0xff3b4e, 0x3d6bff, 0xeaf0ff, 0x7d8bb0, 0xffd23f,
+      0xff6b3d, 0xffffff, 0x0e1830, 0x3a0d18, 0x6fa8ff, 0x111d3a, 0x3a2c08 },
+    STYLE_INW, &tunes::RJ_BOOT_J, &tunes::RJ_MSG_J, &tunes::RJ_DM_J, &tunes::RJ_MEN_J, RM_VIBES, 7, 0x40, &tunes::RJ_CHG_J, SCENE_RJULY4 },
+  #undef RM_VIBES
+#endif
 };
 static constexpr uint8_t THEME_COUNT = sizeof(THEMES) / sizeof(THEMES[0]);
+#if RABBITMESH
+// RabbitMesh offers its own themes only: Neon Rabbit (the default, settings.h themeId = 6), Red
+// Team, Blue Team, and its six holidays (shown by date, holiday.h, or picked). The upstream looks (ids 0-5) stay in the table only so saved ids and
+// backups keep their numbers; none is offered, and a saved one (or an owner's custom theme)
+// gives the Neon Rabbit.
+constexpr uint8_t THEME_NEON = 6;
+static_assert(THEME_COUNT == 15, "RabbitMesh: ids 0-5 upstream (never offered), 6 Neon Rabbit, 7 Red Team, 8 Blue Team, 9-14 its holidays");
+inline bool themeListed(uint8_t id) { return id >= 6 && id < THEME_COUNT; }
+static const uint8_t THEME_ORDER[] = {6, 7, 8, 12, 13, 14, 9, 10, 11};   // its own three, then the holidays through the year
+// The holiday themes by holiday_core.h's numbering (H_HALLOWEEN .. H_JULY4).
+static const uint8_t HOLIDAY_THEME[] = {0, 9, 10, 11, 12, 13, 14};
+#else
+inline bool themeListed(uint8_t) { return true; }
+#endif

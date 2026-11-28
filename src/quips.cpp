@@ -199,6 +199,27 @@ static const char* const THEMED[][N_THEMED] = {
     "Nice list: everyone who relays.",
     "Peace on earth. Packets on the air.",
     "Cold drains batteries. Keep yours in a pocket." }
+  // Neon Rabbit (RabbitMesh)
+  , { "Follow the white rabbit. He has a repeater.",
+    "High tech, low bandwidth.",
+    "No cell towers. No problem. No corp.",
+    "The mesh remembers what the cloud forgets.",
+    "Wake up, runner. You have packets.",
+    "Rain on chrome. Packets on the air.",
+    "Every repeater is a lighthouse in the static.",
+    "Wardrive tonight? The grid is waiting.",
+    "Off-grid is the new underground.",
+    "Neon fades. LoRa carries on.",
+    "Encrypted, decentralized, unbothered.",
+    "Your link budget called. It wants a hill.",
+    "They hear you, but do you hear them?",
+    "Down the rabbit hole, one hop at a time.",
+    "SNR is just vibes with a decimal point.",
+    "Jack in. Mesh up. Hop out.",
+    "In this city, line of sight is a luxury.",
+    "Signal strength is a state of mind.",
+    "Chrome ears, analog heart.",
+    "The street finds its own uses for radio." }
 };
 static constexpr int N_GENERAL = sizeof(GENERAL) / sizeof(GENERAL[0]);
 static constexpr int N_MORE = sizeof(MORE) / sizeof(MORE[0]);
@@ -259,6 +280,10 @@ static bool liveLine(int which, char* out, size_t cap) {
 // Lines about the pager's own hardware (its wheel, being a pager) read wrong on
 // another board, which skips them.
 static bool fitsBoard(const char* q) {
+#if RABBITMESH
+  // The upstream lines about its sasquatch and its home turf aren't the rabbit's.
+  for (const char* w : {"squatch", "Inland Northwest"}) if (strcasestr(q, w)) return false;
+#endif
 #if BOARD_HAS_TOUCH
   for (const char* w : {"pager", "wheel", "PCNT", "orange", "rotary"}) if (strcasestr(q, w)) return false;
 #endif
@@ -282,7 +307,8 @@ const char* quipNext() {
     if (k < N_MORE) { if (fitsBoard(MORE[k])) return MORE[k]; continue; }
     k -= N_MORE;
     if (k < N_THEMED) {
-      const uint8_t s = nav.theme().scene == SCENE_HALLOWEEN ? 4 : nav.theme().scene == SCENE_SQUATCHMAS ? 5
+      const uint8_t s = rabbitScene(nav.theme().scene) ? 6
+                      : nav.theme().scene == SCENE_HALLOWEEN ? 4 : nav.theme().scene == SCENE_SQUATCHMAS ? 5
                       : nav.theme().style < 4 ? nav.theme().style : 0;
       if (fitsBoard(THEMED[s][k])) return THEMED[s][k];
       continue;

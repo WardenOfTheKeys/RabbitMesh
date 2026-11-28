@@ -40,7 +40,7 @@ jobs:
         if: steps.bump.outputs.changed == 'true' && steps.seen.outputs.done != 'true'
         with:
           path: ~/.platformio
-          key: pio-${{ hashFiles('patches/rabbitmesh-tdeck.patch') }}
+          key: pio-${{ hashFiles('platformio.ini') }}
           restore-keys: pio-
 
       - name: Build and test with it
@@ -49,8 +49,7 @@ jobs:
         continue-on-error: true
         run: |
           pip install platformio
-          ./setup.sh build
-          (cd build && pio run -e t-deck-rabbit)
+          pio run -e t-deck-rabbit
           test/run.sh
 
       - name: Pull request, or an issue if it needs work
@@ -66,7 +65,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BR"
-          git add patches/rabbitmesh-tdeck.patch docs/DEVELOPMENT.md
+          git add platformio.ini docs/DEVELOPMENT.md
           git commit -m "MeshCore $V (from $CUR)"
           git push origin "$BR"
           if [ "$OK" = "true" ]; then

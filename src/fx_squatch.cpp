@@ -10,6 +10,7 @@
 
 #include "fx_internal.h"
 #include "mascot.h"
+#include "rabbit.h"         // RabbitMesh: drawThemeMascot, so the rabbit hops through the screen changes
 
 namespace fx {
 using namespace k;
@@ -121,7 +122,7 @@ void sasquatchRun(Canvas& from, Canvas& to, uint16_t ms) {
         }
       drawMotes(s.g, dust, false);
       if (x > -60 && x < W + 100 && touches(s, ground - hgt - 12, ground + 4))
-        drawSasquatch(s.band, c, (int)x, ground - s.bandY, hgt, phase, c.amber);
+        drawThemeMascot(s.band, c, (int)x, ground - s.bandY, hgt, phase, c.amber);
     });
     if (p >= 1 || testStop(t0)) break;
   }
@@ -207,7 +208,7 @@ void groundPound(Canvas& from, Canvas& to, uint16_t ms) {
           }
       }
       drawMotes(s.g, dust, false);
-      if (gx < W + 90 && touches(s, gy - hgt - 12, gy + 4)) drawSasquatch(s.band, c, gx, gy - s.bandY, hgt - squash, phase, c.amber);
+      if (gx < W + 90 && touches(s, gy - hgt - 12, gy + 4)) drawThemeMascot(s.band, c, gx, gy - s.bandY, hgt - squash, phase, c.amber);
     }, shx, shy);
     if (p >= 1 || testStop(t0)) break;
   }

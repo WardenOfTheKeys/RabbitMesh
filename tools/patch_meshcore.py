@@ -564,10 +564,18 @@ def patch_mymesh(src):
     # pair and read or send messages. Give each pager its own random PIN the first
     # time, saved so a paired phone keeps working; Settings > Bluetooth shows it.
     old = "_active_ble_pin = BLE_PIN_CODE; // otherwise static pin"
-    if src.count(old) != 2:
+    new = "  _active_ble_pin = _prefs.ble_pin;\n"   # MeshCore 1.18+: the default moved to its main.cpp
+    if src.count(old) == 2:
+        src = src.replace(old, "_prefs.ble_pin = 100000 + (esp_random() % 900000); savePrefs(); "
+                               "_active_ble_pin = _prefs.ble_pin; // INW: per-pager random PIN, not 123456")
+    elif src.count(new) == 1:
+        # Since 1.18 begin() takes the saved PIN as it is and companion_radio/main.cpp (not built
+        # here: src/node.cpp is ours) picks the default, so with none saved it would be 0. Pick
+        # this device's own here, once, and save it.
+        src = src.replace(new, "  if (_prefs.ble_pin == 0) { _prefs.ble_pin = 100000 + (esp_random() % 900000); savePrefs(); }"
+                               "   // INW: per-device random PIN, not 123456\n" + new)
+    else:
         raise SystemExit("patch_meshcore.py: MyMesh.cpp BLE pin code changed upstream, patch did not apply")
-    src = src.replace(old, "_prefs.ble_pin = 100000 + (esp_random() % 900000); savePrefs(); "
-                           "_active_ble_pin = _prefs.ble_pin; // INW: per-pager random PIN, not 123456")
     # Path hash size defaults to 2 bytes (mode 1). MeshCore's default is 1 byte,
     # which collides on a mesh this size. Only the default: a saved choice, or one
     # made from the phone app, still wins when prefs load over it.

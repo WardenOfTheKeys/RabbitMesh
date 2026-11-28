@@ -5,6 +5,7 @@
 #pragma once
 #include <Arduino.h>
 #include <MyMesh.h>
+#include <helpers/MultiSerialInterface.h>   // RabbitMesh: MyMesh.h stopped including it in MeshCore 1.18
 
 // ---- what the UI gets told ---------------------------------------------------
 enum class NodeEvent : uint8_t {
@@ -48,6 +49,11 @@ struct PacketLogEntry {
   int8_t   snr4;
   int16_t  rssi;
   bool     tx;
+  // RabbitMesh (the RF Monitor's packet detail): who sent it, when the packet says - an advert's
+  // public key (4 bytes) or a message's 1-byte sender hash - and, for a flood, the hash of the
+  // repeater it came through (the path's last hop, up to 3 bytes). Lengths 0: not known.
+  uint8_t  src[4], srcLen;
+  uint8_t  via[3], viaLen;
 };
 
 // One outgoing DM awaiting its ACK.

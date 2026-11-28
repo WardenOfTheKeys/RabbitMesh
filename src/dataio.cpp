@@ -105,6 +105,7 @@ static uint32_t s_lookedAt = 0;
 static uint32_t s_failedAt = 0;
 static constexpr uint32_t SD_REST_MS = 300000;
 static void sdLookAgain() { s_lookedAt = 0; s_failedAt = 0; }
+void sdLookNow() { sdLookAgain(); }
 
 void sdWriteFailed(const char* what) {
   if (!s_sd) return;

@@ -69,7 +69,11 @@ struct UiSettings {
   uint8_t  tileSource    = 0;         // 0 OSM (https), 1 wadamesh proxy (jpg), 2 custom
   char     tileUrl[96]   = "";        // custom: base URL, {z}/{x}/{y} appended
   bool     ntpSync       = true;
+#if RABBITMESH
+  uint8_t  themeId       = 6;         // index into THEMES: Neon Rabbit (themes.h checks it)
+#else
   uint8_t  themeId       = 0;         // index into THEMES
+#endif
   // battery
   bool     smartCharge   = true;      // hold at 80% until shortly before the usual unplug time
   bool     autoSaver     = true;      // battery saver switches itself on when low

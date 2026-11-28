@@ -126,13 +126,13 @@ Push the card in until it clicks. You can put it in with the T-Deck on; the SD c
 
 ## Building from source
 
-`./setup.sh`, then `cd build && pio run -e t-deck-rabbit`. Everything else (the flash files, tests, previews, the code map and the MeshCore version) is in **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**.
+`pip install platformio`, then `pio run -e t-deck-rabbit` in this folder. Everything it needs is in this repository. Everything else (the flash files, tests, previews, the code map and the MeshCore version) is in **[docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)**.
 
 ## Credits & license
 
 GPL-3.0, like both projects it's built from.
 
-- [Squatch Mesh](https://squatchmesh.com) / [BamBam1121/inw-mesh](https://github.com/BamBam1121/inw-mesh): GPL-3.0
+- [Squatch Mesh](https://squatchmesh.com) / [BamBam1121/inw-mesh](https://github.com/BamBam1121/inw-mesh): GPL-3.0. RabbitMesh is built on its T-Deck firmware (tag `tdeck-v1.2.7`), whose source is in this repository with RabbitMesh's changes; its own third-party notices are in `licenses/SQUATCH-THIRD_PARTY.md`
 - [WadaMesh](https://wadamesh.com) / [ALLFATHER-BV/wadamesh](https://github.com/ALLFATHER-BV/wadamesh): GPL-3.0. Wardrive design, including the probe-not-listen approach, both-way links and the review mode, by the WadaMesh contributors (Wardrive 1.2 review by tmetz1987)
 - [MECP](https://github.com/xiang-dev-1/MECP) by xiang-dev-1: the protocol is CC0; the English code table in `src/mecp_core.h` is CC BY 4.0
 - [MeshCore](https://github.com/meshcore-dev/MeshCore)

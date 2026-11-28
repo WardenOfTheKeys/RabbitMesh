@@ -20,6 +20,7 @@ enum SdState : uint8_t { SD_NONE, SD_UNREADABLE, SD_MOUNTED };
 SdState sdState();
 // Formats a card that does NOT mount as FAT32; refuses one that mounts. Erases the card.
 const char* sdFormat();
+void sdLookNow();   // forget the last failed look: the next sdMount() looks in the slot at once
 #if INW_DEV
 const char* sdTest(const char* what);   // developer build: info | ls | keep | gpt | back | format
 #endif

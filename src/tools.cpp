@@ -5,6 +5,8 @@
 #include "gps.h"
 #include "logstore.h"
 #include "fieldtools.h"
+#include "wardrive.h"   // RabbitMesh
+#include "deck.h"       // RabbitMesh
 #include "fx.h"
 #include "extport.h"
 #if BOARD_HAS_TOUCH
@@ -244,6 +246,15 @@ static void gpsPage() {
       }
     }
     snprintf(b, sizeof(b), "fix        %s", gps.hasFix() ? "yes" : "searching"); out.push_back(b);
+#if RABBITMESH
+    // What the module itself says about the fix: tells "no fix yet" from "a fix it isn't reading".
+    {
+      const char st = gps.rmcStatus();
+      snprintf(b, sizeof(b), "# module   rmc %s, gga quality %u, %u sats in the fix",
+               st == 'A' ? "fix" : st == 'V' ? "no fix" : "not sent", gps.ggaQuality(), gps.ggaUsed());
+      out.push_back(b);
+    }
+#endif
     snprintf(b, sizeof(b), "satellites %u", f.satellites); out.push_back(b);
     if (gps.hasFix()) {
       snprintf(b, sizeof(b), "position   %.6f, %.6f", f.lat, f.lon); out.push_back(b);
@@ -259,7 +270,11 @@ static void gpsPage() {
 void deviceInfoPage() {
   nav.push(new TextPageView("Device", [](std::vector<String>& out) {
     char b[72];
+#if RABBITMESH
+    snprintf(b, sizeof(b), "firmware     RabbitMesh v%s  (MeshCore %s)", RABBITMESH_VERSION, FIRMWARE_VERSION); out.push_back(b);
+#else
     snprintf(b, sizeof(b), "firmware     Squatch Mesh %s  (MeshCore %s)", FW_VERSION, FIRMWARE_VERSION); out.push_back(b);
+#endif
     if (g_node) {
       char h[20];
       mesh::Utils::toHex(h, g_node->self_id.pub_key, 8);
@@ -292,14 +307,23 @@ void logsPage() {
   }, 2000));
 }
 
+// RabbitMesh: the deck's tiles open these two screens of ours.
+namespace deckhooks {
+void discover() { nav.push(new DiscoverView()); }
+void sniffer() { packetLogPage(); }
+void gps() { gpsPage(); }
+}
+
 void app::openTools() {
   auto* m = new MenuView("Tools");
+  m->action("deck: rf monitor, airtime, radar, trip", [] { deck::open(); });   // RabbitMesh
   m->header("mesh");
   m->action("advert: nearby (zero hop)", [] { nav.toast(g_node && g_node->advertZeroHop() ? "advert sent nearby" : "failed"); });
   m->action("advert: whole mesh (flood)", [] { nav.toast(g_node && g_node->advertFlood() ? "flood advert sent" : "failed"); });
   m->action("discover repeaters nearby", [] { nav.push(new DiscoverView()); });
   m->action("recently heard", [] { recentPage(); });
   m->action("trace / ping / console", [] { app::openContacts(); nav.toast("pick a contact"); });
+  m->action("wardrive: lora coverage map", [] { wardrive::openMenu(); });   // RabbitMesh
   m->action("field: range test, sos, trail", [] { field::openMenu(); });
   m->header("radio");
   m->action("signal + radio stats", [] { signalPage(); });

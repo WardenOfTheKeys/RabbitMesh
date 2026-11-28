@@ -23,6 +23,7 @@ struct SquatchPose {
     float slump = 0;          // tired: head down, eyes half shut, 0..1 (a low battery)
     bool happy = false;       // eyes shut in a smile (the charger)
     float dizzy = -1;         // >= 0: stars circling his head, at this angle
+    bool talking = false;     // a line of his is up (RabbitMesh: the rabbit stops to say it)
 };
 
 // Halloween: what he's dressed as and where he's walking, chosen at start-up.

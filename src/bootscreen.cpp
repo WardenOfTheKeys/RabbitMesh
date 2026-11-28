@@ -1,5 +1,8 @@
 #include "bootscreen.h"
 #include "app.h"
+#if RABBITMESH
+#include "boot_rabbit.h"   // RabbitMesh: the rabbit for the mark, RABBIT for the wordmark
+#endif
 
 namespace boot {
 
@@ -10,6 +13,13 @@ static const uint8_t LINKS[][2] = {{0,1},{1,2},{2,3},{3,4},{4,0},{0,2},{1,3}};
 constexpr uint32_t HOP_MS = 420;
 
 void drawMark(lgfx::LovyanGFX& g, int ox, int oy, uint32_t ms, bool animate) {
+#if RABBIT_BOOT_ART   // the sprite rabbit: off until it has run right on a T-Deck
+  bootrabbit::mark(g, theme, MARK_X + ox, MARK_Y + oy, MARK_W, MARK_H, ms, animate);
+  return;
+#elif RABBITMESH
+  bootrabbit::geoMark(g, theme, MARK_X + ox, MARK_Y + oy, MARK_W, MARK_H, ms, animate);
+  return;
+#endif
   ox += MARK_DX; oy += MARK_DY;
   const int hop = (ms / HOP_MS) % 5;                    // links 0..4 are the outer ring
   const float f = (ms % HOP_MS) / (float)HOP_MS;
@@ -35,14 +45,19 @@ void drawMark(lgfx::LovyanGFX& g, int ox, int oy, uint32_t ms, bool animate) {
 
 // "SQUATCH / M E S H". tint < 0: the theme's colours, with an offset copy
 // underneath that reads as glow; otherwise one flat colour (the power-off tear).
+#if RABBITMESH
+#define BOOT_WORD bootrabbit::WORD
+#else
+#define BOOT_WORD "SQUATCH"
+#endif
 static void wordmark(lgfx::LovyanGFX& g, int dx, int32_t tint) {
-  g.setTextSize(1);                                     // at size 2 "SQUATCH" runs off the screen
+  g.setTextSize(1);                                     // at size 2 the word runs off the screen
   if (STACKED) {
     g.setFont(&fonts::FreeSansBold18pt7b);
-    const int x = (L::W - g.textWidth("SQUATCH")) / 2 + dx;
-    if (tint < 0) { g.setTextColor(theme.greenDim); g.drawString("SQUATCH", x + 2, 130); g.setTextColor(theme.green); }
+    const int x = (L::W - g.textWidth(BOOT_WORD)) / 2 + dx;
+    if (tint < 0) { g.setTextColor(theme.greenDim); g.drawString(BOOT_WORD, x + 2, 130); g.setTextColor(theme.green); }
     else g.setTextColor((uint16_t)tint);
-    g.drawString("SQUATCH", x, 128);
+    g.drawString(BOOT_WORD, x, 128);
     g.setFont(&fonts::FreeSans9pt7b);
     g.setTextColor(tint < 0 ? theme.txt : (uint16_t)tint);
     g.drawString("M E S H", (L::W - g.textWidth("M E S H")) / 2 + dx, 158);
@@ -51,12 +66,12 @@ static void wordmark(lgfx::LovyanGFX& g, int dx, int32_t tint) {
   g.setFont(&fonts::FreeSansBold24pt7b);
   if (tint < 0) {
     g.setTextColor(theme.greenDim);
-    g.drawString("SQUATCH", 199 + dx, 49);
+    g.drawString(BOOT_WORD, 199 + dx, 49);
     g.setTextColor(theme.green);
   } else {
     g.setTextColor((uint16_t)tint);
   }
-  g.drawString("SQUATCH", 196 + dx, 46);
+  g.drawString(BOOT_WORD, 196 + dx, 46);
   g.setFont(&fonts::FreeSans12pt7b);
   g.setTextColor(tint < 0 ? theme.txt : (uint16_t)tint);
   g.drawString("M E S H", 198 + dx, 106);
@@ -72,7 +87,11 @@ void drawLogo(lgfx::LovyanGFX& g) {
   g.fillScreen(theme.bg);
   drawMark(g, 0, 0, 0, false);
   wordmark(g, 0, -1);
+#if RABBITMESH
+  caption(g, "hop on the mesh  //  v" RABBITMESH_VERSION);
+#else
   caption(g, "inland northwest  //  " FW_VERSION);
+#endif
   g.drawRect(BAR_X, BAR_Y, BAR_W, 5, theme.line);
 }
 

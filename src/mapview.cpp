@@ -6,6 +6,7 @@
 
 #include "app.h"
 #include "fieldtools.h"
+#include "wardrive.h"   // RabbitMesh: the coverage overlay
 #include "node.h"
 #include "dataio.h"
 #include "netwifi.h"
@@ -480,6 +481,21 @@ public:
         g.setTextColor(f ? t.white : t.txt, f ? t.greenDim : t.bg);
         drawRich(g, nm, x + 11, y - 8);
         if (!_pinch) _labels.push_back({i, (int16_t)(x + 8), (int16_t)(y - 8), (int16_t)w, (int16_t)16});
+      }
+    }
+    // Wardrive coverage (RabbitMesh, wardrive.cpp): a dot per probe, coloured by the link
+    // direction picked in Tools > wardrive; a hollow ring where nothing answered.
+    if (wardrive::overlayShown()) {
+      size_t wn = 0;
+      const wdcore::Stop* ws = wardrive::overlay(wn);
+      const uint8_t wdir = wardrive::overlayDir();
+      for (size_t i = 0; i < wn; i++) {
+        const int x = scrX(p, ws[i].lon), y = scrY(p, ws[i].lat);
+        if (x < -6 || x > L::W + 6 || y < MAP_Y - 6 || y > L::H + 6) continue;
+        if (!ws[i].n) { g.drawCircle(x, y, 3, t.red); continue; }
+        const uint32_t c = wdcore::rampRgb(wdcore::quality(wdcore::stopDb(ws[i], wdir)));
+        g.fillCircle(x, y, 4, t.bg);
+        g.fillCircle(x, y, 3, g.color565(c >> 16, (c >> 8) & 0xFF, c & 0xFF));
       }
     }
     // Breadcrumb trail (field tools): the path walked, and a flag at the start.

@@ -99,6 +99,8 @@ static const Set SETS[KIND_COUNT] = {
   TALK_SET(POKE_L), TALK_SET(POKE2_L)};
 #undef TALK_SET
 
+#include "rabbit_talk.h"   // RabbitMesh: the Neon Rabbit's lines (RABBIT_SETS)
+
 struct Deck { uint8_t order[MAX_LINES]; uint8_t pos = 0, n = 0; };
 
 // The next line index from a deck of n, reshuffling (Fisher-Yates) when it runs out.
@@ -134,7 +136,16 @@ inline const char* line(Kind k, unsigned n = 0) {
     }
     return b;
   }
-  const Set& s = SETS[k];
+  const bool rabbit = rabbitScene(nav.theme().scene);
+  if (rabbit && rabbitChatKind(k) && random(3) == 0) {             // RabbitMesh: a holiday's own lines, a third of the time
+    const char* hl = rabbitHolidayLine(nav.theme().scene);
+    if (hl) return hl;
+  }
+  if (rabbit && rabbitChatKind(k) && random(RARE_ODDS) == 0) {    // RabbitMesh: now and then, a rare line
+    static Deck rare;
+    return R_RARE_L[deal(rare, (uint8_t)(sizeof(R_RARE_L) / sizeof(R_RARE_L[0])))];
+  }
+  const Set& s = (rabbit ? RABBIT_SETS : SETS)[k];
   return s.l[deal(decks[k], s.n)];
 }
 
@@ -157,6 +168,7 @@ inline int typed(const char* text, uint32_t e) {
 // How he looks e ms into a line of kind k that's up for `total` ms: the mouth moves
 // while the words come out, and each kind has its own gesture.
 inline void pose(Kind k, const char* text, uint32_t e, uint32_t total, SquatchPose& p) {
+  p.talking = true;                                         // RabbitMesh: he stops walking to say it
   const uint32_t n = (uint32_t)strlen(text);
   const bool typing = e >= POP_MS && e < POP_MS + n * TYPE_MS;
   // Gestures ease in over the first quarter second and out over the last.
@@ -182,6 +194,7 @@ inline void pose(Kind k, const char* text, uint32_t e, uint32_t total, SquatchPo
 // Just above the character's head in each lock scene (scenes.h), lift px off the
 // ground mid-hop: where the bubble's tail points.
 inline void anchor(uint8_t style, int lift, int& ax, int& ay) {
+  if (rabbitScene(nav.theme().scene)) { scenes::rabbitAnchor(lift, ax, ay); return; }   // RabbitMesh
   switch (style) {
     case STYLE_BLOCKS: ax = scenes::MASCOT_X - 9;  ay = 70; break;           // the explorer (his ground varies)
     case STYLE_HERO:   ax = scenes::MASCOT_X - 12; ay = 86; break;           // the adventurer

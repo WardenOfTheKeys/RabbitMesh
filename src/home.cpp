@@ -10,6 +10,7 @@
 #include "power.h"
 #include "squatch_talk.h"
 #include "regional.h"
+#include "deck.h"   // RabbitMesh
 
 #ifndef BOARD_SCENE_STEP_MS
 #define BOARD_SCENE_STEP_MS 0   // board_pins.h: move the lock scene by time at the pager's pace (ms a step)
@@ -34,7 +35,11 @@ static const char* subContacts() {
   return b;
 }
 static const char* subMap() { return gps.hasFix() ? "gps fix" : (ui_settings.gpsOn && !power::saver() ? "searching" : "gps off"); }
+#if RABBITMESH
+static const char* subTools() { return "rf  airtime  radar  trip"; }
+#else
 static const char* subTools() { return "discover  trace  rf"; }
+#endif
 #if INW_NFC
 static const char* subNfc() { return "read  write  share"; }
 void openNfc();
@@ -50,7 +55,11 @@ static const CarouselItem ITEMS[] = {
   { "MESSAGES", subChats,    [] { app::openChats(); } },
   { "CONTACTS", subContacts, [] { app::openContacts(); } },
   { "MAP",      subMap,      [] { app::openMap(); } },
+#if RABBITMESH
+  { "DECK",     subTools,    [] { deck::open(); } },  // RabbitMesh: the tools hub
+#else
   { "TOOLS",    subTools,    [] { app::openTools(); } },
+#endif
 #if INW_NFC
   { "NFC",      subNfc,      [] { openNfc(); } },
 #endif
@@ -94,7 +103,11 @@ public:
       case 'm': app::openChats(); break;
       case 'c': app::openContacts(); break;
       case 'p': app::openMap(); break;
+#if RABBITMESH
+      case 't': deck::open(); break;              // the deck; its MORE tile is the full list
+#else
       case 't': app::openTools(); break;
+#endif
 #if INW_NFC
       case 'n': openNfc(); break;
 #endif
@@ -129,6 +142,15 @@ public:
     scenes::mascotPose() = pose();        // blinking, talking, waving...
     if (t.scene == SCENE_HALLOWEEN) scenes::halloween(d, t, _phase, _scroll, hasUnread);
     else if (t.scene == SCENE_SQUATCHMAS) scenes::squatchmas(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_NEONRABBIT) scenes::neonRabbit(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_REDTEAM) scenes::redTeam(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_BLUETEAM) scenes::blueTeam(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_RHALLOWEEN) scenes::rabbitHalloween(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_RTHANKS) scenes::rabbitThanksgiving(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_RXMAS) scenes::rabbitChristmas(d, t, _phase, _scroll, hasUnread);
+    else if (t.scene == SCENE_RNEWYEAR) scenes::rabbitFireworks(d, t, _phase, _scroll, hasUnread, false);
+    else if (t.scene == SCENE_RJULY4) scenes::rabbitFireworks(d, t, _phase, _scroll, hasUnread, true);
+    else if (t.scene == SCENE_REASTER) scenes::rabbitEaster(d, t, _phase, _scroll, hasUnread);
     else switch (t.style) {
       case STYLE_BLOCKS: scenes::blocks(d, t, _phase, _scroll, hasUnread); break;
       case STYLE_HERO:   scenes::hero(d, t, _phase, _scroll, hasUnread, app::batteryPct(), app::unread()); break;
