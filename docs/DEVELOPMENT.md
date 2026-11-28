@@ -100,7 +100,11 @@ The generated sprite files are committed, so building doesn't need Python. To ch
 2. Write the notes in `docs/releases/vX.Y.Z.md` (optional; without them GitHub writes a list of changes).
 3. Tag and push (`git tag vX.Y.Z && git push origin vX.Y.Z`), or on GitHub: Actions > Release > Run workflow, with the version; that tags the newest `main` itself.
 
-The **Release** job (`.github/workflows/release.yml`) checks the tag matches the version, runs the host tests, builds, makes the two flash files and `SHA256SUMS.txt`, and publishes the release. T-Decks on WiFi notice it within a week (`src/updcheck.cpp`).
+The **Release** job (`.github/workflows/release.yml`) checks the tag matches the version, runs the host tests, builds, makes the two flash files and `SHA256SUMS.txt`, signs the update file, and publishes the release. T-Decks on WiFi notice it within a week (`src/updcheck.cpp`) and can install it from Settings > System.
+
+**The release key.** A T-Deck installs over WiFi only an update file signed with RabbitMesh's release key: `rabbitmesh-<v>-tdeck-update.bin.sig`, Ed25519 over the file's SHA-256, made by `tools/sign_release.py`, checked against the public key in `src/updcore.h`. The private key (32 bytes, as 64 hex digits) is the repository secret `RABBITMESH_SIGNING_KEY` (Settings > Secrets and variables > Actions); without it the job publishes the release unsigned, with a warning, and that release goes on by USB only. Keep a copy of the key somewhere safe: GitHub won't show a secret again. If it's lost or leaks, make a new pair, put the new public key in `src/updcore.h`, and the release with it has to be flashed by USB once (T-Decks only trust the key they were built with).
+
+**How a WiFi update goes** (`src/updcheck.cpp`): the update file is written to the spare app slot as it downloads, hashed as it goes, and switched to only if the signature checks out. The new version starts on trial (the bootloader's rollback, kept pending by `verifyRollbackLater()`); after 15 seconds it marks itself good, and if it restarted before that the bootloader goes back to the old one. Once good, it copies itself into the first app slot and starts from there next time, so the USB update file at `0x10000` always replaces what runs. If that slot changed since the update (someone flashed it by USB), it starts that instead.
 
 ## Keeping MeshCore current
 

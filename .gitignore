@@ -20,3 +20,6 @@ tools/cameras-*.geojson.gz.part
 # preview output
 preview/out/
 __pycache__/
+# the release signing key (a GitHub secret): never commit it
+RABBITMESH_SIGNING_KEY*
+*.sig

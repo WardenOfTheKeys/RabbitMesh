@@ -85,23 +85,26 @@ More about the character and how he's drawn: [docs/CHARACTER.md](docs/CHARACTER.
 
 ## Privacy: what it sends, and where
 
-- **It never updates itself, and never reports anything** to the projects it's built on. You update it only by flashing it.
-- **New versions:** once a week, while on WiFi, it asks this project's GitHub page for the newest version number, and tells you if there's a newer one. Nothing about you or your device is sent, and nothing is installed. Turn it off under Settings > System.
+- **It never updates by itself, and never reports anything** to the projects it's built on. It installs a new version only when you press install, and only RabbitMesh's own, signed.
+- **New versions:** once a week, while on WiFi, it asks this project's GitHub page for the newest version, and tells you if there's a newer one. Nothing about you or your device is sent. Turn it off under Settings > System.
 - **WiGLE:** RabbitMesh only writes the file. It never contacts WiGLE; uploading is up to you.
 - **The only internet addresses in the firmware:**
   - `data.dontgetflocked.com`: the camera map, when you update it (at most once a day);
   - `tile.openstreetmap.org`: map tiles while you look at the map;
   - `pool.ntp.org` and `time.google.com`: the clock;
-  - `api.github.com`: the weekly new-version check above.
+  - `api.github.com`: the weekly new-version check above;
+  - `github.com` (and GitHub's file store it sends downloads on to): a new version's files, only when you press install.
 - **Flock hunt** only listens. Nothing is ever transmitted at a camera.
 
 ## Staying up to date
 
-RabbitMesh tracks [MeshCore](https://github.com/meshcore-dev/MeshCore): each MeshCore release gets a RabbitMesh build on it. A T-Deck only changes firmware when you flash it, so:
+RabbitMesh tracks [MeshCore](https://github.com/meshcore-dev/MeshCore): each MeshCore release gets a RabbitMesh build on it.
 
 - **Your T-Deck tells you** when a new version is out (once a week, on WiFi), and Settings > System > check for updates asks now.
+- **Install it over WiFi** (from 0.1.4 on): Settings > System > **install vX.Y.Z over wifi**. It downloads about 3 MB from this project's GitHub, checks the file is signed with RabbitMesh's release key (anything else is thrown away), and restarts into it. Settings, contacts and identity stay. Keep it on WiFi and above 30% battery (or plugged in) while it runs; a minute or so.
+- **If a new version won't start,** the T-Deck goes back to the one before by itself: the new one is on trial for its first 15 seconds.
+- **Or by USB, as before:** flash the new **update** file at `0x10000` (see Install). That always works, whichever way it was last updated.
 - **Or watch this repository:** Watch > Custom > Releases on GitHub emails you when there's a new one.
-- **To update:** flash the new **update** file at `0x10000` (see Install). Your settings and contacts stay.
 
 ## The SD card
 

@@ -2,6 +2,9 @@
 # (v0.1.0, v0.1.1, ...) is pushed, or from the Actions tab (Run workflow, with the version), which
 # tags the commit it builds. The version has to match RABBITMESH_VERSION in platformio.ini.
 # Release notes come from docs/releases/<tag>.md when there is one.
+# With the RABBITMESH_SIGNING_KEY secret set (Settings > Secrets and variables > Actions), the
+# update file is signed (tools/sign_release.py), so T-Decks can install it over WiFi; without
+# it the release is published unsigned, and goes on by USB only.
 name: Release
 
 on:
@@ -61,6 +64,19 @@ jobs:
           sha256sum rabbitmesh-*.bin > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      - name: Sign the update file (for installing over WiFi)
+        env:
+          RABBITMESH_SIGNING_KEY: ${{ secrets.RABBITMESH_SIGNING_KEY }}
+        run: |
+          v="${TAG#v}"
+          if [ -z "$RABBITMESH_SIGNING_KEY" ]; then
+            echo "::warning::RABBITMESH_SIGNING_KEY isn't set: this release can't be installed over WiFi, only by USB"
+            exit 0
+          fi
+          pip install cryptography
+          python3 tools/sign_release.py "rabbitmesh-$v-tdeck-update.bin"
+          python3 tools/sign_release.py --verify "rabbitmesh-$v-tdeck-update.bin"
+
       - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -68,5 +84,7 @@ jobs:
           v="${TAG#v}"
           notes="docs/releases/$TAG.md"
           if [ -f "$notes" ]; then set -- --notes-file "$notes"; else set -- --generate-notes; fi
+          sig=""
+          [ -f "rabbitmesh-$v-tdeck-update.bin.sig" ] && sig="rabbitmesh-$v-tdeck-update.bin.sig"
           gh release create "$TAG" --target "$GITHUB_SHA" --title "RabbitMesh $v" "$@" \
-            "rabbitmesh-$v-tdeck-full.bin" "rabbitmesh-$v-tdeck-update.bin" SHA256SUMS.txt
+            "rabbitmesh-$v-tdeck-full.bin" "rabbitmesh-$v-tdeck-update.bin" SHA256SUMS.txt $sig

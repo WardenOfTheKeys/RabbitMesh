@@ -1197,8 +1197,8 @@ static void systemMenu() {
   m->action("run first-start setup", [] { startSetup(); });
   m->header("updates");
 #if RABBITMESH
-  // RabbitMesh: no update site and no installing over WiFi; a weekly look at its own GitHub
-  // releases (updcheck.h) says when there's a newer one, and updating is flashing it.
+  // RabbitMesh: a weekly look at its own GitHub releases (updcheck.h) says when there's a newer
+  // one, and installs it over WiFi when asked (signed releases only), or it's flashed by USB.
   m->info("version", []() -> String { return String("RabbitMesh v" RABBITMESH_VERSION); });
   m->info("newest", []() -> String { return updcheck::status(); });
   m->action("check for updates", [] { updcheck::checkNow(); });
@@ -1206,7 +1206,16 @@ static void systemMenu() {
     updcheck::setEnabled(!updcheck::enabled());
     nav.toast(updcheck::enabled() ? "a weekly look at github for a newer version" : "no update checks", 3000);
   });
-  m->info("to update", []() -> String { return String("flash the update file from the releases page"); });
+  // Installing over WiFi: offered when the newest release is newer, signed, and checked for.
+  if (updcheck::installable()) {
+    m->action((String("install ") + updcheck::latest() + " over wifi").c_str(), [] {
+      confirm("Install " + updcheck::latest() + "?",
+              "downloads about 3 MB from rabbitmesh's github, checks its signature, then restarts. settings, contacts and identity stay",
+              [] { nav.toast(updcheck::install(), 5000); });
+    });
+  } else {
+    m->info("to update", []() -> String { return String("check for updates, or flash the update file"); });
+  }
   m->info("releases", []() -> String { return String("github.com/WardenOfTheKeys/rabbitmesh"); });
 #else
   m->info("version", []() -> String { return String(FW_VERSION); });
