@@ -42,9 +42,14 @@ def main():
         return
     if len(args) != 1:
         sys.exit(__doc__)
-    seed = os.environ.get("RABBITMESH_SIGNING_KEY", "").strip()
-    if not re.fullmatch(r"[0-9a-fA-F]{64}", seed):
-        sys.exit("RABBITMESH_SIGNING_KEY isn't set (64 hex digits)")
+    raw = os.environ.get("RABBITMESH_SIGNING_KEY", "")
+    # the key is 64 hex digits; a paste can bring a line number, quotes or spaces along with it
+    m = re.search(r"(?<![0-9a-fA-F])[0-9a-fA-F]{64}(?![0-9a-fA-F])", raw)
+    if not m:
+        hexes = len(re.findall(r"[0-9a-fA-F]", raw))
+        sys.exit(f"RABBITMESH_SIGNING_KEY has no 64-hex-digit key in it ({len(raw.strip())} characters, "
+                 f"{hexes} of them hex digits): paste the key file's line again, whole")
+    seed = m.group(0)
     key = Ed25519PrivateKey.from_private_bytes(bytes.fromhex(seed))
     pub = key.public_key().public_bytes_raw()
     if pub != public_key():
